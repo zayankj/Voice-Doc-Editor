@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Underline from '@tiptap/extension-underline';
@@ -16,16 +16,19 @@ import { startCapture } from './lib/audio';
 import { exportDocx } from './lib/exportDocx';
 import { todayString } from './lib/tools';
 import { extractEdits } from './lib/fileExtract';
-import { readDocument, stopReading, ttsSupported } from './lib/tts';
+import { readDocument, stopReading, ttsSupported, watchVoices } from './lib/tts';
 import Toolbar from './components/Toolbar';
 import DocEditor from './components/DocEditor';
 import VoiceControls from './components/VoiceControls';
+import VoiceSettings from './components/VoiceSettings';
 import HistoryPanel from './components/HistoryPanel';
 
 const STORE = 'voice-doc-html';
 const EMPTY = '<p>Click <b>Open .docx</b> to load a document, then use the mic to edit it by voice.</p>';
 const load = () => { try { return localStorage.getItem(STORE) || EMPTY; } catch { return EMPTY; } };
 const save = (html) => { try { localStorage.setItem(STORE, html); } catch { /* ignore */ } };
+const lsGet = (key, fallback) => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } };
+const lsSet = (key, value) => { try { localStorage.setItem(key, value); } catch { /* ignore */ } };
 
 export default function App() {
   const [history, setHistory] = useState([]);
@@ -37,6 +40,9 @@ export default function App() {
   const [reading, setReading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [note, setNote] = useState('');
+  const [voices, setVoices] = useState([]);
+  const [voiceName, setVoiceName] = useState(() => lsGet('tts-voice', ''));
+  const [rate, setRate] = useState(() => Number(lsGet('tts-rate', '0.95')) || 0.95);
   const live = useRef(null);
   const stopMic = useRef(null);
   const fileInput = useRef(null);
@@ -55,6 +61,20 @@ export default function App() {
     content: load(),
     onUpdate: ({ editor }) => save(editor.getHTML()),
   });
+
+  // The best female voice is chosen automatically unless the user picked another one
+  useEffect(() => watchVoices(setVoices), []);
+  const activeVoice = voices.find((v) => v.name === voiceName) || voices[0];
+
+  function chooseVoice(name) {
+    setVoiceName(name);
+    lsSet('tts-voice', name);
+  }
+
+  function chooseRate(value) {
+    setRate(value);
+    lsSet('tts-rate', String(value));
+  }
 
   // ---------- open the base .docx ----------
   async function openDocx(e) {
@@ -111,7 +131,11 @@ export default function App() {
     }
     setError('');
     setReading(true);
-    readDocument(editor, { onEnd: () => setReading(false) });
+    readDocument(editor, {
+      voiceName: activeVoice?.name,
+      rate,
+      onEnd: () => setReading(false),
+    });
   }
 
   // ---------- upload a file and apply its changes ----------
@@ -221,6 +245,13 @@ export default function App() {
             onRead={toggleRead}
             uploading={uploading}
             onUpload={() => uploadInput.current?.click()}
+          />
+          <VoiceSettings
+            voices={voices}
+            voiceName={activeVoice?.name || ''}
+            onVoice={chooseVoice}
+            rate={rate}
+            onRate={chooseRate}
           />
           {transcript && <p className="bubble you">You: {transcript}</p>}
           {reply && <p className="bubble ai">AI: {reply}</p>}
