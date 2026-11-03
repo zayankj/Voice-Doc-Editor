@@ -11,6 +11,7 @@ import { Flash } from './lib/flash';
 import { docxToHtml } from './lib/docxImport';
 import { buildOutline } from './lib/outline';
 import { applyVoiceEdit } from './lib/voiceEdit';
+import { scrollToPos, scrollToFirstChange } from './lib/scroll';
 import { startLive } from './lib/liveClient';
 import { startCapture } from './lib/audio';
 import { exportDocx } from './lib/exportDocx';
@@ -96,9 +97,11 @@ export default function App() {
   }
 
   // ---------- one edit (used by voice AND by uploads) ----------
-  function handleEdit(args) {
+  // scroll: bring the changed line into view if it is off-screen (uploads scroll once at the end instead)
+  function handleEdit(args, { scroll = true } = {}) {
     const r = applyVoiceEdit(editor, args);
     if (!r.ok) return { ok: false, error: r.error };
+    if (scroll && r.pos != null) scrollToPos(editor, r.pos, true);
     setHistory((h) => [
       {
         label: args.field_label || args.block_id,
@@ -169,12 +172,15 @@ export default function App() {
       let applied = 0;
       let skipped = 0;
       for (const ed of ordered) {
-        if (handleEdit(ed).ok) applied++;
+        if (handleEdit(ed, { scroll: false }).ok) applied++;
         else skipped++;
       }
 
+      // every changed part is now highlighted: jump to the first one
+      if (applied) scrollToFirstChange(editor);
+
       const head = applied
-        ? `${applied} change${applied > 1 ? 's' : ''} applied from "${file.name}".`
+        ? `${applied} change${applied > 1 ? 's' : ''} applied from "${file.name}". Changed parts are highlighted in yellow.`
         : `No changes were needed from "${file.name}".`;
       setNote([head, skipped ? `${skipped} could not be applied.` : '', summary].filter(Boolean).join(' '));
     } catch (err) {

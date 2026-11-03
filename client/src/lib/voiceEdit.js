@@ -1,11 +1,17 @@
 import { getBlocks } from './outline';
 import { flashKey } from './flash';
 
+const HIGHLIGHT_MS = 5000; // how long changed text stays highlighted (5 seconds)
+let clearTimer;
+
+// One shared timer: every new edit restarts it, so all highlights from one batch
+// disappear together, 5 seconds after the LAST change.
 function scheduleClear(editor) {
-  setTimeout(() => {
+  clearTimeout(clearTimer);
+  clearTimer = setTimeout(() => {
     if (editor.isDestroyed) return;
     editor.view.dispatch(editor.state.tr.setMeta(flashKey, null).setMeta('addToHistory', false));
-  }, 2500);
+  }, HIGHLIGHT_MS);
 }
 
 // Applies ONE edit instruction to ONE text block. Everything else stays untouched.
@@ -31,10 +37,10 @@ export function applyVoiceEdit(editor, args) {
     const insertPos = pos + node.nodeSize;
     const para = editor.schema.nodes.paragraph.create(null, editor.schema.text(new_value));
     const tr = editor.state.tr.insert(insertPos, para);
-    tr.setMeta(flashKey, { from: insertPos, to: insertPos + para.nodeSize });
+    tr.setMeta(flashKey, { add: { from: insertPos, to: insertPos + para.nodeSize } });
     editor.view.dispatch(tr);
     scheduleClear(editor);
-    return { ok: true, before: '', after: new_value };
+    return { ok: true, before: '', after: new_value, pos: insertPos };
   }
 
   // Map every character of the block's text to its document position
@@ -72,9 +78,9 @@ export function applyVoiceEdit(editor, args) {
 
   const tr = editor.state.tr.insertText(insert, from, to);
   const changed = tr.doc.nodeAt(pos);
-  tr.setMeta(flashKey, { from: pos, to: pos + changed.nodeSize });
+  tr.setMeta(flashKey, { add: { from: pos, to: pos + changed.nodeSize } });
   editor.view.dispatch(tr);
   scheduleClear(editor);
 
-  return { ok: true, before, after: changed.textContent };
+  return { ok: true, before, after: changed.textContent, pos };
 }

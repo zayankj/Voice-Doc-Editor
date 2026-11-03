@@ -62,3 +62,6 @@ aside { overflow: auto; padding: 14px; display: flex; flex-direction: column; ga
 .voice-settings label { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 110px; }
 .voice-settings label:first-child { flex: 2; min-width: 160px; }
 .voice-settings select { font: inherit; padding: 5px; border: 1px solid #d4d8de; border-radius: 6px; max-width: 100%; }
+
+/* changed text: stronger highlight so it is easy to spot */
+.ProseMirror .flash { background: #ffe066; box-shadow: 0 0 0 3px #ffe066; border-radius: 3px; transition: background .4s; }
