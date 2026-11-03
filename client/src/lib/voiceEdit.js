@@ -1,9 +1,20 @@
 import { getBlocks } from './outline';
 import { flashKey } from './flash';
 
-// Applies ONE edit instruction from the model to ONE text block. Everything else stays untouched.
+function scheduleClear(editor) {
+  setTimeout(() => {
+    if (editor.isDestroyed) return;
+    editor.view.dispatch(editor.state.tr.setMeta(flashKey, null).setMeta('addToHistory', false));
+  }, 2500);
+}
+
+// Applies ONE edit instruction to ONE text block. Everything else stays untouched.
 // Formatting (bold, italic...) of the edited text is preserved by ProseMirror's insertText.
-export function applyVoiceEdit(editor, { block_id, operation, new_value = '', find_text = '' }) {
+export function applyVoiceEdit(editor, args) {
+  const { block_id, operation } = args;
+  const new_value = args.new_value ?? '';
+  const find_text = args.find_text ?? '';
+
   const index = parseInt(String(block_id).replace(/\D/g, ''), 10);
   const blocks = getBlocks(editor.state.doc);
   const target = blocks[index];
@@ -13,6 +24,18 @@ export function applyVoiceEdit(editor, { block_id, operation, new_value = '', fi
   const start = pos + 1; // first position inside the block
   const end = pos + node.nodeSize - 1; // last position inside the block
   const before = node.textContent;
+
+  // Add a NEW paragraph after this block (used by file uploads)
+  if (operation === 'insert_after') {
+    if (!new_value.trim()) return { ok: false, error: 'insert_after needs new_value' };
+    const insertPos = pos + node.nodeSize;
+    const para = editor.schema.nodes.paragraph.create(null, editor.schema.text(new_value));
+    const tr = editor.state.tr.insert(insertPos, para);
+    tr.setMeta(flashKey, { from: insertPos, to: insertPos + para.nodeSize });
+    editor.view.dispatch(tr);
+    scheduleClear(editor);
+    return { ok: true, before: '', after: new_value };
+  }
 
   // Map every character of the block's text to its document position
   let text = '';
@@ -51,11 +74,7 @@ export function applyVoiceEdit(editor, { block_id, operation, new_value = '', fi
   const changed = tr.doc.nodeAt(pos);
   tr.setMeta(flashKey, { from: pos, to: pos + changed.nodeSize });
   editor.view.dispatch(tr);
-
-  setTimeout(() => {
-    if (editor.isDestroyed) return;
-    editor.view.dispatch(editor.state.tr.setMeta(flashKey, null).setMeta('addToHistory', false));
-  }, 2500);
+  scheduleClear(editor);
 
   return { ok: true, before, after: changed.textContent };
 }

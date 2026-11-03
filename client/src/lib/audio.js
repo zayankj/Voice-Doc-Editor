@@ -1,4 +1,4 @@
-// Captures the mic as 16 kHz mono PCM, returns a stop() function.
+// Captures the mic as 16 kHz mono PCM, returns a stop() function that is safe to call more than once.
 export async function startCapture(onChunk) {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -13,11 +13,15 @@ export async function startCapture(onChunk) {
   node.port.onmessage = (e) => onChunk(floatToBase64Pcm(e.data));
   src.connect(node).connect(mute).connect(ctx.destination);
 
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
+    node.port.onmessage = null;
     node.disconnect();
     src.disconnect();
     stream.getTracks().forEach((t) => t.stop());
-    ctx.close();
+    if (ctx.state !== 'closed') ctx.close().catch(() => {});
   };
 }
 
