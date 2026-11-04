@@ -24,17 +24,17 @@ async function toPayload(file) {
   throw new Error('Unsupported file. Use an image, PDF, .docx or .txt file.');
 }
 
-// Returns { edits, summary } from the server
-export async function extractEdits({ file, outline, today }) {
-  if (file.size > MAX_MB * 1024 * 1024) throw new Error(`File is too large (max ${MAX_MB} MB)`);
-  const payload = await toPayload(file);
+// file and instruction are both optional, but at least one is needed. Returns { edits, summary }.
+export async function extractEdits({ file, instruction = '', outline, today }) {
+  if (file && file.size > MAX_MB * 1024 * 1024) throw new Error(`File is too large (max ${MAX_MB} MB)`);
+  const payload = file ? await toPayload(file) : {};
 
   const res = await fetch('/api/extract-edits', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ outline, today, fileName: file.name, ...payload }),
+    body: JSON.stringify({ outline, today, instruction: instruction.trim(), fileName: file?.name, ...payload }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Could not read the file');
+  if (!res.ok) throw new Error(data.error || 'Could not apply the edit');
   return data;
 }
