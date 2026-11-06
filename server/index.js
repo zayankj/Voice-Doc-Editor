@@ -1,21 +1,40 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import express from 'express';
-import cors from 'cors';
 import { GoogleGenAI, Type } from '@google/genai';
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '25mb' })); // uploaded files and voice clips arrive as base64
 
 const apiKey = process.env.GEMINI_API_KEY;
 const useVertex = String(process.env.GOOGLE_GENAI_USE_VERTEXAI).toLowerCase() === 'true';
 const project = process.env.GOOGLE_CLOUD_PROJECT;
 const location = process.env.GOOGLE_CLOUD_LOCATION || 'asia-south1';
+const INTERNAL_KEY = process.env.INTERNAL_KEY;
 
+if (!INTERNAL_KEY) {
+  console.error('INTERNAL_KEY is missing in server/.env (it must be the same value as in gateway/.env)');
+  process.exit(1);
+}
 if (useVertex && !project) {
   console.error('GOOGLE_CLOUD_PROJECT is missing in server/.env');
   process.exit(1);
 }
+
+const app = express();
+app.disable('x-powered-by');
+
+// Only the gateway may call this service: every request must carry the internal key
+function internalOnly(req, res, next) {
+  const given = Buffer.from(String(req.get('x-internal-key') || ''));
+  const expected = Buffer.from(INTERNAL_KEY);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
+    return res.status(401).json({ error: 'Not allowed' });
+  }
+  next();
+}
+app.use(internalOnly);
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.use(express.json({ limit: '25mb' })); // uploaded files and voice clips arrive as base64
 
 // The client that reads files, voice clips and instructions.
 // With Vertex AI every request goes to the regional endpoint (default: Mumbai).
@@ -28,9 +47,6 @@ console.log(
     ? `Backend: Vertex AI | project ${project} | region ${location}`
     : 'WARNING: using the Gemini Developer API (API key). The region cannot be chosen, so this is NOT India-only.'
 );
-
-// Short-lived tokens for the Live API (only used if the app is set to live mode)
-const tokenAi = apiKey ? new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } }) : null;
 
 // Main model, then optional fallbacks (comma separated)
 const MODELS = [
@@ -193,27 +209,6 @@ async function generateWithRetry(request) {
   throw finalError(lastErr, quotaSeen);
 }
 
-// ---------- Live token (only for live mode, needs GEMINI_API_KEY) ----------
-app.post('/api/token', async (_req, res) => {
-  if (!tokenAi) {
-    return res.status(501).json({ error: 'Live mode needs GEMINI_API_KEY and is not available in the India region setup.' });
-  }
-  try {
-    const now = Date.now();
-    const token = await tokenAi.authTokens.create({
-      config: {
-        uses: 1,
-        expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
-        newSessionExpireTime: new Date(now + 60 * 1000).toISOString(),
-      },
-    });
-    res.json({ token: token.name });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Could not create token' });
-  }
-});
-
 // ---------- Edits from a file, a typed instruction and/or a spoken command ----------
 const editsSchema = {
   type: Type.OBJECT,
@@ -345,4 +340,6 @@ app.post('/api/extract-edits', async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3001, () => console.log('Server running'));
+// Listens on this computer only: the browser cannot reach it, only the gateway can
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, '127.0.0.1', () => console.log(`AI service running on 127.0.0.1:${PORT} (internal, used by the gateway only)`));

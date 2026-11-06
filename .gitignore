@@ -10,3 +10,5 @@ dist/
 build/
 .next/
 .DS_Store
+gateway/.env
+gateway/logs/
