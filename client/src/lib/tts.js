@@ -1,12 +1,16 @@
 import { getBlocks } from './outline';
 import { flashKey } from './flash';
+import { scrollToPos } from './scroll';
 
 // Read aloud with the browser's built-in speech engine: free, no key, no model.
 
 // ---------- settings you can change ----------
 const INTRO = 'Reading the discharge summary now.';
+const INTRO_FROM_CURSOR = 'Reading from here.'; // said when reading starts at the cursor
 const OUTRO = 'That is the end of the summary.';
 const PITCH = 1.0;
+// Reading starts where the cursor is. Set to false to always read from the top.
+const START_FROM_CURSOR = true;
 // Reads two-cell table rows as "label: value". Set to false if your tables are normal grids.
 const PAIR_TABLE_CELLS = true;
 // Reads mobile / registration / IP / bed numbers digit by digit. Set to false to read them as normal numbers.
@@ -231,7 +235,8 @@ function tableRowPos(doc, pos) {
   return null;
 }
 
-// List of { index, text }: index is the block to highlight while it is read
+// List of { index, text, block }: index is the block to highlight while it is read.
+// block is set for normal paragraphs (not table rows) so reading can start inside them.
 function buildItems(editor) {
   const doc = editor.state.doc;
   const blocks = getBlocks(doc);
@@ -240,7 +245,7 @@ function buildItems(editor) {
   while (i < blocks.length) {
     const rowPos = tableRowPos(doc, blocks[i].pos);
     if (rowPos === null) {
-      items.push({ index: blocks[i].index, text: blocks[i].node.textContent });
+      items.push({ index: blocks[i].index, text: blocks[i].node.textContent, block: blocks[i] });
       i++;
       continue;
     }
@@ -259,12 +264,60 @@ function buildItems(editor) {
   return items;
 }
 
+// ---------- start reading at the cursor ----------
+// Where each sentence of a text starts (character positions). "Dr. Rathees" is not treated as a sentence end.
+const SENTENCE_BREAK = /(?<!\b(?:Dr|Mr|Mrs|Ms|Tab|Inj|Syp|No|St|Fig|vs)\.)(?<=[.!?])\s+/gi;
+
+function sentenceStarts(text) {
+  const starts = [0];
+  const re = new RegExp(SENTENCE_BREAK.source, 'gi');
+  let m;
+  while ((m = re.exec(text))) starts.push(m.index + m[0].length);
+  return starts;
+}
+
+// Drops everything before the cursor. Returns { items, mid } where mid = reading starts in the middle.
+function fromCursor(editor, items) {
+  const doc = editor.state.doc;
+  const { from } = editor.state.selection;
+  const cur = getBlocks(doc).find((b) => from >= b.pos && from <= b.pos + b.node.nodeSize);
+  if (!cur) return { items, mid: false };
+
+  const at = items.findIndex((it) => it.index >= cur.index);
+  if (at === -1) return { items, mid: false };
+
+  const first = items[at];
+  let text = first.text;
+  let sentenceOffset = 0;
+
+  // inside a normal paragraph: start at the sentence the cursor is in
+  if (first.block) {
+    const start = cur.pos + 1;
+    const upTo = Math.max(start, Math.min(from, cur.pos + cur.node.nodeSize - 1));
+    const offset = doc.textBetween(start, upTo).length;
+    for (const s of sentenceStarts(first.text)) if (s <= offset) sentenceOffset = s;
+    text = first.text.slice(sentenceOffset);
+  }
+
+  return {
+    items: [{ ...first, text }, ...items.slice(at + 1)],
+    mid: at > 0 || sentenceOffset > 0,
+  };
+}
+
 // ---------- highlight while reading ----------
 function setHighlight(editor, index) {
   if (!editor || editor.isDestroyed) return;
   const b = getBlocks(editor.state.doc)[index];
   const meta = b ? { from: b.pos, to: b.pos + b.node.nodeSize } : null;
   editor.view.dispatch(editor.state.tr.setMeta(flashKey, meta).setMeta('addToHistory', false));
+}
+
+// Keeps the line that is being read in view (only scrolls when it is off-screen)
+function followScroll(editor, index) {
+  if (!editor || editor.isDestroyed) return;
+  const b = getBlocks(editor.state.doc)[index];
+  if (b) scrollToPos(editor, b.pos, true);
 }
 
 export function stopReading(editor) {
@@ -280,7 +333,10 @@ export function readDocument(editor, { voiceName, rate = 0.95, onEnd } = {}) {
 
   const voice = synth.getVoices().find((v) => v.name === voiceName);
 
-  const items = [{ index: -1, text: INTRO }, ...buildItems(editor), { index: -1, text: OUTRO }];
+  const all = buildItems(editor);
+  const { items: body, mid } = START_FROM_CURSOR ? fromCursor(editor, all) : { items: all, mid: false };
+  const items = [{ index: -1, text: mid ? INTRO_FROM_CURSOR : INTRO }, ...body, { index: -1, text: OUTRO }];
+
   const parts = [];
   for (const item of items) {
     const spoken = toSpoken(item.text);
@@ -308,7 +364,11 @@ export function readDocument(editor, { voiceName, rate = 0.95, onEnd } = {}) {
     }
     u.rate = rate;
     u.pitch = PITCH;
-    u.onstart = () => { if (id === runId) setHighlight(editor, p.index); };
+    u.onstart = () => {
+      if (id !== runId) return;
+      setHighlight(editor, p.index);
+      followScroll(editor, p.index);
+    };
     u.onend = () => { if (i === parts.length - 1) finish(); };
     u.onerror = (e) => { if (e.error !== 'canceled' && e.error !== 'interrupted') finish(); };
     synth.speak(u);

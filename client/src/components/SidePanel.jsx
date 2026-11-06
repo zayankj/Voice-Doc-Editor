@@ -1,10 +1,30 @@
 import { useState } from 'react';
-import VoiceSettings from './VoiceSettings';
 import HistoryPanel from './HistoryPanel';
 
+const MicIcon = () => (
+  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="9" y="2" width="6" height="12" rx="3" />
+    <path d="M5 11a7 7 0 0 0 14 0" />
+    <path d="M12 18v4" />
+  </svg>
+);
+
+const SpeakerIcon = () => (
+  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M11 5 6 9H3v6h3l5 4V5z" />
+    <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+    <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+  </svg>
+);
+
+const StopIcon = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+    <rect x="6" y="6" width="12" height="12" rx="2" />
+  </svg>
+);
+
 export default function SidePanel({
-  status, onMic, reading, onRead, applying,
-  voices, voiceName, onVoice, rate, onRate,
+  status, micDetail, onMic, reading, onRead, applying,
   transcript, reply, note, error,
   attached, onPickFile, onDropFile, onClearFile,
   instruction, onInstruction, onApply,
@@ -12,7 +32,8 @@ export default function SidePanel({
 }) {
   const [tab, setTab] = useState('smart');
   const busyMic = status !== 'idle';
-  const micLabel = { idle: 'Tap to record', connecting: 'Connecting...', listening: 'Listening... tap to stop' }[status];
+  const micLabel =
+    micDetail || (status === 'connecting' ? 'Connecting...' : status === 'listening' ? 'Listening... tap to stop' : 'Mic');
   const canApply = Boolean(attached || instruction.trim()) && !applying && !busyMic;
 
   return (
@@ -26,32 +47,34 @@ export default function SidePanel({
 
       {tab === 'smart' ? (
         <div className="side-body">
-          <div>
-            <div className="section-title">Record voice note</div>
-            <div className="voice-card">
+          <div className="round-row">
+            <div className="round-item">
               <button
-                className={`mic-sm ${status}`}
+                className={`round-btn mic ${status}`}
                 onClick={onMic}
                 disabled={status === 'connecting' || applying}
-                aria-label="Record voice command"
+                aria-label="Mic"
+                title="Record a voice command"
               >
-                {status === 'listening' ? '■' : '🎤'}
+                {status === 'listening' ? <StopIcon /> : <MicIcon />}
               </button>
-              <div>
-                <b>{micLabel}</b>
-                <span>Say what to change, e.g. "change the discharge date to today".</span>
-              </div>
+              <span className="round-label">{micLabel}</span>
             </div>
-          </div>
 
-          <div>
-            <div className="readrow">
-              <button className="btn" onClick={onRead} disabled={busyMic || applying}>
-                {reading ? '■ Stop reading' : '🔊 Read aloud'}
+            <div className="round-item">
+              <button
+                className={`round-btn read ${reading ? 'on' : ''}`}
+                onClick={onRead}
+                disabled={busyMic || applying}
+                aria-label="Read aloud"
+                title="Read the document aloud"
+              >
+                {reading ? <StopIcon /> : <SpeakerIcon />}
               </button>
+              <span className="round-label">{reading ? 'Stop' : 'Read'}</span>
             </div>
-            <VoiceSettings voices={voices} voiceName={voiceName} onVoice={onVoice} rate={rate} onRate={onRate} />
           </div>
+          <p className="hint">Tap Mic, say what to change, then pause. Tap it again to stop.</p>
 
           <div>
             <div className="section-title">Attach file <span className="opt">(optional)</span></div>

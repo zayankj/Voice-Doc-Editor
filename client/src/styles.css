@@ -129,3 +129,16 @@ textarea.instr { width: 100%; min-height: 90px; border: 1px solid #d4d8de; borde
   body { background: #fff; }
   .ProseMirror .flash { background: none; box-shadow: none; }
 }
+
+/* Mic and Read round buttons */
+.round-row { display: flex; justify-content: space-evenly; align-items: flex-start; padding: 8px 0 0; }
+.round-item { display: flex; flex-direction: column; align-items: center; gap: 8px; width: 150px; text-align: center; }
+.round-btn { width: 68px; height: 68px; border-radius: 50%; display: grid; place-items: center; border: 2px solid #c9ced6; background: #fff; color: #2b2f36; transition: background .15s; }
+.round-btn:hover:not(:disabled) { background: #f4f5f7; }
+.round-btn:disabled { opacity: .45; cursor: not-allowed; }
+.round-btn.mic { background: #e5334f; border-color: #e5334f; color: #fff; }
+.round-btn.mic:hover:not(:disabled) { background: #cf2a45; }
+.round-btn.mic.listening { animation: pulse 1.2s infinite; }
+.round-btn.read.on { background: #e3ebff; border-color: #7aa2f7; color: #1d4ed8; }
+.round-label { font-size: 13px; color: #555; min-height: 18px; }
+.hint { margin: 0; text-align: center; font-size: 12px; color: #8a9099; }
