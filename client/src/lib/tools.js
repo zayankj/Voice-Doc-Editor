@@ -43,7 +43,7 @@ ${outline}
 
 Rules:
 - The user speaks an edit command. Call edit_text once for each block that must change.
-- Change ONLY what was asked. Never touch other blocks, headings or labels.
+- Change ONLY what was asked, plus the consistency fixes described below. Never touch unrelated blocks, headings or labels.
 - In tables, edit the VALUE cell next to the label (e.g. "Date of Discharge" label -> change the cell after it).
 - For a small change inside a sentence, use replace_text with the exact find_text. If unsure, use set with the full new text for that block.
 - If the request is ambiguous (e.g. "change the date" with two dates), do not edit. Ask one short question.

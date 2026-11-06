@@ -326,16 +326,21 @@ export function stopReading(editor) {
   setHighlight(editor, -1);
 }
 
-export function readDocument(editor, { voiceName, rate = 0.95, onEnd } = {}) {
+// intro = false: no opening line (used when reading restarts after a click)
+export function readDocument(editor, { voiceName, rate = 0.95, intro = true, onEnd } = {}) {
   const synth = window.speechSynthesis;
   const id = ++runId;
-  synth.cancel();
+  synth.cancel(); // also stops a reading that is already running
 
   const voice = synth.getVoices().find((v) => v.name === voiceName);
 
   const all = buildItems(editor);
   const { items: body, mid } = START_FROM_CURSOR ? fromCursor(editor, all) : { items: all, mid: false };
-  const items = [{ index: -1, text: mid ? INTRO_FROM_CURSOR : INTRO }, ...body, { index: -1, text: OUTRO }];
+  const items = [
+    ...(intro ? [{ index: -1, text: mid ? INTRO_FROM_CURSOR : INTRO }] : []),
+    ...body,
+    { index: -1, text: OUTRO },
+  ];
 
   const parts = [];
   for (const item of items) {

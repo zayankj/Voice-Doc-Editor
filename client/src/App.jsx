@@ -16,7 +16,7 @@ import { Flash, getFlashRanges } from './lib/flash';
 import { FontSize, LineHeight } from './lib/extensions';
 import { docxToHtml } from './lib/docxImport';
 import { buildOutline } from './lib/outline';
-import { applyVoiceEdit } from './lib/voiceEdit';
+import { applyVoiceEdit, applyPatientConsistency, getPatientFacts } from './lib/voiceEdit';
 import { scrollToPos, scrollToFirstChange } from './lib/scroll';
 import { findMissingFields } from './lib/validate';
 import { startLive } from './lib/liveClient';
@@ -41,6 +41,7 @@ const VOICE_MODE = import.meta.env.VITE_VOICE_MODE === 'live' ? 'live' : 'audio'
 const IDLE_STOP_MS = 5 * 60 * 1000; // the mic turns itself off after this long without speech
 const MAX_QUEUE = 5; // commands that may wait while a previous one is being applied
 const READ_RATE = 1.1; // reading speed for Read aloud (0.95 = normal, 1.1 = fast)
+const RESTART_ON_CLICK = true; // while reading, clicking in the document restarts reading from the clicked sentence
 
 const STORE = 'voice-doc-html';
 const EMPTY = '<p>Click <b>File → Open .docx</b> to load a document, then use the mic to edit it by voice.</p>';
@@ -150,19 +151,25 @@ export default function App() {
   // ---------- one edit (used by voice AND by Apply Edit) ----------
   // scroll: bring the changed line into view if it is off-screen (batches scroll once at the end instead)
   function handleEdit(args, { scroll = true } = {}) {
+    const factsBefore = getPatientFacts(editor.state.doc);
     const r = applyVoiceEdit(editor, args);
     if (!r.ok) return { ok: false, error: r.error };
+    // Header age/gender changed -> also fix "60-year-old female" etc. in the rest of the document
+    const synced = applyPatientConsistency(editor, factsBefore);
     if (scroll && r.pos != null) scrollToPos(editor, r.pos, true);
+    const at = new Date().toLocaleTimeString();
+    // One history entry: the edit and its consistency fixes are undone together
+    const extra = synced.length ? ` (+${synced.length} matching place${synced.length > 1 ? 's' : ''} updated)` : '';
     setHistory((h) => [
       {
-        label: args.field_label || args.block_id,
+        label: (args.field_label || args.block_id) + extra,
         before: r.before || '(empty)',
         after: r.after || '(empty)',
-        at: new Date().toLocaleTimeString(),
+        at,
       },
       ...h,
     ]);
-    return { ok: true, new_text: r.after };
+    return { ok: true, new_text: r.after, also_updated: synced.map((c) => c.after) };
   }
 
   function undo() {
@@ -201,6 +208,32 @@ export default function App() {
       onEnd: () => setReading(false),
     });
   }
+
+  // While reading, a click inside the document restarts the reading from the clicked sentence
+  useEffect(() => {
+    if (!RESTART_ON_CLICK || !reading || !editor) return undefined;
+    const dom = editor.view.dom;
+    let timer;
+
+    const onClick = () => {
+      clearTimeout(timer);
+      // small delay: lets the editor move the cursor to the clicked place first (and ignores a double click)
+      timer = setTimeout(() => {
+        readDocument(editor, {
+          voiceName: activeVoice?.name,
+          rate: READ_RATE,
+          intro: false, // no opening line, just continue from where you clicked
+          onEnd: () => setReading(false),
+        });
+      }, 150);
+    };
+
+    dom.addEventListener('click', onClick);
+    return () => {
+      clearTimeout(timer);
+      dom.removeEventListener('click', onClick);
+    };
+  }, [reading, editor, activeVoice]);
 
   // ---------- send a file / text / voice clip to the server and apply the edits it returns ----------
   // voice = true: a spoken command. It does not touch the Apply Edit button.

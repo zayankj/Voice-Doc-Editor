@@ -1,5 +1,8 @@
 import { getBlocks } from './outline';
 import { flashKey } from './flash';
+import { getPatientFacts, syncPatientFacts } from './consistency';
+
+export { getPatientFacts };
 
 const HIGHLIGHT_MS = 5000; // how long changed text stays highlighted (5 seconds)
 let clearTimer;
@@ -83,4 +86,19 @@ export function applyVoiceEdit(editor, args) {
   scheduleClear(editor);
 
   return { ok: true, before, after: changed.textContent, pos };
+}
+
+// If the patient's age or gender in the header changed (factsBefore -> now), update every
+// narrative phrase like "60 -YEAR OLD FEMALE" to match. Changed blocks are highlighted too.
+export function applyPatientConsistency(editor, factsBefore) {
+  const now = getPatientFacts(editor.state.doc);
+  const ageChanged = now.age && now.age !== factsBefore.age;
+  const genderChanged = now.gender && now.gender !== factsBefore.gender;
+  if (!ageChanged && !genderChanged) return [];
+
+  const changes = syncPatientFacts(editor, now, (tr, pos, node) => {
+    tr.setMeta(flashKey, { add: { from: pos, to: pos + node.nodeSize } });
+  });
+  if (changes.length) scheduleClear(editor);
+  return changes;
 }
