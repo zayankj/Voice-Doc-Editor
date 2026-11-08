@@ -26,11 +26,14 @@ async function toPayload(file) {
 
 // file, instruction and audio are all optional, but at least one is needed.
 // audio = { base64, mimeType } (a recorded voice command). Returns { edits, summary, heard }.
-export async function extractEdits({ file, instruction = '', audio = null, outline, today }) {
+// templateId: only for department templates (e.g. "nursing-assessment"). Summaries send none,
+// so the server uses exactly the same discharge summary prompt as before.
+export async function extractEdits({ file, instruction = '', audio = null, outline, today, templateId = '' }) {
   if (file && file.size > MAX_MB * 1024 * 1024) throw new Error(`File is too large (max ${MAX_MB} MB)`);
   const payload = file ? await toPayload(file) : {};
 
   const body = { outline, today, instruction: instruction.trim(), fileName: file?.name, ...payload };
+  if (templateId) body.templateId = templateId;
   if (audio) {
     body.audioBase64 = audio.base64;
     body.audioMimeType = audio.mimeType;

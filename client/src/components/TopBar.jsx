@@ -1,8 +1,8 @@
 import Dropdown from './Dropdown';
 
 export default function TopBar({
-  editor, title, saved, userInitial,
-  onOpen, onExportDocx, onPrint, onInsertImage, onZoom, onValidate,
+  editor, title, saved, userInitial, onBack, backLabel = '← Back',
+  onOpen, onExportDocx, onPrint, onInsertImage, onZoom, onValidate, onFixConsistency,
 }) {
   const cmd = (fn) => () => {
     if (editor) fn(editor.chain().focus()).run();
@@ -42,6 +42,7 @@ export default function TopBar({
     ]],
     ['Validate', [
       { label: 'Find missing fields', onClick: onValidate },
+      ...(onFixConsistency ? [{ label: 'Fix age / gender everywhere', onClick: onFixConsistency }] : []),
     ]],
     ['Help', [
       { info: 'Voice: tap the mic and say "change the discharge date to today\'s date".' },
@@ -53,7 +54,11 @@ export default function TopBar({
 
   return (
     <header className="topbar">
-      <span className="logo">▤</span>
+      {onBack ? (
+        <button className="back-btn" onClick={onBack} title="Back to the list">{backLabel}</button>
+      ) : (
+        <span className="logo">▤</span>
+      )}
       <div className="doc-title">
         <b>{title}</b>
         <span className={`saved ${saved ? '' : 'saving'}`}>{saved ? '✓ Saved' : 'Saving…'}</span>
@@ -73,7 +78,7 @@ export default function TopBar({
           { label: 'PDF (print dialog)', onClick: onPrint },
         ]}
       />
-      <div className="avatar">{userInitial}</div>
+      {userInitial && <div className="avatar">{userInitial}</div>}
     </header>
   );
 }

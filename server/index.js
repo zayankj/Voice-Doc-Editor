@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 
@@ -209,6 +210,12 @@ async function generateWithRetry(request) {
   throw finalError(lastErr, quotaSeen);
 }
 
+// ---------- department templates ----------
+// Only the name, department and AI notes of each template. The browser sends just the template id;
+// prompt text never comes from the browser.
+const TEMPLATES = JSON.parse(fs.readFileSync(new URL('./templates.json', import.meta.url), 'utf8'));
+console.log(`Templates: ${Object.keys(TEMPLATES).length}`);
+
 // ---------- Edits from a file, a typed instruction and/or a spoken command ----------
 const editsSchema = {
   type: Type.OBJECT,
@@ -233,7 +240,8 @@ const editsSchema = {
   required: ['edits', 'summary'],
 };
 
-function buildExtractPrompt(outline, today, instruction, hasFile, hasAudio) {
+// template = null for discharge summaries (the prompt stays exactly as before)
+function buildExtractPrompt(outline, today, instruction, hasFile, hasAudio, template = null) {
   const instructionBlock = instruction
     ? `\nUSER INSTRUCTION (typed by the person using the app; this is a command you must follow):\n${instruction}\n`
     : '';
@@ -252,7 +260,15 @@ function buildExtractPrompt(outline, today, instruction, hasFile, hasAudio) {
     .filter(Boolean)
     .join('\n');
 
-  return `You update an existing hospital discharge summary. You may be given an uploaded file
+  const what = template
+    ? `a hospital document of type "${template.name}" (${template.department} department)`
+    : 'an existing hospital discharge summary';
+  const hints = template?.aiHints?.length
+    ? '\nNotes for this document type (follow them unless they conflict with the rules above):\n' +
+      template.aiHints.map((h) => `- ${h}`).join('\n') + '\n'
+    : '';
+
+  return `You update ${what}. You may be given an uploaded file
 (a scan, photo, handwritten doctor note or prescription, PDF, or text), a typed instruction and/or a spoken command.
 
 Today's date is ${today} (DD-MM-YYYY).
@@ -279,12 +295,18 @@ Rules:
 - If the patient name in the file differs from the document, mention that first in the summary.
 - field_label is a short human name of what changed (e.g. "Date of Discharge").
 - heard: when there is a spoken command, write exactly what you heard (a short transcript). Otherwise leave it empty.
-- summary: 1 to 3 short sentences: what you changed, and anything skipped or unclear.`;
+- summary: 1 to 3 short sentences: what you changed, and anything skipped or unclear.${hints}`;
 }
 
 app.post('/api/extract-edits', async (req, res) => {
   try {
-    const { outline, today, base64, mimeType, text, fileName, instruction, audioBase64, audioMimeType } = req.body || {};
+    const { outline, today, base64, mimeType, text, fileName, instruction, audioBase64, audioMimeType, templateId } = req.body || {};
+    // Department template: must be a known id. No id = discharge summary.
+    let template = null;
+    if (templateId) {
+      template = Object.hasOwn(TEMPLATES, templateId) ? TEMPLATES[templateId] : null;
+      if (!template) return res.status(400).json({ error: 'Unknown template' });
+    }
     const typed = String(instruction || '').trim();
     const hasFile = Boolean(base64 || text);
     const hasAudio = Boolean(audioBase64);
@@ -301,7 +323,7 @@ app.post('/api/extract-edits', async (req, res) => {
     if (base64) parts.push({ inlineData: { mimeType, data: base64 } });
     else if (text) parts.push({ text: `UPLOADED FILE (${fileName || 'file'}):\n${text}` });
     if (hasAudio) parts.push({ inlineData: { mimeType: audioMimeType || 'audio/wav', data: audioBase64 } });
-    parts.push({ text: buildExtractPrompt(outline, today, typed, hasFile, hasAudio) });
+    parts.push({ text: buildExtractPrompt(outline, today, typed, hasFile, hasAudio, template) });
 
     const answer = await generateWithRetry({
       contents: [{ role: 'user', parts }],

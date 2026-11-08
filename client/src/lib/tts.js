@@ -76,8 +76,12 @@ function spokenDate(d, m, y) {
   return `${day} ${MONTHS[month - 1]} ${y}`;
 }
 
-// "9494705601" -> "9 4 9 4 7 0 5 6 0 1"
-const SPELL = (s) => s.split('').join(' ');
+// Digits are spoken as WORDS. Some voices (Chrome's Google voices) read a lone "0" as the letter "O",
+// so "0019" is spoken as "zero zero one nine".
+const DIGIT_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+const SPELL_DIGITS = (s) => s.split('').map((d) => DIGIT_WORDS[Number(d)]).join(' ');
+// "STR" -> "S T R"
+const SPELL_LETTERS = (s) => s.split('').join(' ');
 
 // Splits a run of digits into small groups so it can be read with pauses
 function groupDigits(d) {
@@ -88,20 +92,21 @@ function groupDigits(d) {
   return out;
 }
 
-// "STR - 721" -> "S T R, 7 2 1"     "IP00019814" -> "I P, 0 0 0 1, 9 8 1 4"
+// "STR - 721" -> "S T R, seven two one"     "IP00019814" -> "I P, zero zero zero one, nine eight one four"
 function spellOut(value) {
   const runs = value.replace(/[\s-]+/g, '').match(/[A-Za-z]+|\d+/g) || [];
   const spoken = [];
   for (const run of runs) {
-    if (/^\d+$/.test(run)) groupDigits(run).forEach((g) => spoken.push(SPELL(g)));
-    else spoken.push(SPELL(run.toUpperCase()));
+    if (/^\d+$/.test(run)) groupDigits(run).forEach((g) => spoken.push(SPELL_DIGITS(g)));
+    else spoken.push(SPELL_LETTERS(run.toUpperCase()));
   }
   return spoken.join(', ');
 }
 
-// ---------- ID fields: "Patient mobile no : 949..." -> "patient mobile number is 9 4 9 ..." ----------
+// ---------- ID fields: "Patient mobile no : 949..." -> "patient mobile number is nine four nine ..." ----------
 const NUM = '(?:no|number|num)\\b\\.?';
-const VALUE = '((?:[A-Za-z]{1,5}\\s*-?\\s*)?\\d[\\d\\s-]*\\d|\\d|not\\s+specified)';
+// a value is: letters + digits (IP00019814, STR - 721), digits, "Not Specified", or a dash (empty)
+const VALUE = '((?:[A-Za-z]{1,5}\\s*-?\\s*)?\\d[\\d\\s-]*\\d|\\d|not\\s+specified|[—–])';
 
 const ID_RULES = [
   {
@@ -111,6 +116,7 @@ const ID_RULES = [
   },
   { src: `reg(?:istration)?\\s*${NUM}`, say: () => 'registration number' },
   { src: `ip\\s*${NUM}`, say: () => 'I P number' },
+  { src: `op\\s*${NUM}`, say: () => 'O P number' },
   { src: `bed\\s*${NUM}`, say: () => 'bed number' },
   { src: `patient\\s*${NUM}`, say: () => 'patient number' },
 ].map(({ src, say }) => ({ re: new RegExp(`\\b(${src})\\s*[:\\-]?\\s*${VALUE}`, 'gi'), say }));
@@ -119,7 +125,7 @@ function speakIds(text) {
   let t = text;
   for (const { re, say } of ID_RULES) {
     t = t.replace(re, (m, label, value) => {
-      if (/^not/i.test(value)) return `${say(label)} is not specified`;
+      if (/^(not|[—–])/i.test(value)) return `${say(label)} is not specified`;
       return `${say(label)} is ${SPELL_ID_DIGITS ? spellOut(value) : value}`;
     });
   }
@@ -133,12 +139,12 @@ export function toSpoken(input) {
 
   t = t.replace(/[\u26A0\uFE0F]/g, ''); // warning symbol
 
-  // ID fields (mobile, registration, IP, bed, patient number)
+  // ID fields (mobile, registration, IP, OP, bed, patient number)
   t = speakIds(t);
 
   // phone numbers without a label: landline 0492 2351111, or any run of 10+ digits
-  t = t.replace(/\b0\d{2,4}[\s-]\d{6,8}\b/g, (m) => m.split(/[\s-]+/).map(SPELL).join(', '));
-  t = t.replace(/\b\d{10,}\b/g, (m) => groupDigits(m).map(SPELL).join(', '));
+  t = t.replace(/\b0\d{2,4}[\s-]\d{6,8}\b/g, (m) => m.split(/[\s-]+/).map(SPELL_DIGITS).join(', '));
+  t = t.replace(/\b\d{10,}\b/g, (m) => groupDigits(m).map(SPELL_DIGITS).join(', '));
 
   // age and gender: "60 Y / FEMALE" -> "60 year old female",  "Female / 15" -> "15 year old female"
   t = t.replace(
@@ -148,6 +154,9 @@ export function toSpoken(input) {
   t = t.replace(/\b(male|female)\s*\/\s*(\d{1,3})\b/gi, (m, g, age) => `${age} year old ${g.toLowerCase()}`);
   t = t.replace(/\bGender\s*\/\s*Age\b/gi, 'Gender and age');
 
+  // age on its own: "20 Y" or "20 yrs" -> "20 years"
+  t = t.replace(/\b(\d{1,3})\s*(?:y|yrs?)\b/gi, (m, n) => `${n} ${Number(n) === 1 ? 'year' : 'years'}`);
+
   // dates: 23-10-2026, 23/10/2026, 06/11/26
   t = t.replace(/\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/g, (m, d, mo, y) => spokenDate(d, mo, y) ?? m);
   t = t.replace(/\b(\d{1,2})\/(\d{1,2})\/(\d{2})\b/g, (m, d, mo, y) => spokenDate(d, mo, `20${y}`) ?? m);
@@ -155,8 +164,11 @@ export function toSpoken(input) {
   // numbers written with commas: 3,86,000 -> 386000
   t = t.replace(/\b\d{1,3}(?:,\d{2,3})+\b/g, (m) => m.replace(/,/g, ''));
 
-  // dosage pattern 1-0-1 -> "1, 0, 1"
-  t = t.replace(/\b(\d)-(\d)-(\d)\b/g, '$1, $2, $3');
+  // dosage pattern 1-0-1 -> "one, zero, one"
+  t = t.replace(
+    /\b(\d)-(\d)-(\d)\b/g,
+    (m, a, b, c) => `${DIGIT_WORDS[a]}, ${DIGIT_WORDS[b]}, ${DIGIT_WORDS[c]}`
+  );
 
   // blood pressure 120/80 -> "120 over 80"
   t = t.replace(/\b(\d{2,3})\/(\d{2,3})\b/g, '$1 over $2');
@@ -197,6 +209,12 @@ export function toSpoken(input) {
 
   // punctuation that sounds odd when spoken
   t = t.replace(/\s*[—–]\s*/g, ', ').replace(/\s\/\s/g, ', ');
+
+  // qualifications written without spaces: "MBBS,MD,DNB" -> "M B B S, M D, D N B"
+  t = t.replace(/\b[A-Z]{2,8}(?:,[A-Z]{2,8}){2,}\b/g, (m) => m.split(',').map(SPELL_LETTERS).join(', '));
+
+  // short ALL-CAPS label words that some voices would spell letter by letter
+  t = t.replace(/\b(AGE|SEX|NAME|DATE|WARD|ROOM|TIME|TYPE|MALE)\b/g, (w) => w.toLowerCase());
 
   // ALL-CAPS words of 5+ letters are read as normal words (short ones like CBC stay as letters)
   t = t.replace(/\b[A-Z]{5,}\b/g, (w) => w.toLowerCase());
@@ -327,7 +345,8 @@ export function stopReading(editor) {
 }
 
 // intro = false: no opening line (used when reading restarts after a click)
-export function readDocument(editor, { voiceName, rate = 0.95, intro = true, onEnd } = {}) {
+// introText: the opening line (default: the discharge summary line), e.g. "Reading the Nursing Assessment now."
+export function readDocument(editor, { voiceName, rate = 0.95, intro = true, introText = INTRO, onEnd } = {}) {
   const synth = window.speechSynthesis;
   const id = ++runId;
   synth.cancel(); // also stops a reading that is already running
@@ -337,7 +356,7 @@ export function readDocument(editor, { voiceName, rate = 0.95, intro = true, onE
   const all = buildItems(editor);
   const { items: body, mid } = START_FROM_CURSOR ? fromCursor(editor, all) : { items: all, mid: false };
   const items = [
-    ...(intro ? [{ index: -1, text: mid ? INTRO_FROM_CURSOR : INTRO }] : []),
+    ...(intro ? [{ index: -1, text: mid ? INTRO_FROM_CURSOR : introText }] : []),
     ...body,
     { index: -1, text: OUTRO },
   ];

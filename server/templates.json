@@ -1,0 +1,101 @@
+{
+  "patient-registration": {
+    "name": "Patient Registration",
+    "department": "Reception",
+    "status": "sample",
+    "aiHints": [
+      "Values are written as {{placeholder}} markers. When the user, the file or the voice command gives a value, replace the marker with that value (replace_text, find_text = the exact marker).",
+      "If a value is not given, leave its {{placeholder}} marker unchanged. Never invent patient details."
+    ]
+  },
+  "opd-consultation-note": {
+    "name": "OPD Consultation Note",
+    "department": "OPD",
+    "status": "demo",
+    "aiHints": []
+  },
+  "follow-up-consultation": {
+    "name": "Follow-up Consultation",
+    "department": "OPD",
+    "status": "demo",
+    "aiHints": []
+  },
+  "patient-admission-assessment": {
+    "name": "Patient Admission Assessment",
+    "department": "IPD / Ward",
+    "status": "demo",
+    "aiHints": []
+  },
+  "patient-progress-notes": {
+    "name": "Patient Progress Notes",
+    "department": "IPD / Ward",
+    "status": "demo",
+    "aiHints": []
+  },
+  "nursing-assessment": {
+    "name": "Nursing Assessment",
+    "department": "Nursing",
+    "status": "demo",
+    "aiHints": []
+  },
+  "nursing-progress-notes": {
+    "name": "Nursing Progress Notes",
+    "department": "Nursing",
+    "status": "demo",
+    "aiHints": []
+  },
+  "emergency-initial-assessment": {
+    "name": "Emergency Initial Assessment",
+    "department": "Emergency",
+    "status": "demo",
+    "aiHints": []
+  },
+  "triage-assessment": {
+    "name": "Triage Assessment",
+    "department": "Emergency",
+    "status": "demo",
+    "aiHints": []
+  },
+  "preoperative-assessment": {
+    "name": "Preoperative Assessment",
+    "department": "Operation Theatre",
+    "status": "demo",
+    "aiHints": []
+  },
+  "operative-notes": {
+    "name": "Operative Notes",
+    "department": "Operation Theatre",
+    "status": "demo",
+    "aiHints": []
+  },
+  "medical-assessment": {
+    "name": "Medical Assessment",
+    "department": "General Medicine",
+    "status": "demo",
+    "aiHints": []
+  },
+  "clinical-progress-notes": {
+    "name": "Clinical Progress Notes",
+    "department": "General Medicine",
+    "status": "demo",
+    "aiHints": []
+  },
+  "orthopedic-consultation": {
+    "name": "Orthopedic Consultation",
+    "department": "Orthopedics",
+    "status": "demo",
+    "aiHints": []
+  },
+  "cardiology-consultation": {
+    "name": "Cardiology Consultation",
+    "department": "Cardiology",
+    "status": "demo",
+    "aiHints": []
+  },
+  "pediatric-assessment": {
+    "name": "Pediatric Assessment",
+    "department": "Pediatrics",
+    "status": "demo",
+    "aiHints": []
+  }
+}

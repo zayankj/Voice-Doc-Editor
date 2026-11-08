@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useEditor } from '@tiptap/react';
+import { EditorState } from '@tiptap/pm/state';
 import StarterKit from '@tiptap/starter-kit';
 import Underline from '@tiptap/extension-underline';
 import TextStyle from '@tiptap/extension-text-style';
@@ -13,12 +14,15 @@ import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
 
 import { Flash, getFlashRanges } from './lib/flash';
+import { Placeholders } from './lib/placeholders';
 import { FontSize, LineHeight } from './lib/extensions';
 import { docxToHtml } from './lib/docxImport';
 import { buildOutline } from './lib/outline';
-import { applyVoiceEdit, applyPatientConsistency, getPatientFacts } from './lib/voiceEdit';
+import { applyVoiceEdit, applyPatientConsistency, ensurePatientConsistency, getPatientFacts } from './lib/voiceEdit';
+import { genderStatedIn } from './lib/consistency';
 import { scrollToPos, scrollToFirstChange } from './lib/scroll';
 import { findMissingFields } from './lib/validate';
+import { genderChangeAllowed } from './lib/guards';
 import { startLive } from './lib/liveClient';
 import { startCapture } from './lib/audio';
 import { createSegmenter } from './lib/vad';
@@ -32,8 +36,23 @@ import FormatBar from './components/FormatBar';
 import Ruler from './components/Ruler';
 import DocEditor from './components/DocEditor';
 import SidePanel from './components/SidePanel';
+import Sidebar from './components/Sidebar';
+import AppHeader from './components/AppHeader';
+import Placeholder from './pages/Placeholder';
+import Summaries from './pages/Summaries';
+import Templates from './pages/Templates';
+import { findDepartment, findTemplate, findTemplateById, templateStartHtml } from './data/templates';
+import {
+  listTemplateDocs, createTemplateDoc, getTemplateDocHtml, getTemplateDocMeta, saveTemplateDocHtml, deleteTemplateDoc,
+} from './lib/templateDocs';
+import { useRoute, go, DEFAULT_PAGE } from './lib/route';
+import {
+  listSummaries, createSummary, getSummaryHtml, saveSummaryHtml, updateSummary, deleteSummary,
+} from './lib/summaries';
 
-const USER_INITIAL = 'U'; // letter shown in the round avatar at the top right
+const KNOWN_PAGES = new Set(['dashboard', 'summaries', 'create-summary', 'templates', 'activity', 'settings']);
+
+const USER_INITIAL = ''; // the user is now shown in the top header (AppHeader)
 
 // audio = the mic listens all the time, each command is sent after a pause (works with the Mumbai models).
 // live  = real-time Live model (needs GEMINI_API_KEY and a Live model; not available in the India region setup).
@@ -42,11 +61,25 @@ const IDLE_STOP_MS = 5 * 60 * 1000; // the mic turns itself off after this long 
 const MAX_QUEUE = 5; // commands that may wait while a previous one is being applied
 const READ_RATE = 1.1; // reading speed for Read aloud (0.95 = normal, 1.1 = fast)
 const RESTART_ON_CLICK = true; // while reading, clicking in the document restarts reading from the clicked sentence
+// TEMPORARY voice debugging. Logs ONLY numbers, block ids, operations and labels (no patient text,
+// no transcript). Remove this together with the [voice-debug] lines when we finish.
+const DEBUG_VOICE = true;
+// Average and peak loudness of a recorded clip (0 = silence, 1 = maximum)
+function clipLevels(chunks) {
+  let sum = 0, n = 0, peak = 0;
+  for (const b64 of chunks) {
+    const bin = atob(b64);
+    for (let i = 0; i + 1 < bin.length; i += 2) {
+      let v = bin.charCodeAt(i) | (bin.charCodeAt(i + 1) << 8);
+      if (v >= 0x8000) v -= 0x10000;
+      const f = Math.abs(v) / 0x8000;
+      sum += f * f; n++; if (f > peak) peak = f;
+    }
+  }
+  return { avg: +Math.sqrt(sum / (n || 1)).toFixed(4), peak: +peak.toFixed(3) };
+}
 
-const STORE = 'voice-doc-html';
-const EMPTY = '<p>Click <b>File → Open .docx</b> to load a document, then use the mic to edit it by voice.</p>';
-const load = () => { try { return localStorage.getItem(STORE) || EMPTY; } catch { return EMPTY; } };
-const save = (html) => { try { localStorage.setItem(STORE, html); } catch { /* ignore */ } };
+// Summaries are saved in this browser by lib/summaries.js (one entry per summary).
 
 export default function App() {
   const [history, setHistory] = useState([]);
@@ -56,7 +89,6 @@ export default function App() {
   const [transcript, setTranscript] = useState('');
   const [reply, setReply] = useState('');
   const [error, setError] = useState('');
-  const [fileName, setFileName] = useState('');
   const [reading, setReading] = useState(false);
   const [applying, setApplying] = useState(false); // Apply Edit button only (files / typed instructions)
   const [note, setNote] = useState('');
@@ -78,6 +110,10 @@ export default function App() {
   const imageInput = useRef(null);
   const saveTimer = useRef(null);
   const toastTimer = useRef(null);
+  const [summaries, setSummaries] = useState(listSummaries);
+  const [templateDocs, setTemplateDocs] = useState(listTemplateDocs); // documents made from department templates
+  // What is open in the editor right now: a summary id, or "tdoc:<document id>" for a document made from a template
+  const currentId = useRef(null);
 
   const editor = useEditor({
     extensions: [
@@ -95,17 +131,57 @@ export default function App() {
       TableHeader,
       TableCell,
       Flash,
+      Placeholders, // grey {{placeholders}} in template documents (looks only)
     ],
-    content: load(),
-    onUpdate: ({ editor }) => {
+    content: '',
+    onUpdate: ({ editor: ed }) => {
+      editorRef.current = ed;
       setSaved(false);
       clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => {
-        save(editor.getHTML());
-        setSaved(true);
-      }, 600);
+      saveTimer.current = setTimeout(() => flushSave(), 600);
     },
   });
+  // Always the live editor. (onUpdate above was created before the editor existed,
+  // so it must not rely on the "editor" variable of that first render.)
+  const editorRef = useRef(null);
+  editorRef.current = editor;
+
+  // Saves the open summary now (also called before switching to another summary,
+  // so the last typed letters are never saved into the wrong summary)
+  function flushSave() {
+    if (!saveTimer.current) return; // nothing changed since the last save (just looking does not save)
+    clearTimeout(saveTimer.current);
+    saveTimer.current = null;
+    const ed = editorRef.current;
+    if (!ed || ed.isDestroyed || !currentId.current) return;
+    try {
+      const key = currentId.current;
+      if (key.startsWith('tdoc:')) setTemplateDocs(saveTemplateDocHtml(key.slice(5), ed.getHTML(), ed.state.doc));
+      else setSummaries(saveSummaryHtml(key, ed.getHTML(), ed.state.doc));
+      setSaved(true);
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  // The department template open in the editor, or null for a discharge summary.
+  // Read from the ref (not from the page address) because voice commands run in callbacks
+  // that were created earlier and would otherwise see an old value.
+  function openTemplateId() {
+    const key = currentId.current || '';
+    return key.startsWith('tdoc:') ? getTemplateDocMeta(key.slice(5))?.templateId || '' : '';
+  }
+
+  // Puts a document into the editor with a FRESH undo memory,
+  // so Undo can never bring back text from a different summary.
+  function loadIntoEditor(html) {
+    editor.commands.setContent(html || '<p></p>', false);
+    editor.view.updateState(EditorState.create({ doc: editor.state.doc, plugins: editor.state.plugins }));
+    setHistory([]);
+    setNote(''); setError(''); setTranscript(''); setReply('');
+    setAttached(null); setInstruction('');
+    setSaved(true);
+  }
 
   // The reading voice is chosen automatically: the best female voice the browser has
   // (Microsoft Neerja Online (Natural) in Edge).
@@ -124,13 +200,10 @@ export default function App() {
     if (!file) return;
     try {
       const html = await docxToHtml(file);
-      editor.commands.setContent(html);
-      save(html);
-      setSaved(true);
-      setFileName(file.name);
-      setHistory([]);
-      setNote('');
-      setError('');
+      // A Word file always becomes a NEW summary; the open one is kept as it is
+      const { summary, list } = createSummary(html);
+      setSummaries(list);
+      go(`summaries/${summary.id}`);
     } catch (err) {
       console.error(err);
       setError('Could not read that .docx file');
@@ -150,10 +223,10 @@ export default function App() {
 
   // ---------- one edit (used by voice AND by Apply Edit) ----------
   // scroll: bring the changed line into view if it is off-screen (batches scroll once at the end instead)
-  function handleEdit(args, { scroll = true } = {}) {
+  function handleEdit(args, { scroll = true, allowGender = true } = {}) {
     const factsBefore = getPatientFacts(editor.state.doc);
-    const r = applyVoiceEdit(editor, args);
-    if (!r.ok) return { ok: false, error: r.error };
+    const r = applyVoiceEdit(editor, args, { allowGender });
+    if (!r.ok) return { ok: false, error: r.error, blocked: r.blocked };
     // Header age/gender changed -> also fix "60-year-old female" etc. in the rest of the document
     const synced = applyPatientConsistency(editor, factsBefore);
     if (scroll && r.pos != null) scrollToPos(editor, r.pos, true);
@@ -169,7 +242,30 @@ export default function App() {
       },
       ...h,
     ]);
-    return { ok: true, new_text: r.after, also_updated: synced.map((c) => c.after) };
+    return { ok: true, moved: Boolean(r.moved), new_text: r.after, also_updated: synced.map((c) => c.after) };
+  }
+
+  // Adds the automatic age/gender fixes to History (one entry). Returns how many blocks changed.
+  function recordConsistency(changes) {
+    if (!changes.length) return 0;
+    const at = new Date().toLocaleTimeString();
+    setHistory((h) => [
+      {
+        label: `Age / gender made consistent (${changes.length} place${changes.length > 1 ? 's' : ''})`,
+        before: changes.map((c) => c.before).join(' | '),
+        after: changes.map((c) => c.after).join(' | '),
+        at,
+      },
+      ...h,
+    ]);
+    return changes.length;
+  }
+
+  // Validate -> Fix age / gender everywhere (also after typing by hand)
+  function fixConsistency() {
+    const n = recordConsistency(ensurePatientConsistency(editor));
+    if (n) scrollToFirstChange(editor);
+    showToast(n ? `Fixed ${n} place${n > 1 ? 's' : ''} so age and gender match the header` : 'Age and gender already match everywhere');
   }
 
   function undo() {
@@ -202,9 +298,11 @@ export default function App() {
     }
     setError('');
     setReading(true);
+    const tpl = findTemplateById(openTemplateId())?.tpl;
     readDocument(editor, {
       voiceName: activeVoice?.name,
       rate: READ_RATE,
+      ...(tpl ? { introText: `Reading the ${tpl.name} now.` } : {}), // summaries keep their usual opening line
       onEnd: () => setReading(false),
     });
   }
@@ -249,6 +347,7 @@ export default function App() {
         audio,
         outline: buildOutline(editor.state.doc), // fresh snapshot of the document at this moment
         today: todayString(),
+        templateId: openTemplateId(), // '' for discharge summaries
       });
       if (heard) setTranscript(heard);
 
@@ -263,11 +362,40 @@ export default function App() {
         .sort((a, b) => blockNo(b.ed) - blockNo(a.ed) || b.i - a.i)
         .map((x) => x.ed);
 
+      // Gender may only change when the command talks about it (or a file was attached)
+      const allowGender = genderChangeAllowed({ instruction: text, heard, hasFile: Boolean(file) });
+
       let applied = 0;
       let skipped = 0;
+      const blockedWhy = []; // edits refused by the guards (locked label / unasked gender change)
+      const appliedValues = []; // new texts that were really applied
+      const debugRows = []; // [voice-debug]
       for (const ed of ordered) {
-        if (handleEdit(ed, { scroll: false }).ok) applied++;
+        const r = handleEdit(ed, { scroll: false, allowGender });
+        if (DEBUG_VOICE) debugRows.push({
+          block_id: ed.block_id, operation: ed.operation, field_label: ed.field_label,
+          result: r.ok ? (r.moved ? 'moved to section text' : 'applied') : r.blocked ? 'blocked' : 'failed',
+        });
+        if (r.ok) {
+          applied++;
+          // only CHANGED text can set a new gender; added sentences ("append") follow the patient's gender
+          if (ed.operation === 'set' || ed.operation === 'replace_text') appliedValues.push(ed.new_value || '');
+        }
+        else if (r.blocked) blockedWhy.push(`${ed.field_label || ed.block_id}: ${r.error}`);
         else skipped++;
+      }
+      if (DEBUG_VOICE) {
+        console.info(`[voice-debug] ${label}: model returned ${edits.length} edit(s)`);
+        if (debugRows.length) console.table(debugRows);
+      }
+
+      // Age / gender must be the same everywhere. If this command set a gender somewhere
+      // (e.g. only in Course in Hospital), that gender goes to the header and everywhere else too.
+      // Also repairs places that were already wrong.
+      let alsoFixed = 0;
+      if (applied) {
+        const target = allowGender ? genderStatedIn(appliedValues) : null;
+        alsoFixed = recordConsistency(ensurePatientConsistency(editor, target));
       }
 
       if (applied) {
@@ -283,7 +411,11 @@ export default function App() {
       const head = applied
         ? `${applied} change${applied > 1 ? 's' : ''} applied from ${label}. Changed parts are highlighted in yellow.`
         : `No changes were made from ${label}.`;
-      setNote([head, skipped ? `${skipped} could not be applied.` : '', summary].filter(Boolean).join(' '));
+      const blockedNote = blockedWhy.length
+        ? `🔒 Blocked ${blockedWhy.length} change${blockedWhy.length > 1 ? 's' : ''} (${blockedWhy.join('; ')}).`
+        : '';
+      const fixedNote = alsoFixed ? `Also updated ${alsoFixed} other place${alsoFixed > 1 ? 's' : ''} so age and gender match everywhere.` : '';
+      setNote([head, fixedNote, blockedNote, skipped ? `${skipped} could not be applied.` : '', summary].filter(Boolean).join(' '));
       return true;
     } catch (err) {
       console.error(err);
@@ -318,6 +450,10 @@ export default function App() {
       while (queue.current.length) {
         const clip = queue.current.shift();
         const { base64, seconds } = pcmChunksToWav(clip);
+        if (DEBUG_VOICE) {
+          const lv = clipLevels(clip);
+          console.info('[voice-debug] clip', { seconds: +seconds.toFixed(1), avgLevel: lv.avg, peakLevel: lv.peak, sent: seconds >= 0.5 });
+        }
         if (seconds < 0.5) continue;
         await runEdits({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
       }
@@ -432,11 +568,120 @@ export default function App() {
         ? 'Applying your command…'
         : '';
 
-  const title = fileName ? fileName.replace(/\.docx$/i, '') : 'Untitled document';
+  // ---------- which page is open ----------
+  const route = useRoute();
+  const page = KNOWN_PAGES.has(route[0]) ? route[0] : DEFAULT_PAGE; // unknown address -> Summaries
+  // #/summaries/<id>                   -> that summary in the editor
+  // #/templates/<department>/doc/<id>   -> a document made from a template, in the SAME editor
+  const openId = page === 'summaries' ? route[1] || null : null;
+  const openSummary = openId ? summaries.find((s) => s.id === openId) : null;
+  const tplDept = page === 'templates' && route[1] ? findDepartment(route[1]) : null;
+  const openDoc = tplDept && route[2] === 'doc' && route[3] ? templateDocs.find((d) => d.id === route[3]) || null : null;
+  const openTemplate = openDoc ? findTemplate(openDoc.deptId, openDoc.templateId) : null;
+  const openKey = openSummary ? openSummary.id : openDoc ? `tdoc:${openDoc.id}` : null;
+  const onEditor = Boolean(openKey);
+
+  // Opening a document (or leaving it): save the previous one, then load the new one
+  useEffect(() => {
+    if (!editor) return;
+    if (currentId.current === openKey) return;
+    flushSave();
+    currentId.current = openKey;
+    if (openSummary) {
+      loadIntoEditor(getSummaryHtml(openSummary.id));
+    } else if (openDoc) {
+      loadIntoEditor(getTemplateDocHtml(openDoc.id));
+    } else if (openId) {
+      go('summaries'); // the address points to a summary that does not exist
+    } else if (tplDept && route[2]) {
+      go(`templates/${tplDept.id}`); // unknown template
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, openKey]);
+
+  // "Open" on a template: always a NEW document from a fresh copy of the template
+  function openNewFromTemplate(deptId, tplId) {
+    const dept = findDepartment(deptId);
+    const tpl = findTemplate(deptId, tplId);
+    if (!dept || !tpl) return;
+    try {
+      const { doc, list } = createTemplateDoc(tpl, deptId, templateStartHtml(tpl, dept));
+      setTemplateDocs(list);
+      go(`templates/${deptId}/doc/${doc.id}`);
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  const title = openSummary
+    ? [openSummary.patient?.name || 'Unnamed patient', openSummary.caseNo].join(' · ')
+    : openDoc
+      ? [
+          `${tplDept.name} › ${openTemplate?.name || 'Document'}${openTemplate?.status === 'demo' ? ' (Demo)' : ''}`,
+          openDoc.patientName,
+        ].filter(Boolean).join(' · ')
+      : 'Untitled document';
+  const back = openDoc
+    ? { label: `← ${tplDept.name}`, go: () => go(`templates/${tplDept.id}`) }
+    : { label: '← Summaries', go: () => go('summaries') };
+
+  // Leaving the editor screen: stop the microphone and reading, so nothing keeps running in the background
+  useEffect(() => {
+    if (onEditor) return;
+    if (status === 'listening') toggleMic();
+    if (reading) stopReadingNow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onEditor]);
 
   return (
-    <div className="app">
-      <input ref={fileInput} type="file" accept=".docx" hidden onChange={openDocx} />
+    <div className="shell">
+    <AppHeader />
+    <div className="shell-body">
+    <Sidebar active={page} />
+
+    {page === 'summaries' && !onEditor && (
+      <Summaries
+        summaries={summaries}
+        onOpen={(id) => go(`summaries/${id}`)}
+        onImport={() => fileInput.current?.click()}
+        onChange={(id, changes) => setSummaries(updateSummary(id, changes))}
+        onDelete={(id) => setSummaries(deleteSummary(id))}
+      />
+    )}
+    {page === 'dashboard' && (
+      <Placeholder title="Dashboard">
+        <p>Welcome. Use <a href="#/summaries">Summaries</a> to edit discharge summaries, or <a href="#/templates">Templates</a> for department documents.</p>
+      </Placeholder>
+    )}
+    {page === 'create-summary' && (
+      <Placeholder title="Create Summary">
+        <p>Discharge summary creation is available through the existing <a href="#/summaries">Summaries</a> workflow.</p>
+      </Placeholder>
+    )}
+    {page === 'templates' && !onEditor && (
+      <Templates
+        deptId={route[1]}
+        docs={templateDocs}
+        onOpen={openNewFromTemplate}
+        onContinue={(d) => go(`templates/${d.deptId}/doc/${d.id}`)}
+        onDelete={(id) => setTemplateDocs(deleteTemplateDoc(id))}
+      />
+    )}
+    {page === 'activity' && (
+      <Placeholder title="Activity">
+        <p className="muted">Coming in a later step.</p>
+      </Placeholder>
+    )}
+    {page === 'settings' && (
+      <Placeholder title="Settings">
+        <p className="muted">No settings yet.</p>
+      </Placeholder>
+    )}
+
+    {/* The existing editor screen. It is only HIDDEN on other pages, never removed,
+        so the document, history and undo are kept while you look at other pages. */}
+    <input ref={fileInput} type="file" accept=".docx" hidden onChange={openDocx} />
+    <div className="app" hidden={!onEditor}>
       <input
         ref={attachInput}
         type="file"
@@ -452,6 +697,8 @@ export default function App() {
       <TopBar
         editor={editor}
         title={title}
+        onBack={back.go}
+        backLabel={back.label}
         saved={saved}
         userInitial={USER_INITIAL}
         onOpen={() => fileInput.current?.click()}
@@ -460,6 +707,7 @@ export default function App() {
         onInsertImage={() => imageInput.current?.click()}
         onZoom={setZoom}
         onValidate={validate}
+        onFixConsistency={fixConsistency}
       />
       <FormatBar
         editor={editor}
@@ -474,7 +722,7 @@ export default function App() {
       <div className="workspace">
         <div className="canvas">
           <Ruler />
-          <DocEditor editor={editor} zoom={zoom} />
+          <DocEditor editor={editor} zoom={zoom} className={openDoc ? 'tpl-doc' : ''} />
         </div>
         <SidePanel
           status={status}
@@ -499,7 +747,9 @@ export default function App() {
         />
       </div>
 
-      {toast && <div className="toast">{toast}</div>}
+    </div>
+    </div>
+    {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }

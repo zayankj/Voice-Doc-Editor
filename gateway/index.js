@@ -152,9 +152,11 @@ function validate(body = {}) {
     mimeType: str(body.mimeType, 100, 'The file type'),
     audioBase64: str(body.audioBase64, 10_000_000, 'The audio'),
     audioMimeType: str(body.audioMimeType, 100, 'The audio type'),
+    templateId: str(body.templateId, 80, 'The template'), // '' = discharge summary
   };
 
   if (!out.outline) throw bad('The document is missing');
+  if (out.templateId && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(out.templateId)) throw bad('The template is not valid');
   if (!/^\d{2}-\d{2}-\d{4}$/.test(out.today)) throw bad('The date is not valid');
   if (!out.base64 && !out.text && !out.instruction.trim() && !out.audioBase64) {
     throw bad('Speak, attach a file or type an instruction');
@@ -198,6 +200,7 @@ app.post('/api/extract-edits', express.json({ limit: '25mb' }), extractLimiter, 
   // what is logged: which kinds of input and roughly how big, never the content
   req.meta = {
     input: [clean.base64 || clean.text ? 'file' : null, clean.audioBase64 ? 'audio' : null, clean.instruction ? 'instruction' : null].filter(Boolean),
+    template: clean.templateId || 'discharge-summary', // which document type (an id, never content)
     approxKB: Math.round((clean.base64.length + clean.audioBase64.length + clean.text.length) / 1024),
   };
 
