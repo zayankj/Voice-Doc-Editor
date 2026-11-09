@@ -6,6 +6,8 @@
 // 2. GENDER IS PROTECTED: an AI edit that changes gender words (male/female, he/she, ...) is only
 //    allowed when the command itself talks about gender, or a file was attached (the file is the source).
 
+import { cellAt, dataCellRole } from './tables.js';
+
 // Field and section labels used in hospital documents (compared in lower case, without ":" or ".")
 const LABELS = new Set([
   'name', 'patient name', 'name of patient', 'name of the patient', 'patients name', "patient's name",
@@ -53,6 +55,12 @@ export function isLockedLabel(doc, block) {
   if (!isCell(cell)) return false;
   if (/^\s*[^:]{1,40}:\s*$/.test(text)) return true; // a "Label :" cell
 
+  // Data tables ("Investigation | Result"): the column titles and the row names (HB, SGPT ...) are labels,
+  // the results are values
+  const role = dataCellRole(cellAt(doc, block.pos));
+  if (role === 'title' || role === 'name') return true;
+  if (role === 'value') return false;
+
   const row = $pos.node($pos.depth - 1);
   const col = $pos.index($pos.depth - 1); // which column this cell is in (0, 1, 2 ...)
   const cells = [];
@@ -85,11 +93,19 @@ export function lockReason(doc, block, operation, resultText) {
 const GENDER_WORDS = /\b(male|female|man|woman|men|women|boy|girl|gentleman|lady|he|she|him|his|her|hers|himself|herself)\b/gi;
 const ABOUT_GENDER = /\b(male|female|gender|sex|man|woman|boy|girl|gentleman|lady|he|she|him|his|her)\b/i;
 
-const genderWords = (t) => (String(t || '').match(GENDER_WORDS) || []).map((w) => w.toLowerCase()).sort().join(',');
+const genderWords = (t) => (String(t || '').match(GENDER_WORDS) || []).map((w) => w.toLowerCase());
 
-// True when the edit would add, remove or swap gender words
+// True when the edit would ADD or SWAP gender words ("male" -> "female", or a new "he" ...).
+// Only REMOVING words is not a gender change: clearing a section that says "60-year-old female"
+// is allowed. (Each gender word of the new text must already be in the old text.)
 export function changesGender(before, after) {
-  return genderWords(before) !== genderWords(after);
+  const left = genderWords(before);
+  for (const w of genderWords(after)) {
+    const k = left.indexOf(w);
+    if (k === -1) return true; // a gender word that was not there before
+    left.splice(k, 1);
+  }
+  return false;
 }
 
 // May the AI change gender words for this command?

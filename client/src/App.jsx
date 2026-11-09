@@ -23,13 +23,22 @@ import { genderStatedIn } from './lib/consistency';
 import { scrollToPos, scrollToFirstChange } from './lib/scroll';
 import { findMissingFields } from './lib/validate';
 import { genderChangeAllowed } from './lib/guards';
+import { clearSection } from './lib/sectionCommands';
+import { applyRemovals, textAfter } from './lib/medicineText';
+import { classifyCommand } from './lib/commandIntent';
+import { asOneUndoStep } from './lib/undoStep';
+import { checkNamedSection, checkTableEdits } from './lib/verify';
+import ConfirmChanges from './components/ConfirmChanges';
+import ConfirmClear from './components/ConfirmClear';
+import UploadPreview from './components/UploadPreview';
 import { startLive } from './lib/liveClient';
 import { startCapture } from './lib/audio';
 import { createSegmenter } from './lib/vad';
 import { pcmChunksToWav } from './lib/wav';
 import { exportDocx } from './lib/exportDocx';
 import { todayString } from './lib/tools';
-import { extractEdits } from './lib/fileExtract';
+import { extractEdits, checkFile, FILE_ACCEPT } from './lib/fileExtract';
+import { previewEdits } from './lib/previewEdits';
 import { readDocument, stopReading, ttsSupported, watchVoices } from './lib/tts';
 import TopBar from './components/TopBar';
 import FormatBar from './components/FormatBar';
@@ -99,6 +108,8 @@ export default function App() {
   const [attached, setAttached] = useState(null);
   const [instruction, setInstruction] = useState('');
   const [toast, setToast] = useState('');
+  // a code-based removal (remove phrases / generic names) waiting in the confirm window: { kind, plan, doc }
+  const [pending, setPending] = useState(null);
   const live = useRef(null);
   const stopMic = useRef(null);
   const segmenter = useRef(null); // cuts the microphone stream into commands (audio mode)
@@ -223,9 +234,11 @@ export default function App() {
 
   // ---------- one edit (used by voice AND by Apply Edit) ----------
   // scroll: bring the changed line into view if it is off-screen (batches scroll once at the end instead)
-  function handleEdit(args, { scroll = true, allowGender = true } = {}) {
+  // collect: a list to put the History entry in, instead of adding it to History straight away
+  //          (runEdits makes ONE History entry for a whole instruction)
+  function handleEdit(args, { scroll = true, allowGender = true, fromFile = false, collect = null } = {}) {
     const factsBefore = getPatientFacts(editor.state.doc);
-    const r = applyVoiceEdit(editor, args, { allowGender });
+    const r = applyVoiceEdit(editor, args, { allowGender, fromFile });
     if (!r.ok) return { ok: false, error: r.error, blocked: r.blocked };
     // Header age/gender changed -> also fix "60-year-old female" etc. in the rest of the document
     const synced = applyPatientConsistency(editor, factsBefore);
@@ -233,31 +246,29 @@ export default function App() {
     const at = new Date().toLocaleTimeString();
     // One history entry: the edit and its consistency fixes are undone together
     const extra = synced.length ? ` (+${synced.length} matching place${synced.length > 1 ? 's' : ''} updated)` : '';
-    setHistory((h) => [
-      {
-        label: (args.field_label || args.block_id) + extra,
-        before: r.before || '(empty)',
-        after: r.after || '(empty)',
-        at,
-      },
-      ...h,
-    ]);
+    const entry = {
+      label: (args.field_label || args.block_id) + extra,
+      before: r.before || '(empty)',
+      after: r.after || '(empty)',
+      at,
+    };
+    if (collect) collect.push(entry);
+    else setHistory((h) => [entry, ...h]);
     return { ok: true, moved: Boolean(r.moved), new_text: r.after, also_updated: synced.map((c) => c.after) };
   }
 
   // Adds the automatic age/gender fixes to History (one entry). Returns how many blocks changed.
-  function recordConsistency(changes) {
+  // collect: as in handleEdit
+  function recordConsistency(changes, collect = null) {
     if (!changes.length) return 0;
-    const at = new Date().toLocaleTimeString();
-    setHistory((h) => [
-      {
-        label: `Age / gender made consistent (${changes.length} place${changes.length > 1 ? 's' : ''})`,
-        before: changes.map((c) => c.before).join(' | '),
-        after: changes.map((c) => c.after).join(' | '),
-        at,
-      },
-      ...h,
-    ]);
+    const entry = {
+      label: `Age / gender made consistent (${changes.length} place${changes.length > 1 ? 's' : ''})`,
+      before: changes.map((c) => c.before).join(' | '),
+      after: changes.map((c) => c.after).join(' | '),
+      at: new Date().toLocaleTimeString(),
+    };
+    if (collect) collect.push(entry);
+    else setHistory((h) => [entry, ...h]);
     return changes.length;
   }
 
@@ -333,6 +344,275 @@ export default function App() {
     };
   }, [reading, editor, activeVoice]);
 
+  // ---------- commands done by CODE, not by the AI ----------
+  // ONE classifier (lib/commandIntent.js) for typed instructions AND voice transcripts:
+  //   clear  "remove everything from the course in hospital"      -> the existing clear-section step
+  //   remove "remove generic names from Advice", "remove oral, twice daily and so on"
+  //          -> the confirm window; nothing changes before Apply
+  //   ask    unclear -> a question, nothing changes
+  //   ai     anything else -> the normal AI editing (returns false)
+  // Returns true when the command was handled here (done, asked, or shown for confirmation).
+  function runCodeCommand(command) {
+    const c = String(command || '').trim();
+    if (!c) return false;
+    const intent = classifyCommand(editor.state.doc, c);
+
+    if (intent.type === 'ask') {
+      setNote(intent.question);
+      return true;
+    }
+
+    // "Remove everything from <section>" / "make <section> blank": the whole section is emptied in one step
+    // (the heading stays; one Undo brings it back).
+    if (intent.type === 'clear') {
+      // a section with medicines (Advice): ask first; nothing changes until "Clear section"
+      if (intent.confirm) {
+        setPending({ kind: 'clear', section: intent.section, preview: intent.preview, doc: editor.state.doc });
+        setNote('Please check the window, then press Clear section or Cancel. Nothing has been changed yet.');
+        return true;
+      }
+      doClear(intent.section);
+      return true;
+    }
+
+    if (intent.type !== 'remove') return false; // not a command for code: the AI handles it as before
+    return showRemoval(intent);
+  }
+
+  // Empties one section in ONE step (one Undo; the heading stays) and records it in History
+  function doClear(section) {
+    const r = clearSection(editor, section);
+    if (!r.ok) {
+      setNote(`🔒 Nothing was changed: ${r.error}.`);
+    } else if (r.alreadyEmpty) {
+      setNote(`${r.title} is already empty. Nothing was changed.`);
+    } else {
+      setHistory((h) => [
+        { label: `${r.title}: section cleared`, before: r.before, after: '(empty)', at: new Date().toLocaleTimeString() },
+        ...h,
+      ]);
+      scrollToPos(editor, r.pos, true);
+      setNote(`${r.title}: all content removed (the heading stays). Use Undo to bring it back.`);
+    }
+  }
+
+  // "Clear section" in the confirmation window
+  function applyClear() {
+    const p = pending;
+    setPending(null);
+    if (!p) return;
+    if (!editor.state.doc.eq(p.doc)) {
+      setNote('The document changed while the window was open, so nothing was changed. Please give the command again.');
+      return;
+    }
+    doClear(p.section);
+  }
+
+  function showRemoval(intent) {
+    // Removal: show the preview window. Remember the document as it is now: if it changes while the
+    // window is open, the preview is outdated and Apply refuses.
+    // (whole-medicine commands have no categories / word list: every field is optional here)
+    if (DEBUG_VOICE) {
+      const it = intent.intent || {};
+      console.info('[voice-debug] code command', {
+        section: it.section,
+        categories: it.categories || [],
+        phrases: (it.phrases || []).length,
+        forms: it.forms || it.entries?.forms || [],
+        names: (it.entries?.names || []).length,
+      });
+    }
+    setPending({ kind: intent.kind, plan: intent.plan, doc: editor.state.doc });
+    setNote('Please check the changes in the window, then press Apply or Cancel. Nothing has been changed yet.');
+    return true;
+  }
+
+  // Apply in the confirm window: delete exactly the ticked parts, in ONE step (one Undo)
+  function applyPending(planWithChoices) {
+    const p = pending;
+    setPending(null);
+    if (!p) return;
+    if (!editor.state.doc.eq(p.doc)) {
+      setNote('The document changed while the window was open, so nothing was changed. Please give the command again.');
+      return;
+    }
+    const r = applyRemovals(editor, planWithChoices);
+    if (!r.ok) {
+      setNote(`Nothing was changed: ${r.error}`);
+      return;
+    }
+    if (!r.lines) {
+      setNote('No line was ticked. Nothing was changed.');
+      return;
+    }
+    const lines = planWithChoices.changes.filter((c) => c.removals.some((x) => x.selected));
+    const removed = [...new Set(lines.flatMap((c) => c.removals.filter((x) => x.selected).map((x) => x.text.trim().toLowerCase())))];
+    const what = p.kind === 'generic' ? 'generic names removed' : `removed ${removed.join(', ')}`;
+    const title = planWithChoices.section.title;
+    const count = `${r.lines} line${r.lines > 1 ? 's' : ''}`;
+    setHistory((h) => [
+      {
+        label: `${title}: ${what} (${count})`,
+        before: lines.map((c) => c.before).join(' | '),
+        after: lines.map((c) => textAfter(c)).join(' | '),
+        at: new Date().toLocaleTimeString(),
+      },
+      ...h,
+    ]);
+    scrollToFirstChange(editor);
+    setNote(`${title}: ${count} changed (${what}). Changed lines are highlighted in yellow. Use Undo to bring it back.`);
+  }
+
+  // Cancel in the confirm window: the document is not touched
+  function cancelPending() {
+    setPending(null);
+    setNote('Cancelled. Nothing was changed.');
+  }
+
+  // Applies the AI's edits (already checked and in bottom-up order) as ONE undo step with ONE History entry,
+  // and shows what happened. Used for typed / spoken commands, and by Apply in the upload preview.
+  // consistency = false: skip the final age / gender step (the user did not tick it in the upload preview)
+  function applyAiEdits({ ordered, allowGender, fromFile = false, consistency = true, label, text = '', heard = '', file = null,
+    summary = '', voice = false, blockedFirst = [], aiEditCount = ordered.length }) {
+    let applied = 0;
+    let skipped = 0;
+    let noEffect = 0; // edits that "succeeded" but did not change the document
+    const blockedWhy = [...blockedFirst]; // edits refused by the checks (table row / locked label / unasked gender change)
+    const appliedValues = []; // new texts that were really applied
+    const debugRows = []; // [voice-debug]
+    const entries = []; // History entries of this instruction: added as ONE entry below
+    let alsoFixed = 0;
+    // Everything this instruction changes (all AI edits + the age/gender fix) is ONE undo step,
+    // even when the changes are far apart ("change the age to 31": table + Presenting Complaint)
+    asOneUndoStep(editor.view, () => {
+      for (const ed of ordered) {
+        const docBefore = editor.state.doc;
+        const r = handleEdit(ed, { scroll: false, allowGender, fromFile, collect: entries });
+        // Honest counting: an edit only counts when the document REALLY changed
+        // (e.g. replacing a text with the same text "succeeds" but changes nothing)
+        const changed = r.ok && !editor.state.doc.eq(docBefore);
+        if (r.ok && !changed) entries.pop(); // its History entry (handleEdit added exactly one): nothing to record
+        if (DEBUG_VOICE) debugRows.push({
+          block_id: ed.block_id, operation: ed.operation, field_label: ed.field_label,
+          result: changed ? (r.moved ? 'moved to section text' : 'applied') : r.ok ? 'no change' : r.blocked ? 'blocked' : 'failed',
+        });
+        if (r.ok && !changed) noEffect++;
+        else if (r.ok) {
+          applied++;
+          // only CHANGED text can set a new gender; added sentences ("append") follow the patient's gender
+          if (ed.operation === 'set' || ed.operation === 'replace_text') appliedValues.push(ed.new_value || '');
+        }
+        else if (r.blocked) blockedWhy.push(`${ed.field_label || ed.block_id}: ${r.error}`);
+        else skipped++;
+      }
+      if (DEBUG_VOICE) {
+        console.info(`[voice-debug] ${label}: model returned ${aiEditCount} edit(s)`);
+        if (debugRows.length) console.table(debugRows);
+      }
+
+      // Age / gender must be the same everywhere. If this command set a gender somewhere
+      // (e.g. only in Course in Hospital), that gender goes to the header and everywhere else too.
+      // Also repairs places that were already wrong.
+      if (applied && consistency) {
+        const target = allowGender ? genderStatedIn(appliedValues) : null;
+        alsoFixed = recordConsistency(ensurePatientConsistency(editor, target), entries);
+      }
+    }); // end of the one undo step
+
+    // ONE History entry for the whole instruction, listing every place it changed
+    // (one Undo click in History = this whole instruction)
+    if (entries.length) {
+      const said = String(text || heard || file?.name || label).trim();
+      const short = said.length > 60 ? `${said.slice(0, 57)}…` : said;
+      const places = [...new Set(entries.map((e) => e.label))];
+      setHistory((h) => [
+        {
+          label: `"${short}": ${places.join(', ')}`,
+          before: entries.map((e) => `${e.label}: ${e.before}`).join(' | '),
+          after: entries.map((e) => `${e.label}: ${e.after}`).join(' | '),
+          at: new Date().toLocaleTimeString(),
+        },
+        ...h,
+      ]);
+    }
+
+    if (applied) {
+      if (voice) {
+        // spoken edit: only scroll when the change is out of view
+        const ranges = getFlashRanges(editor.state);
+        if (ranges.length) scrollToPos(editor, Math.min(...ranges.map((r) => r.from)), true);
+      } else {
+        scrollToFirstChange(editor); // every changed part is highlighted: jump to the first one
+      }
+    }
+
+    const head = applied
+      ? `${applied} change${applied > 1 ? 's' : ''} applied from ${label}. Changed parts are highlighted in yellow.`
+      : `No changes were made from ${label}.`;
+    const blockedNote = blockedWhy.length
+      ? `🔒 Blocked ${blockedWhy.length} change${blockedWhy.length > 1 ? 's' : ''} (${blockedWhy.join('; ')}).`
+      : '';
+    const fixedNote = alsoFixed ? `Also updated ${alsoFixed} other place${alsoFixed > 1 ? 's' : ''} so age and gender match everywhere.` : '';
+    // The AI's own summary describes what it TRIED. Show it only when something was applied. When the AI
+    // returned no edit at all, its text is a question or explanation ("Which date do you mean?"): show it as such.
+    // When it returned edits but none could be applied, its "done" summary would be wrong: leave it out.
+    const aiNote = applied ? summary : aiEditCount === 0 && summary ? `AI: ${summary}` : '';
+    const noEffectNote = noEffect ? `${noEffect} edit${noEffect > 1 ? 's' : ''} from the AI did not change anything.` : '';
+    setNote([head, fixedNote, blockedNote, skipped ? `${skipped} could not be applied.` : '', noEffectNote, aiNote].filter(Boolean).join(' '));
+  }
+
+  // ---------- upload preview ----------
+  // A DRY RUN of the file's edits on a copy of the document (lib/previewEdits.js) is shown in a window.
+  // The real document is not touched until Apply.
+  function showUploadPreview({ ordered, allowGender, label, text, file, summary }) {
+    const doc = editor.state.doc;
+    const opts = { allowGender, fromFile: true };
+    const preview = previewEdits(doc, ordered, opts);
+    if (!preview.items.length && !preview.blocked.length) {
+      setNote(`No changes were needed from ${label}.${summary ? ` AI: ${summary}` : ''}`);
+      return;
+    }
+    // the same dry run for the user's choice of tick boxes (the age / gender step depends on it)
+    const recompute = (selected, consistency) => previewEdits(doc, ordered, { ...opts, selected, consistency });
+    setPending({ kind: 'upload', doc, ordered, preview, recompute, allowGender, label, text, fileName: file.name, summary });
+    setNote('Please check the changes from the file in the window, then press Apply or Cancel. Nothing has been changed yet.');
+  }
+
+  // Apply in the upload preview: only the ticked changes, as ONE undo step with ONE History entry
+  function applyUpload({ selected, consistency }) {
+    const p = pending;
+    setPending(null);
+    if (!p) return;
+    if (!editor.state.doc.eq(p.doc)) {
+      setNote('The document changed while the window was open, so nothing was changed. Please upload the file again.');
+      return;
+    }
+    applyAiEdits({
+      ordered: p.ordered.filter((_, i) => selected.has(i)),
+      allowGender: p.allowGender,
+      fromFile: true,
+      consistency,
+      label: p.label,
+      text: p.text,
+      file: { name: p.fileName },
+      summary: p.summary,
+      aiEditCount: p.ordered.length,
+    });
+  }
+
+  // A file is checked as soon as it is attached (file picker or drag-and-drop): a wrong type is never sent
+  function attachFile(file) {
+    if (!file) return;
+    const c = checkFile(file);
+    if (c.error) {
+      setAttached(null);
+      setError(c.error);
+      return;
+    }
+    setError('');
+    setAttached(file);
+  }
+
   // ---------- send a file / text / voice clip to the server and apply the edits it returns ----------
   // voice = true: a spoken command. It does not touch the Apply Edit button.
   async function runEdits({ file = null, text = '', audio = null, label, voice = false }) {
@@ -341,7 +621,10 @@ export default function App() {
     setNote('');
     if (!voice) setApplying(true);
     try {
-      const { edits, summary, heard } = await extractEdits({
+      // Typed command (no file, no voice): commands done by code are recognised BEFORE calling the AI
+      if (!file && !audio && runCodeCommand(text)) return true;
+
+      const { edits: aiEdits, summary: aiSummary, heard } = await extractEdits({
         file,
         instruction: text,
         audio,
@@ -350,6 +633,24 @@ export default function App() {
         templateId: openTemplateId(), // '' for discharge summaries
       });
       if (heard) setTranscript(heard);
+
+      // Voice: the AI has turned the speech into text; now check for commands done by code
+      if (!file && audio && runCodeCommand([text, heard].filter(Boolean).join(' '))) return true;
+
+      // C. When the command names a section ("inside COURSE IN HOSPITAL add ..."), the AI's edits must land
+      //    there: added text is moved to that section, other changes elsewhere refuse the whole command.
+      //    (Not used for file uploads: a file may update several sections.)
+      const check = file ? { edits: aiEdits, moved: [] } : checkNamedSection(editor.state.doc, [text, heard].filter(Boolean).join(' '), aiEdits);
+      if (check.reject) {
+        setNote(`🔒 ${check.reject}`);
+        return true;
+      }
+      // D. Lab tables: a changed row must be named in the command, and its new number must have been said
+      //    (stops a value landing in the wrong row, or a misheard number). Not for files: the file is the source.
+      const tableCheck = file ? { edits: check.edits, blocked: [] } : checkTableEdits(editor.state.doc, [text, heard].filter(Boolean).join(' '), check.edits);
+      const edits = tableCheck.edits;
+      // when text was moved to the right section, the AI's own summary ("added malaria to the diagnosis") is wrong
+      const summary = check.moved.length ? check.moved.map((m) => `${m.section}: added 1 line.`).join(' ') : aiSummary;
 
       // Apply from the bottom of the document upwards, so a newly inserted line
       // never shifts the blocks that are still waiting to be edited.
@@ -365,57 +666,13 @@ export default function App() {
       // Gender may only change when the command talks about it (or a file was attached)
       const allowGender = genderChangeAllowed({ instruction: text, heard, hasFile: Boolean(file) });
 
-      let applied = 0;
-      let skipped = 0;
-      const blockedWhy = []; // edits refused by the guards (locked label / unasked gender change)
-      const appliedValues = []; // new texts that were really applied
-      const debugRows = []; // [voice-debug]
-      for (const ed of ordered) {
-        const r = handleEdit(ed, { scroll: false, allowGender });
-        if (DEBUG_VOICE) debugRows.push({
-          block_id: ed.block_id, operation: ed.operation, field_label: ed.field_label,
-          result: r.ok ? (r.moved ? 'moved to section text' : 'applied') : r.blocked ? 'blocked' : 'failed',
-        });
-        if (r.ok) {
-          applied++;
-          // only CHANGED text can set a new gender; added sentences ("append") follow the patient's gender
-          if (ed.operation === 'set' || ed.operation === 'replace_text') appliedValues.push(ed.new_value || '');
-        }
-        else if (r.blocked) blockedWhy.push(`${ed.field_label || ed.block_id}: ${r.error}`);
-        else skipped++;
+      // An uploaded file: show the preview first. It is a DRY RUN on a copy of the document; nothing changes
+      // until Apply. Typed and spoken commands are applied straight away, as before.
+      if (file) {
+        showUploadPreview({ ordered, allowGender, label, text, file, summary });
+        return true;
       }
-      if (DEBUG_VOICE) {
-        console.info(`[voice-debug] ${label}: model returned ${edits.length} edit(s)`);
-        if (debugRows.length) console.table(debugRows);
-      }
-
-      // Age / gender must be the same everywhere. If this command set a gender somewhere
-      // (e.g. only in Course in Hospital), that gender goes to the header and everywhere else too.
-      // Also repairs places that were already wrong.
-      let alsoFixed = 0;
-      if (applied) {
-        const target = allowGender ? genderStatedIn(appliedValues) : null;
-        alsoFixed = recordConsistency(ensurePatientConsistency(editor, target));
-      }
-
-      if (applied) {
-        if (voice) {
-          // spoken edit: only scroll when the change is out of view
-          const ranges = getFlashRanges(editor.state);
-          if (ranges.length) scrollToPos(editor, Math.min(...ranges.map((r) => r.from)), true);
-        } else {
-          scrollToFirstChange(editor); // every changed part is highlighted: jump to the first one
-        }
-      }
-
-      const head = applied
-        ? `${applied} change${applied > 1 ? 's' : ''} applied from ${label}. Changed parts are highlighted in yellow.`
-        : `No changes were made from ${label}.`;
-      const blockedNote = blockedWhy.length
-        ? `🔒 Blocked ${blockedWhy.length} change${blockedWhy.length > 1 ? 's' : ''} (${blockedWhy.join('; ')}).`
-        : '';
-      const fixedNote = alsoFixed ? `Also updated ${alsoFixed} other place${alsoFixed > 1 ? 's' : ''} so age and gender match everywhere.` : '';
-      setNote([head, fixedNote, blockedNote, skipped ? `${skipped} could not be applied.` : '', summary].filter(Boolean).join(' '));
+      applyAiEdits({ ordered, allowGender, label, text, heard, file, summary, voice, blockedFirst: tableCheck.blocked, aiEditCount: check.edits.length });
       return true;
     } catch (err) {
       console.error(err);
@@ -630,6 +887,7 @@ export default function App() {
     if (onEditor) return;
     if (status === 'listening') toggleMic();
     if (reading) stopReadingNow();
+    setPending(null); // a confirm window that was still open is closed without changing anything
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onEditor]);
 
@@ -685,10 +943,10 @@ export default function App() {
       <input
         ref={attachInput}
         type="file"
-        accept="image/*,.pdf,.docx,.txt,.csv"
+        accept={FILE_ACCEPT}
         hidden
         onChange={(e) => {
-          setAttached(e.target.files?.[0] || null);
+          attachFile(e.target.files?.[0] || null);
           e.target.value = '';
         }}
       />
@@ -737,7 +995,7 @@ export default function App() {
           error={error}
           attached={attached}
           onPickFile={() => attachInput.current?.click()}
-          onDropFile={setAttached}
+          onDropFile={attachFile}
           onClearFile={() => setAttached(null)}
           instruction={instruction}
           onInstruction={setInstruction}
@@ -749,6 +1007,16 @@ export default function App() {
 
     </div>
     </div>
+    {pending && onEditor && (
+      pending.kind === 'upload' ? (
+        <UploadPreview fileName={pending.fileName} summary={pending.summary} preview={pending.preview}
+          recompute={pending.recompute} onApply={applyUpload} onCancel={cancelPending} />
+      ) : pending.kind === 'clear' ? (
+        <ConfirmClear preview={pending.preview} onApply={applyClear} onCancel={cancelPending} />
+      ) : (
+        <ConfirmChanges kind={pending.kind} plan={pending.plan} onApply={applyPending} onCancel={cancelPending} />
+      )
+    )}
     {toast && <div className="toast">{toast}</div>}
     </div>
   );

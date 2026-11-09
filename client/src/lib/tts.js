@@ -324,11 +324,24 @@ function fromCursor(editor, items) {
 }
 
 // ---------- highlight while reading ----------
+// true while a line is highlighted BY READING ALOUD. Clearing only happens when it is true,
+// so stopping (or not even running) read aloud never wipes the yellow highlights of AI edits.
+let readingHighlightOn = false;
+
 function setHighlight(editor, index) {
   if (!editor || editor.isDestroyed) return;
   const b = getBlocks(editor.state.doc)[index];
-  const meta = b ? { from: b.pos, to: b.pos + b.node.nodeSize } : null;
-  editor.view.dispatch(editor.state.tr.setMeta(flashKey, meta).setMeta('addToHistory', false));
+  if (!b) {
+    // "clear": only remove the reading highlight, and only if reading actually put one there
+    if (!readingHighlightOn) return;
+    readingHighlightOn = false;
+    editor.view.dispatch(editor.state.tr.setMeta(flashKey, null).setMeta('addToHistory', false));
+    return;
+  }
+  readingHighlightOn = true;
+  editor.view.dispatch(
+    editor.state.tr.setMeta(flashKey, { from: b.pos, to: b.pos + b.node.nodeSize }).setMeta('addToHistory', false)
+  );
 }
 
 // Keeps the line that is being read in view (only scrolls when it is off-screen)
