@@ -45,7 +45,10 @@ export default function UploadPreview({ fileName, summary, preview, recompute, o
   const patients = preview.items.filter((i) => i.patient).length;
   const chosen = ticks.size + (syncOn && sync.length ? 1 : 0);
   const title = `Changes from ${fileName ? `"${fileName}"` : 'the uploaded file'}`;
-  const footer = `${ticks.size} of ${plural(preview.items.length, 'change', 'changes')} selected`;
+  // nothing selected: Apply stays usable and only closes the window (the document is not touched)
+  const footer = chosen
+    ? `${ticks.size} of ${plural(preview.items.length, 'change', 'changes')} selected`
+    : 'Nothing selected: Apply closes the window and leaves the document unchanged.';
 
   return (
     <div className="modal-back" onClick={onCancel}>
@@ -139,7 +142,7 @@ export default function UploadPreview({ fileName, summary, preview, recompute, o
           <span className="muted">{footer}</span>
           <div className="spacer" />
           <button className="pill-btn" onClick={onCancel}>Cancel</button>
-          <button className="seg-btn on" disabled={!chosen} onClick={() => onApply({ selected: new Set(ticks), consistency: syncOn && sync.length > 0 })}>
+          <button className="seg-btn on" onClick={() => onApply({ selected: new Set(ticks), consistency: syncOn && sync.length > 0 })}>
             Apply
           </button>
         </div>

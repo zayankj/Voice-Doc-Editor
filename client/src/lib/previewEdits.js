@@ -6,6 +6,15 @@ import { applyVoiceEdit, applyPatientConsistency, ensurePatientConsistency, getP
 import { genderStatedIn } from './consistency.js';
 import { changesGender, isLabelText } from './guards.js';
 import { cellAt, dataCellRole, rowName } from './tables.js';
+import { countMedicineLines } from './medicineText.js';
+
+// How many medicine lines a set of AI edits (typed / spoken command) would remove, worked out on a COPY with
+// exactly the same code as Apply. The app refuses edits that remove 2 or more: several medicines are removed
+// only through the confirmation window ("remove all medicines", "remove all syrups", "remove dolo and ciplox").
+export function medicinesLostByEdits(doc, edits, allowGender = true) {
+  const dry = previewEdits(doc, edits, { allowGender, fromFile: false });
+  return countMedicineLines(doc) - countMedicineLines(dry.doc);
+}
 
 // A throw-away editor holding a copy of the document
 function copyEditor(doc) {

@@ -86,7 +86,28 @@ export function lockReason(doc, block, operation, resultText) {
   if (prefix && !String(resultText).trimStart().toLowerCase().startsWith(prefix.trim().toLowerCase())) {
     return `the label "${prefix.trim()}" is locked`;
   }
+  // a section heading on the FIRST LINE of a paragraph ("ADVICE↵Tab. DOLO ...", "DIAGNOSIS↵Enteric fever"):
+  // it must stay at the start, unchanged (the AI may change the lines after it, never remove or rename it)
+  const head = firstLineHeading(block.node);
+  if (head && !String(resultText).trimStart().toLowerCase().startsWith(head.toLowerCase())) {
+    return `the heading "${head}" is locked`;
+  }
   return '';
+}
+
+// The first line of a paragraph (the text before its first line break) when it is a known section label
+// ("ADVICE", "Diagnosis :"). Only KNOWN labels: capital-letter content ("ENTERIC FEVER↵SEPSIS") stays editable.
+function firstLineHeading(node) {
+  let first = '';
+  let broke = false;
+  node.forEach((child) => {
+    if (broke) return;
+    if (child.isText) first += child.text;
+    else broke = true;
+  });
+  const head = first.trim();
+  if (!broke || !head) return '';
+  return isLabelText(head) ? head : '';
 }
 
 // ---------- gender ----------

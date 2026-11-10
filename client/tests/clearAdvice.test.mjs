@@ -64,7 +64,7 @@ const cls = (c) => classifyCommand(makeDoc(), c);
 // ---------- 1. recognising whole-section commands ----------
 test('whole-Advice commands are a clear that NEEDS CONFIRMATION (Advice has medicines)', () => {
   for (const c of [
-    'remove all from Advice', 'Remove all from the Advice section.', 'remove everything from Advice',
+    'remove all from Advice', 'Remove all from the Advice section.',
     'clear the entire Advice section', 'clear advice', 'delete all from the advice section', 'delete all in advice',
     'remove all of advice', 'remove all the content from advice', 'empty the Advice section', 'wipe advice',
   ]) {
@@ -73,6 +73,11 @@ test('whole-Advice commands are a clear that NEEDS CONFIRMATION (Advice has medi
     assert.equal(r.section.title.replace(/\s*:\s*$/, ''), 'ADVICE', c);
     assert.equal(r.confirm, true, c);
   }
+  // (approved rule) "remove everything from Advice" removes only the MEDICINES (the review line stays)
+  const r = cls('remove everything from Advice');
+  assert.equal(r.type, 'remove');
+  assert.equal(r.kind, 'entries');
+  assert.deepEqual(r.plan.changes.map((ch) => ch.before), ADVICE);
 });
 
 test('sections WITHOUT medicines still clear at once (no confirmation), as before', () => {

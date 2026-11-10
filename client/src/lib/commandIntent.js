@@ -1,7 +1,8 @@
 import {
   CATEGORIES, categoryOfTerm, formsFromCommand, phrasesFromCommand, pickSection, planRemoval, planEntryRemoval, brandOf, findGenericBracket,
+  medicineEntryAt, DOSING_PATTERN, MEDICINE_TITLE,
 } from './medicineText.js';
-import { findClearSectionCommand, clearPreview, BARE_ALL } from './sectionCommands.js';
+import { findClearSectionCommand, clearPreview, BARE_ALL, findInlineSection, isClearIntent } from './sectionCommands.js';
 import { getSections, findSectionsInCommand } from './sections.js';
 
 // ONE place that understands a command, used for BOTH typed instructions and the voice transcript.
@@ -47,6 +48,52 @@ const saysWhole = (c) => WHOLE.test(c) || BARE_ALL.test(c); // "remove all from 
 const EMPTY_START = /^\s*(?:please\s+)?(?:now\s+)?empty\b/i;
 // "instructions / directions" without saying which kind
 const VAGUE = /\b(?:instructions?|directions?|descriptions?|details)\b/i;
+
+// ---------- medicine scope / safety words ----------
+// "this medicine / that one / the selected tablet": the medicine where the cursor is
+const THIS_ONE = /\b(?:this|that|current|selected)\s+(?:medicine|medication|drug|one|line|entry|tablet|syrup|capsule|injection)\b/i;
+// "only once daily": the words said, never the whole category
+const ONLY = /\bonly\b/i;
+// changing or removing doses / strengths / durations: never for several medicines at once
+const DETAIL = /\b(?:doses?|dosages?|strengths?|durations?|days?|weeks?|months?|mg|mcg|ml|grams?|units?)\b|\d\s*(?:mg|mcg|ml|g|iu|units?|days?|weeks?)\b/i;
+// "dose timings" / "dosing schedule" / "dosing pattern" are frequency, not a dose
+const NOT_DETAIL = /\b(?:dose\s+timings?|(?:dosing|dose|dosage)\s+(?:schedule|pattern)s?)\b/gi;
+// the command EXPLICITLY asks to remove numeric dosing patterns: "remove the dosing patterns", "remove 1-0-1"
+// (only then are they ticked; with a frequency removal they are shown unticked)
+export const asksForPatterns = (c) =>
+  /\b(?:(?:dosing|dose|dosage)\s+)?patterns?\b/i.test(String(c || '')) || new RegExp(DOSING_PATTERN.source).test(String(c || ''));
+const ANY_EDIT = /\b(?:remove|delete|drop|strip|take\s+out|erase|omit|clear|wipe|change|replace|update|set|make|increase|decrease|reduce|modify|edit|alter|correct)\b/i;
+const GROUP = /\b(?:all|every|each)\b|\b(?:medicines|medications|drugs|tablets|tabs|capsules|caps|syrups|injections|drops|ointments|creams|sachets|inhalers)\b/i;
+const MEDICINE_WORDS = /\b(?:medicines?|medications?|drugs?|tablets?|tabs?|capsules?|caps?|syrups?|injections?|drops?|ointments?|creams?|sachets?|inhalers?|doses?|dosages?|strengths?|prescriptions?|advice)\b/i;
+// "timing" without saying which kind (frequency or food timing)
+const TIMING = /\btimings?\b/i;
+// "clear all the medicines", "remove all the medicine", "remove all medicines from Advice": every MEDICINE entry
+// (not the other advice text). Not "all tablets / all syrups" (one type: whole-medicine removal by form, as before).
+// STRICT: the whole command is only "<remove word> all (the) medicines [from (the) <section> (section)]"
+// (plus politeness words), so "remove timing from all medicines" or "remove frequency for all medicines" never match.
+const ALL_MEDICINES =
+  /^(?!.*\b(?:except|but|apart\s+from|other\s+than|keep|leave|not|only|and)\b)\s*(?:(?:please|pls|plz|now|ok|okay|kindly|just)\s+)*(?:remove|delete|drop|take\s+out|erase|clear|wipe|empty|get\s+rid\s+of)\s+(?:all|every|each)\s+(?:of\s+)?(?:the\s+)?(?:medicines?|medications?|drugs?)(?:\s+(?:from|in|inside|under)\s+(?:the\s+)?[a-z ]{1,40}?)?(?:\s+section)?(?:\s+(?:please|pls|plz|sir|ok|okay))?\s*[.!]?\s*$/i;
+// These Advice phrases also mean "remove the MEDICINES" (not the whole section):
+//   "Empty the advice" (without "section"), "Remove everything from (the) advice (section)".
+// ("Clear Advice", "Empty Advice", "Empty the Advice section", "Clear the Advice section" clear the whole section.)
+const ADVICE_MEDICINES = [
+  /^\s*(?:(?:please|pls|plz|now|ok|okay|kindly|just)\s+)*empty\s+the\s+advice\s*[.!]?\s*$/i,
+  /^\s*(?:(?:please|pls|plz|now|ok|okay|kindly|just)\s+)*remove\s+everything\s+(?:from|in)\s+(?:the\s+)?advice(?:\s+section)?\s*[.!]?\s*$/i,
+];
+const NO_ADVICE = 'I could not find the Advice section clearly. Nothing was changed.';
+
+// The medicine section a command means: a section it names, else an Advice heading inside a paragraph,
+// else the one medicine section of the document. { section } | { ask }
+function medicineSectionFor(doc, c) {
+  const named = findSectionsInCommand(getSections(doc), c);
+  if (named.best) return { section: named.best };
+  const inline = findInlineSection(doc, c, { medicine: true });
+  if (inline?.section) return { section: inline.section };
+  if (inline?.ambiguous) return { ask: `Which section did you mean: ${inline.candidates.map((s) => nice(s.title)).join(' or ')}? Nothing was changed.` };
+  if (/\badvice\b/i.test(c)) return { ask: NO_ADVICE }; // Advice named but not found: never guess another section
+  const pick = pickSection(doc, c, { medicineOnly: true });
+  return pick.section ? { section: pick.section } : { ask: pick.ask || NO_ADVICE };
+}
 
 // Every term from the category lists that appears in the command: [{ text, category }]
 function termsInCommand(c) {
@@ -122,7 +169,10 @@ const FORM_NAMES = { tab: 'tablets', cap: 'capsules', syp: 'syrups', susp: 'susp
 // words that can follow "tablet / syrup ..." but are not a medicine name
 const NOT_A_NAME = new Set(['all', 'the', 'a', 'an', 'of', 'in', 'from', 'type', 'types', 'kind', 'kinds', 'every', 'each', 'that', 'this', 'these', 'those',
   'which', 'section', 'advice', 'and', 'or', 'also', 'please', 'entries', 'entry', 'line', 'lines', 'medicine', 'medicines', 'named', 'called', 'i', 'it', 'them',
-  'tablet', 'tablets', 'tab', 'tabs', 'syrup', 'syrups', 'syp', 'capsule', 'capsules', 'cap', 'caps', 'injection', 'injections', 'inj', 'drops', 'from', 'to']);
+  'tablet', 'tablets', 'tab', 'tabs', 'syrup', 'syrups', 'syp', 'capsule', 'capsules', 'cap', 'caps', 'injection', 'injections', 'inj', 'drops', 'from', 'to',
+  'now', 'only', 'except', 'but', 'with', 'for', 'too', 'list', 'route', 'routes', 'frequency', 'frequencies', 'instructions', 'instruction', 'here', 'there',
+  // filler / politeness words people add when speaking ("... from all tablet pls")
+  'pls', 'plz', 'plss', 'please', 'sir', 'madam', 'mam', 'maam', 'ok', 'okay', 'k', 'ji', 'thanks', 'thank', 'you', 'quickly', 'fast', 'just', 'kindly']);
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').replace(/\s+/g, ' ').trim();
 
 // Which whole medicines does the command name? { forms, names, unknown } (unknown = names said but not in the section)
@@ -151,13 +201,54 @@ function medicinesInCommand(doc, section, command) {
   return { forms: formsFromCommand(command.replace(VERB, ' ')), names, unknown };
 }
 
-export function classifyCommand(doc, command) {
+// Doses, strengths or durations of SEVERAL medicines at once: never done (by code or AI), always asked.
+// One named medicine ("change dolo to 500 mg") is left to the AI as before.
+function bulkDetailQuestion(doc, c) {
+  const plain = c.replace(NOT_DETAIL, ' ');
+  if (!ANY_EDIT.test(plain) || !DETAIL.test(plain) || !GROUP.test(plain) || !MEDICINE_WORDS.test(plain)) return null;
+  const med = pickSection(doc, plain, { medicineOnly: true });
+  if (med.section && !/\b(?:all|every|each)\b/i.test(plain) && medicinesInCommand(doc, med.section, plain).names.length === 1) return null;
+  return {
+    type: 'ask',
+    question: 'Doses, strengths and durations are changed one medicine at a time, for safety. Which medicine do you mean? Nothing was changed.',
+  };
+}
+
+// WHICH medicines a removal is for: { names: [], entries: [] } (both empty = every medicine) or { ask }
+//   "from dolo"          -> only DOLO           "from this medicine" -> only the medicine at the cursor
+function medicineTarget(doc, section, c, cursor) {
+  const title = nice(section.title);
+  if (THIS_ONE.test(c)) {
+    const e = medicineEntryAt(doc, section, cursor);
+    if (!e) return { ask: `Please click on the medicine in ${title} first, or say its name. Nothing was changed.` };
+    return { names: [], entries: [`${e.block}-${e.entry}`] };
+  }
+  const meds = medicinesInCommand(doc, section, c);
+  if (meds.unknown.length && !meds.names.length) {
+    const list = meds.unknown.map((u) => u[0].toUpperCase() + u.slice(1)).join(', ');
+    return { ask: `I could not find a medicine called ${list} in ${title}. Nothing was changed.` };
+  }
+  // a name that fits two medicines: ask which one
+  for (const n of meds.names) {
+    const hits = planEntryRemoval(doc, section, { names: [n] }).changes;
+    if (hits.length > 1) {
+      return { ask: `${hits.length} medicines in ${title} match "${n.toUpperCase()}": ${hits.map((h) => h.before.trim()).join(' / ')}. Which one? Nothing was changed.` };
+    }
+  }
+  return { names: meds.names, entries: [] };
+}
+
+export function classifyCommand(doc, command, { cursor } = {}) {
   const c = String(command || '').trim();
-  if (!c || (!VERB.test(c) && !EMPTY_START.test(c))) return { type: 'ai' };
+  if (!c) return { type: 'ai' };
+  const bulk = bulkDetailQuestion(doc, c);
+  if (bulk) return bulk;
+  if (!VERB.test(c) && !EMPTY_START.test(c)) return { type: 'ai' };
 
   const namedSection = findSectionsInCommand(getSections(doc), c).best;
   const what = understandRemoval(c, namedSection?.title || '');
-  const specific = what.categories.length > 0 || what.phrases.length > 0;
+  const patterns = asksForPatterns(c);
+  const specific = what.categories.length > 0 || what.phrases.length > 0 || patterns;
 
   // ---------- something specific to remove: NEVER a clear-section ----------
   if (specific) {
@@ -169,29 +260,65 @@ export function classifyCommand(doc, command) {
       };
     }
     // categories and words like Oral / Twice Daily belong to medicines: without a section name, use the medicine section
-    const medicineOnly = what.categories.length > 0 || what.medicineTerms;
+    const medicineOnly = what.categories.length > 0 || what.medicineTerms || patterns;
     const pick = pickSection(doc, c, { medicineOnly });
     if (pick.ask) return { type: 'ask', question: pick.ask };
     // the verb "drop" is not the medicine form "drops"
     const forms = formsFromCommand(c.replace(VERB, ' '));
-    const plan = planRemoval(doc, pick.section, { categories: what.categories, phrases: what.phrases, forms });
+    // which medicines: a named one, the one at the cursor, or every medicine (of the forms said)
+    const target = medicineTarget(doc, pick.section, c, cursor);
+    if (target.ask) return { type: 'ask', question: target.ask };
+    // ONE frequency named for a GROUP of medicines ("remove once daily from all tablets") = ALL frequency
+    // instructions (and so the dosing patterns too). Several listed, "only", or one named medicine = only those words.
+    let categories = [...what.categories];
+    let phrases = [...what.phrases];
+    const freq = phrases.filter((p) => categoryOfTerm(p) === 'frequency');
+    const group = !target.names.length && !target.entries.length;
+    if (freq.length === 1 && group && !ONLY.test(c) && !categories.includes('frequency')) {
+      phrases = phrases.filter((p) => p !== freq[0]);
+      categories = [...categories, 'frequency'];
+    }
+    const plan = planRemoval(doc, pick.section, { categories, phrases, forms, names: target.names, entries: target.entries, patterns });
     const intent = {
       action: 'remove',
       section: pick.section.title,
-      categories: what.categories,
-      phrases: what.phrases,
+      categories,
+      phrases,
       forms,
+      names: target.names,
+      entries: target.entries,
+      patterns,
       scope: medicineOnly || forms.length ? 'medicine_entries' : 'section_lines',
     };
     if (!plan.changes.some((ch) => ch.removals.some((r) => r.selected))) {
-      const asked = [...what.phrases, ...what.categories.map(labelOf)].join(', ');
-      return { type: 'ask', question: `I found no ${asked} in ${nice(pick.section.title)}. Nothing was changed.`, intent };
+      const asked = [...phrases, ...categories.map(labelOf), ...(patterns ? ['dosing patterns'] : [])].join(', ');
+      const where = target.names.length ? `${target.names.map((n) => n.toUpperCase()).join(', ')} in ` : target.entries.length ? 'this medicine in ' : '';
+      return { type: 'ask', question: `I found no ${asked} in ${where}${nice(pick.section.title)}. Nothing was changed.`, intent };
     }
-    const kind = what.categories.length === 1 && what.categories[0] === 'generic' && !what.phrases.length ? 'generic' : 'phrases';
+    const kind = categories.length === 1 && categories[0] === 'generic' && !phrases.length ? 'generic' : 'phrases';
     return { type: 'remove', kind, intent, plan };
   }
 
   // ---------- nothing specific named ----------
+  // "clear all the medicines" / "remove all medicines from Advice" / "empty the advice" / "remove everything from
+  // advice": every medicine entry, nothing else (non-medicine advice text and the heading stay)
+  if (ALL_MEDICINES.test(c) || ADVICE_MEDICINES.some((re) => re.test(c))) {
+    const sec = medicineSectionFor(doc, c);
+    if (sec.ask) return { type: 'ask', question: sec.ask };
+    const plan = planEntryRemoval(doc, sec.section, { all: true });
+    const intent = { action: 'remove', section: sec.section.title, entries: { forms: [], names: [] }, all: true, scope: 'medicine_entries' };
+    if (!plan.changes.length) return { type: 'ask', question: `There are no medicines in ${nice(sec.section.title)}. Nothing was changed.`, intent };
+    return { type: 'remove', kind: 'entries', intent, plan };
+  }
+
+  // "remove timing from all medicines": frequency or food timing? ask
+  if (TIMING.test(c) && MEDICINE_WORDS.test(c)) {
+    return {
+      type: 'ask',
+      question: 'Do you mean the frequency (for example Once Daily) or the food timing (for example After Food)? Nothing was changed.',
+    };
+  }
+
   // Whole medicines: "remove all type of syrup", "remove the tablet Dolo", "remove Dolo and Ciplox"
   const medPick = pickSection(doc, c, { medicineOnly: true });
   if (medPick.section) {
@@ -233,10 +360,13 @@ export function classifyCommand(doc, command) {
     return { type: 'ask', question: `Which section should I clear: ${clear.candidates.map((s) => nice(s.title)).join(' or ')}? Nothing was changed.` };
   }
   if (clear?.section) {
-    // a section WITH MEDICINES (Advice ...) is only cleared after the user confirms; other sections clear at once
+    // a section WITH MEDICINES, or a medicine section such as Advice, is only cleared after the user confirms;
+    // other sections clear at once
     const preview = clearPreview(doc, clear.section);
-    return { type: 'clear', section: clear.section, confirm: preview.medicines > 0, preview };
+    return { type: 'clear', section: clear.section, confirm: preview.medicines > 0 || MEDICINE_TITLE.test(clear.section.title), preview };
   }
+  // a clear command for Advice, but no Advice section could be identified: ask (never an ordinary AI edit)
+  if (isClearIntent(c) && /\badvice\b/i.test(c)) return { type: 'ask', question: NO_ADVICE };
 
   // "remove the instructions from Advice": which kind?
   if (what.vague && named.best) {

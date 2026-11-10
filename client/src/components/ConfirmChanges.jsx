@@ -11,10 +11,12 @@ import { deletionRanges, textAfter } from '../lib/medicineText';
 //   plan      from lib/medicineText.js: { section, changes, unchanged, counts, notFound }
 //   onApply   called with a COPY of the plan that has the user's tick-box choices
 //   onCancel  called when the window is closed without applying
+//   understood, original  (optional) when the plan came from the AI's interpretation of the command: both are
+//             shown, so the user sees how the command was understood next to their own words
 
 const KIND_LABEL = {
   generic: 'generic name', description: 'description', route: 'route', frequency: 'frequency',
-  as_needed: 'as needed', food: 'food timing', phrase: 'word', entry: 'whole medicine',
+  as_needed: 'as needed', food: 'food timing', phrase: 'word', entry: 'whole medicine', pattern: 'dosing pattern',
 };
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 export const kindLabel = (k) => KIND_LABEL[k] || k;
@@ -40,7 +42,16 @@ export function countsSummary(counts = {}) {
 const copyPlan = (plan) => plan.changes.map((c) => ({ ...c, removals: c.removals.map((r) => ({ ...r })) }));
 const entryOn = (row) => row.removals.some((r) => r.selected);
 
-export default function ConfirmChanges({ kind, plan, onApply, onCancel }) {
+// The whole-entry tick box: off -> nothing ticked; on -> back to the PROPOSED ticks (so an unticked suggestion,
+// such as a dosing pattern or a description, is never ticked just by re-ticking the line).
+// defaults = the entry's removals as proposed. If none was proposed ticked, everything is ticked.
+export function toggleEntryRemovals(row, defaults) {
+  const on = !entryOn(row);
+  const anyDefault = defaults.some((d) => d.selected);
+  return { ...row, removals: row.removals.map((r, k) => ({ ...r, selected: on && (anyDefault ? Boolean(defaults[k]?.selected) : true) })) };
+}
+
+export default function ConfirmChanges({ kind, plan, onApply, onCancel, understood = '', original = '' }) {
   const [rows, setRows] = useState(() => copyPlan(plan)); // the user's tick-box choices
 
   useEffect(() => {
@@ -54,13 +65,9 @@ export default function ConfirmChanges({ kind, plan, onApply, onCancel }) {
     setRows((rs) => rs.map((row, n) => (n !== i ? row : {
       ...row, removals: row.removals.map((r, m) => (m === k ? { ...r, selected: !r.selected } : r)),
     })));
-  // all removals of one entry on / off
+  // one entry off / back to its proposed ticks
   const toggleEntry = (i) =>
-    setRows((rs) => rs.map((row, n) => {
-      if (n !== i) return row;
-      const on = !entryOn(row);
-      return { ...row, removals: row.removals.map((r) => ({ ...r, selected: on })) };
-    }));
+    setRows((rs) => rs.map((row, n) => (n !== i ? row : toggleEntryRemovals(row, plan.changes[i].removals))));
 
   const chosen = useMemo(() => rows.filter(entryOn).length, [rows]);
   const unchanged = plan.unchanged || [];
@@ -86,6 +93,21 @@ export default function ConfirmChanges({ kind, plan, onApply, onCancel }) {
         </div>
 
         <div className="modal-body confirm-body">
+          {understood && (
+            <p className="confirm-note warn">
+              Understood by AI: <b>{understood}</b>
+              <br />
+              Your words: <i>{original}</i>
+              <br />
+              The app checked this against your words. Please make sure it is what you meant.
+            </p>
+          )}
+          {plan.untyped > 0 && (
+            <p className="confirm-note">
+              {plural(plan.untyped, 'medicine has', 'medicines have')} no type word (Tab. / Cap. / Syp. …), so{' '}
+              {plan.untyped === 1 ? 'it was' : 'they were'} not included.
+            </p>
+          )}
           {wholeMedicines
             ? <p className="confirm-note">{removalSummary}</p>
             : countsSummary(plan.counts) && <p className="confirm-note">Found: {countsSummary(plan.counts)}</p>}
@@ -100,6 +122,12 @@ export default function ConfirmChanges({ kind, plan, onApply, onCancel }) {
             <p className="confirm-note">
               Items marked <i>description</i> say what kind of medicine it is (for example Antacid), not its ingredient.
               They are not ticked. Tick them only if you want them removed too.
+            </p>
+          )}
+
+          {rows.some((r) => r.removals.some((x) => x.kind === 'pattern' && !x.selected)) && (
+            <p className="confirm-note">
+              Dosing patterns such as (1-0-1) are shown but not ticked. Tick them only if you want them removed too.
             </p>
           )}
 

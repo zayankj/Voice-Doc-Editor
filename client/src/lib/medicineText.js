@@ -1,6 +1,6 @@
 import { getBlocks } from './outline.js';
 import { getSections, findSectionsInCommand } from './sections.js';
-import { isLockedLabel } from './guards.js';
+import { isLockedLabel, labelPrefix } from './guards.js';
 import { flashKey } from './flash.js';
 
 // Deterministic removals inside ONE section, done by code (the AI never rewrites medicine lines).
@@ -134,6 +134,15 @@ export const CATEGORIES = {
 // these two are brackets after the brand (found by findGenericBracket), not word lists
 export const BRACKET_CATEGORIES = { generic: { label: 'generic name' }, description: { label: 'description' } };
 
+// Numeric dosing patterns: "(1-0-1)", "(1-1-1)", "(0-0-1)", "(½-0-½)", "1-0-1", "(1-1-1-1)".
+// Every part is ONE digit 0-4 (or ½), 3 or 4 parts: dates ("12-05-2026") and "1-2 tablets" never match.
+// They tell the patient how often to take the medicine, so they are NEVER ticked automatically:
+//   - a line that loses a frequency word shows its pattern as a separate, UNTICKED box (the user may tick it);
+//   - they are ticked only when the command explicitly asks for them ("remove the dosing patterns", "remove 1-0-1");
+//   - route removals, generic names and every other edit never show or touch them.
+export const DOSING_PATTERN =
+  /\(\s*[0-4½](?:\s*-\s*[0-4½]){2,3}\s*\)|(?<![\d½-])[0-4½](?:-[0-4½]){2,3}(?![\d½-])/g;
+
 const sortedTerms = (terms) => [...terms].sort((a, b) => b.length - a.length);
 const categoryRegex = (key) =>
   new RegExp(`(?<![A-Za-z0-9])(?:${sortedTerms(CATEGORIES[key].terms).join('|')})(?![A-Za-z0-9])`, 'gi');
@@ -172,16 +181,22 @@ export function entriesOfBlock(block, blockIndex) {
   finish();
 
   const out = [];
-  for (const piece of pieces) {
+  pieces.forEach((piece, p) => {
     const cuts = [0];
-    for (const m of piece.text.matchAll(MID_START)) if (m.index > 0) cuts.push(m.index);
+    // "Advice : Tab. DOLO 650 mg ...": the medicine-section label at the very start of the paragraph is its OWN
+    // entry (never part of the first medicine), so removing that medicine never removes the label
+    const label = p === 0 ? labelPrefix(piece.text) : '';
+    const labelCut = label && MEDICINE_TITLE.test(label) && piece.text.slice(label.length).trim() ? piece.text.match(/^[^:]*:\s*/)[0].length : 0;
+    if (labelCut) cuts.push(labelCut);
+    for (const m of piece.text.matchAll(MID_START)) if (m.index > labelCut && m.index > 0) cuts.push(m.index);
     cuts.push(piece.text.length);
     for (let i = 0; i < cuts.length - 1; i++) {
       const t = piece.text.slice(cuts[i], cuts[i + 1]);
       // midLine: this medicine started in the middle of a line ("... Treated with Syp. ONDEM ...")
-      if (t.trim()) out.push({ text: t, map: piece.map.slice(cuts[i], cuts[i + 1]), midLine: i > 0 });
+      // (the text right after a label starts a line of its own)
+      if (t.trim()) out.push({ text: t, map: piece.map.slice(cuts[i], cuts[i + 1]), midLine: i > 0 && cuts[i] !== labelCut });
     }
-  }
+  });
   return out.map((e, i) => ({ block: blockIndex, entry: i, ...e }));
 }
 
@@ -193,7 +208,7 @@ export function sectionEntries(doc, section) {
     .flatMap((i) => entriesOfBlock(blocks[i], i));
 }
 
-const MEDICINE_TITLE = /\b(advice|medication|medications|medicine|medicines|treatment|drugs?|prescription|rx)\b/i;
+export const MEDICINE_TITLE = /\b(advice|medication|medications|medicine|medicines|treatment|drugs?|prescription|rx)\b/i;
 
 const isMedicineEntry = (text, medicineSection) =>
   FORM_AT_START.test(text) ||
@@ -270,36 +285,65 @@ function removalsForEntry(text, isMedicine, wanted, medicineSection) {
     if (f.from < from || taken(f.from, f.to)) continue;
     cores.push({ ...f, selected: true });
   }
+  // numeric dosing patterns: ticked only when explicitly asked; otherwise shown UNTICKED on a line that loses
+  // a frequency word (so the user can choose), and not shown at all for any other removal
+  const losesFrequency = cores.some((c) => c.kind === 'frequency' || (c.kind === 'phrase' && categoryOfTerm(c.text) === 'frequency'));
+  if (isMedicine && (wanted.patterns || losesFrequency)) {
+    for (const m of text.matchAll(DOSING_PATTERN)) {
+      const [s, e] = [m.index, m.index + m[0].length];
+      if (s < from || taken(s, e)) continue;
+      cores.push({ from: s, to: e, text: m[0], kind: 'pattern', selected: Boolean(wanted.patterns) });
+    }
+  }
   if (!cores.length) return [];
 
-  // separators: brackets keep their own space in front; words take one neighbouring separator
-  const words = withSeparators(text, cores.filter((c) => !c.bracket));
-  return [...cores.filter((c) => c.bracket), ...words].sort((a, b) => a.from - b.from).map(({ bracket, ...r }) => r);
+  // separators: brackets keep their own space in front; words take one neighbouring separator;
+  // a dosing pattern right after a word ("Twice Daily (1-0-1) — 2 days") takes only the space in front of it,
+  // so removing it alone gives "Twice Daily — 2 days" (never "Twice Daily 2 days")
+  const isPattern = (c) => c.kind === 'pattern';
+  const words = withSeparators(text, cores.filter((c) => !c.bracket && !isPattern(c)));
+  const patterns = cores.filter(isPattern).map((c) => {
+    const left = text.slice(0, c.from).match(/(\S)(\s+)$/);
+    if (left && !/[—–,]/.test(left[1])) return { ...c, from: c.from - left[2].length };
+    return withSeparators(text, [c])[0];
+  });
+  return [...cores.filter((c) => c.bracket), ...words, ...patterns].sort((a, b) => a.from - b.from).map(({ bracket, ...r }) => r);
 }
 
-// The engine. options = { phrases: [], categories: [], forms: [] }
+// The engine. options = { phrases: [], categories: [], forms: [], names: [], entries: [], patterns: false }
+//   patterns: true only when the command EXPLICITLY asks to remove dosing patterns (then they are ticked)
 //   categories: any of 'generic', 'description', 'route', 'frequency', 'as_needed', 'food'
 //   forms: [] = all medicines, or e.g. ['tab', 'syp'] (only those entries)
-export function planRemoval(doc, section, { phrases = [], categories = [], forms = [] } = {}) {
-  const wanted = { categories: new Set(categories), phrases: [...new Set(phrases.filter(Boolean))] };
+//   names: [] = all medicines, or e.g. ['dolo'] (only entries with that brand / generic name)
+//   entries: [] = all, or ['<block>-<entry>'] (only those entries: "this medicine" = the one at the cursor)
+// plan.untyped = medicine entries left out by a form filter because they have no form word ("DOLO 650 mg")
+export function planRemoval(doc, section, { phrases = [], categories = [], forms = [], names = [], entries = [], patterns = false } = {}) {
+  const wanted = { categories: new Set(categories), phrases: [...new Set(phrases.filter(Boolean))], patterns };
   const medicineSection = isMedicineSection(doc, section);
   const changes = [];
   const unchanged = [];
   const counts = {};
+  let untyped = 0;
   for (const e of sectionEntries(doc, section)) {
     const isMedicine = isMedicineEntry(e.text, medicineSection);
     // in a medicine section only medicine entries are touched; elsewhere every line can be
     if (medicineSection && !isMedicine) continue;
     if (forms.length) {
       const f = e.text.match(FORM_AT_START);
-      if (!f || !forms.includes(formKeyOf(f[1]))) continue;
+      if (!f) { if (isMedicine) untyped++; continue; }
+      if (!forms.includes(formKeyOf(f[1]))) continue;
     }
+    if (names.length && !names.some((n) => entryMatchesName(e.text, n))) continue;
+    if (entries.length && !entries.includes(`${e.block}-${e.entry}`)) continue;
     const removals = removalsForEntry(e.text, isMedicine, wanted, medicineSection);
     if (removals.length) {
       changes.push({ block: e.block, entry: e.entry, before: e.text, removals });
       for (const r of removals) {
         const key = r.kind === 'phrase' ? r.phrase : r.kind;
-        if (r.kind !== 'description' || wanted.categories.has('description')) counts[key] = (counts[key] || 0) + 1;
+        // shown-but-unticked suggestions (descriptions, dosing patterns) are not counted as "found"
+        if ((r.kind !== 'description' || wanted.categories.has('description')) && (r.kind !== 'pattern' || wanted.patterns)) {
+          counts[key] = (counts[key] || 0) + 1;
+        }
       }
     } else if (isMedicine) {
       unchanged.push({ block: e.block, entry: e.entry, before: e.text });
@@ -309,8 +353,61 @@ export function planRemoval(doc, section, { phrases = [], categories = [], forms
   const notFound = [
     ...wanted.phrases.filter((p) => !counts[p]),
     ...[...wanted.categories].filter((k) => k !== 'description' && !counts[k]).map((k) => (CATEGORIES[k] || BRACKET_CATEGORIES[k]).label),
+    ...(wanted.patterns && !counts.pattern ? ['dosing pattern'] : []),
   ];
-  return { section: { title: nice(section.title), headingIndex: section.headingIndex }, changes, unchanged, counts, notFound };
+  return {
+    section: { title: nice(section.title), headingIndex: section.headingIndex }, changes, unchanged, counts, notFound, untyped,
+    medicines: medicineSection, // the lines are medicines (for the message: "from 3 medicines" / "from 3 lines")
+  };
+}
+
+// What was ACTUALLY removed, in words, built only from the ticked removals of a plan:
+//   "Removed the Oral route, frequency instructions and dosing patterns from 3 medicines."
+const titleCase = (t) => t.trim().toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase()).replace(/\b(Od|Bd|Bid|Tds|Tid|Qid|Qds|Hs|Sos|Prn|Iv|Im|Sc)\b/g, (w) => w.toUpperCase());
+const andList = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
+export function removalSummary(plan, kind) {
+  const lines = plan.changes.filter((c) => c.removals.some((r) => r.selected));
+  const sel = lines.flatMap((c) => c.removals.filter((r) => r.selected));
+  const medicines = plan.medicines ?? ((plan.unchanged || []).length > 0 || sel.some((r) => r.kind !== 'phrase'));
+  const n = lines.length;
+  const where = `${n} ${medicines ? 'medicine' : 'line'}${n === 1 ? '' : 's'}`;
+  if (kind === 'entries') return `Removed ${where}.`;
+  const has = (k) => sel.some((r) => r.kind === k);
+  const phrases = (cat) => [...new Set(sel.filter((r) => r.kind === 'phrase' && categoryOfTerm(r.text) === cat).map((r) => titleCase(r.text)))];
+  const parts = [];
+  const routes = phrases('route');
+  if (has('route')) parts.push('route instructions');
+  else if (routes.length) parts.push(`the ${andList(routes)} route${routes.length > 1 ? 's' : ''}`);
+  if (has('frequency')) parts.push('frequency instructions');
+  if (has('pattern')) parts.push('dosing patterns');
+  const freq = phrases('frequency');
+  if (freq.length) parts.push(andList(freq));
+  if (has('generic')) parts.push('generic names');
+  if (has('description')) parts.push('descriptions');
+  if (has('as_needed')) parts.push('as-needed instructions');
+  if (has('food')) parts.push('food timing');
+  for (const cat of ['as_needed', 'food']) { const p = phrases(cat); if (p.length) parts.push(andList(p)); }
+  const other = [...new Set(sel.filter((r) => r.kind === 'phrase' && !categoryOfTerm(r.text)).map((r) => `"${r.text.trim()}"`))];
+  if (other.length) parts.push(andList(other));
+  return `Removed ${andList(parts)} from ${where}.`;
+}
+
+// How many medicine LINES the document has: entries that start a line with a medicine form ("Tab. / Syp. ...").
+// Used to stop AI edits that would remove several medicines at once without the confirmation window.
+export function countMedicineLines(doc) {
+  let n = 0;
+  getBlocks(doc).forEach((b, i) => {
+    for (const e of entriesOfBlock(b, i)) if (!e.midLine && FORM_AT_START.test(e.text)) n++;
+  });
+  return n;
+}
+
+// The medicine entry the cursor is in (document position pos), or null. Used for "this medicine".
+export function medicineEntryAt(doc, section, pos) {
+  if (!Number.isInteger(pos)) return null;
+  const medicineSection = isMedicineSection(doc, section);
+  return sectionEntries(doc, section).find((e) =>
+    isMedicineEntry(e.text, medicineSection) && e.map.length && pos >= e.map[0] && pos <= e.map[e.map.length - 1] + 1) || null;
 }
 
 // ---------- removing WHOLE medicine entries ----------
@@ -341,7 +438,9 @@ function entryMatchesName(text, name) {
 //   forms: ['syp'] -> every syrup; names: ['dolo'] -> every entry with that brand (or generic) name.
 //   Both given ("the tablet Dolo") -> entries that match the name AND are of that form.
 // Returns a plan like planRemoval(): every proposed entry has ONE removal of kind 'entry' covering the whole line.
-export function planEntryRemoval(doc, section, { forms = [], names = [] } = {}) {
+//   all: true -> EVERY medicine entry of the section ("remove all medicines"); lines that are not medicines
+//   (advice text, follow-up, review dates, the heading) are never part of the plan, so they stay.
+export function planEntryRemoval(doc, section, { forms = [], names = [], all = false } = {}) {
   const medicineSection = isMedicineSection(doc, section);
   const changes = [];
   const unchanged = [];
@@ -350,7 +449,7 @@ export function planEntryRemoval(doc, section, { forms = [], names = [] } = {}) 
     if (!isMedicineEntry(e.text, medicineSection)) continue;
     const formOk = !forms.length || forms.includes(formOf(e.text));
     const hitNames = names.filter((n) => entryMatchesName(e.text, n));
-    const match = names.length ? hitNames.length > 0 && formOk : formOk && forms.length > 0;
+    const match = all || (names.length ? hitNames.length > 0 && formOk : formOk && forms.length > 0);
     if (match) {
       for (const n of hitNames) found.set(n, found.get(n) + 1);
       changes.push({
@@ -367,6 +466,7 @@ export function planEntryRemoval(doc, section, { forms = [], names = [] } = {}) 
     unchanged,
     counts: changes.length ? { entry: changes.length } : {},
     notFound: names.filter((n) => found.get(n) === 0),
+    medicines: true,
   };
 }
 

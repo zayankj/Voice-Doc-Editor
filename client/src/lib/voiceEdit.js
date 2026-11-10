@@ -1,7 +1,7 @@
 import { getBlocks } from './outline';
 import { flashKey } from './flash';
 import { getPatientFacts, syncPatientFacts, setHeaderGender } from './consistency';
-import { lockReason, changesGender, isLockedLabel, isLabelText } from './guards';
+import { lockReason, changesGender, isLockedLabel, isLabelText, labelPrefix } from './guards';
 import { cellAt, isDataTable, hasTitleRow, rowNames, valueCellAfter, keepValueFormat } from './tables.js';
 
 export { getPatientFacts };
@@ -56,6 +56,17 @@ const isMedicineLine = (t) => FORM_START.test(t);
 
 // Is this block inside a medicine section? (the nearest section heading above it is Advice / Medications ...)
 function inMedicineSection(doc, blocks, index) {
+  // the paragraph itself STARTS with a medicine-section heading: "ADVICE↵Tab. DOLO ..." or "Advice : Tab. DOLO ..."
+  // (the heading shares the paragraph with the medicines, so it is not a heading block of its own)
+  const own = blocks[index]?.node;
+  if (own) {
+    let first = '';
+    let broke = false;
+    own.forEach((c) => { if (!broke) { if (c.isText) first += c.text; else broke = true; } });
+    if (broke && isLabelText(first) && MEDICINE_TITLE.test(first)) return true;
+    const prefix = labelPrefix(own.textContent);
+    if (prefix && MEDICINE_TITLE.test(prefix)) return true;
+  }
   for (let j = index - 1; j >= 0; j--) {
     if (isSectionTitle(doc, blocks[j])) return MEDICINE_TITLE.test(blocks[j].node.textContent);
   }

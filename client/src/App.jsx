@@ -24,8 +24,9 @@ import { scrollToPos, scrollToFirstChange } from './lib/scroll';
 import { findMissingFields } from './lib/validate';
 import { genderChangeAllowed } from './lib/guards';
 import { clearSection } from './lib/sectionCommands';
-import { applyRemovals, textAfter } from './lib/medicineText';
+import { applyRemovals, textAfter, removalSummary } from './lib/medicineText';
 import { classifyCommand } from './lib/commandIntent';
+import { understoodFrom, malayalamStop, checkInterpretation } from './lib/interpretation';
 import { asOneUndoStep } from './lib/undoStep';
 import { checkNamedSection, checkTableEdits } from './lib/verify';
 import ConfirmChanges from './components/ConfirmChanges';
@@ -38,7 +39,7 @@ import { pcmChunksToWav } from './lib/wav';
 import { exportDocx } from './lib/exportDocx';
 import { todayString } from './lib/tools';
 import { extractEdits, checkFile, FILE_ACCEPT } from './lib/fileExtract';
-import { previewEdits } from './lib/previewEdits';
+import { previewEdits, medicinesLostByEdits } from './lib/previewEdits';
 import { readDocument, stopReading, ttsSupported, watchVoices } from './lib/tts';
 import TopBar from './components/TopBar';
 import FormatBar from './components/FormatBar';
@@ -70,23 +71,6 @@ const IDLE_STOP_MS = 5 * 60 * 1000; // the mic turns itself off after this long 
 const MAX_QUEUE = 5; // commands that may wait while a previous one is being applied
 const READ_RATE = 1.1; // reading speed for Read aloud (0.95 = normal, 1.1 = fast)
 const RESTART_ON_CLICK = true; // while reading, clicking in the document restarts reading from the clicked sentence
-// TEMPORARY voice debugging. Logs ONLY numbers, block ids, operations and labels (no patient text,
-// no transcript). Remove this together with the [voice-debug] lines when we finish.
-const DEBUG_VOICE = true;
-// Average and peak loudness of a recorded clip (0 = silence, 1 = maximum)
-function clipLevels(chunks) {
-  let sum = 0, n = 0, peak = 0;
-  for (const b64 of chunks) {
-    const bin = atob(b64);
-    for (let i = 0; i + 1 < bin.length; i += 2) {
-      let v = bin.charCodeAt(i) | (bin.charCodeAt(i + 1) << 8);
-      if (v >= 0x8000) v -= 0x10000;
-      const f = Math.abs(v) / 0x8000;
-      sum += f * f; n++; if (f > peak) peak = f;
-    }
-  }
-  return { avg: +Math.sqrt(sum / (n || 1)).toFixed(4), peak: +peak.toFixed(3) };
-}
 
 // Summaries are saved in this browser by lib/summaries.js (one entry per summary).
 
@@ -352,10 +336,12 @@ export default function App() {
   //   ask    unclear -> a question, nothing changes
   //   ai     anything else -> the normal AI editing (returns false)
   // Returns true when the command was handled here (done, asked, or shown for confirmation).
-  function runCodeCommand(command) {
+  // source: 'typed' | 'voice' (for the message after Apply)
+  function runCodeCommand(command, source = 'typed') {
     const c = String(command || '').trim();
     if (!c) return false;
-    const intent = classifyCommand(editor.state.doc, c);
+    // the cursor tells which medicine "this medicine" is
+    const intent = classifyCommand(editor.state.doc, c, { cursor: editor.state.selection.from });
 
     if (intent.type === 'ask') {
       setNote(intent.question);
@@ -376,11 +362,12 @@ export default function App() {
     }
 
     if (intent.type !== 'remove') return false; // not a command for code: the AI handles it as before
-    return showRemoval(intent);
+    return showRemoval(intent, { source });
   }
 
-  // Empties one section in ONE step (one Undo; the heading stays) and records it in History
-  function doClear(section) {
+  // Empties one section in ONE step (one Undo; the heading stays) and records it in History.
+  // preview (from the confirmation window): what was listed, so the message says exactly what was removed
+  function doClear(section, preview = null) {
     const r = clearSection(editor, section);
     if (!r.ok) {
       setNote(`🔒 Nothing was changed: ${r.error}.`);
@@ -392,7 +379,12 @@ export default function App() {
         ...h,
       ]);
       scrollToPos(editor, r.pos, true);
-      setNote(`${r.title}: all content removed (the heading stays). Use Undo to bring it back.`);
+      const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+      const others = preview ? preview.lines.length - preview.medicines : 0;
+      const what = !preview ? 'all content removed'
+        : `removed ${[preview.medicines ? n(preview.medicines, 'medicine', 'medicines') : '', others ? n(others, 'other line', 'other lines') : '']
+          .filter(Boolean).join(' and ')}`;
+      setNote(`${r.title}: ${what} (the heading stays). Use Undo to bring it back.`);
     }
   }
 
@@ -405,24 +397,18 @@ export default function App() {
       setNote('The document changed while the window was open, so nothing was changed. Please give the command again.');
       return;
     }
-    doClear(p.section);
+    doClear(p.section, p.preview);
   }
 
-  function showRemoval(intent) {
+  // extra = { source, understood, original }: understood/original are shown when the plan came from the
+  // AI's interpretation (already checked against the original words by lib/interpretation.js)
+  function showRemoval(intent, extra = {}) {
     // Removal: show the preview window. Remember the document as it is now: if it changes while the
     // window is open, the preview is outdated and Apply refuses.
-    // (whole-medicine commands have no categories / word list: every field is optional here)
-    if (DEBUG_VOICE) {
-      const it = intent.intent || {};
-      console.info('[voice-debug] code command', {
-        section: it.section,
-        categories: it.categories || [],
-        phrases: (it.phrases || []).length,
-        forms: it.forms || it.entries?.forms || [],
-        names: (it.entries?.names || []).length,
-      });
-    }
-    setPending({ kind: intent.kind, plan: intent.plan, doc: editor.state.doc });
+    setPending({
+      kind: intent.kind, plan: intent.plan, doc: editor.state.doc,
+      source: extra.source || 'typed', understood: extra.understood || '', original: extra.original || '',
+    });
     setNote('Please check the changes in the window, then press Apply or Cancel. Nothing has been changed yet.');
     return true;
   }
@@ -446,13 +432,13 @@ export default function App() {
       return;
     }
     const lines = planWithChoices.changes.filter((c) => c.removals.some((x) => x.selected));
-    const removed = [...new Set(lines.flatMap((c) => c.removals.filter((x) => x.selected).map((x) => x.text.trim().toLowerCase())))];
-    const what = p.kind === 'generic' ? 'generic names removed' : `removed ${removed.join(', ')}`;
+    // the message says only what was ACTUALLY removed (built from the ticked parts, not from the command)
+    const what = removalSummary(planWithChoices, p.kind);
     const title = planWithChoices.section.title;
-    const count = `${r.lines} line${r.lines > 1 ? 's' : ''}`;
+    const from = p.source === 'voice' ? 'your voice command' : 'your typed instruction';
     setHistory((h) => [
       {
-        label: `${title}: ${what} (${count})`,
+        label: `${title}: ${what}`,
         before: lines.map((c) => c.before).join(' | '),
         after: lines.map((c) => textAfter(c)).join(' | '),
         at: new Date().toLocaleTimeString(),
@@ -460,7 +446,7 @@ export default function App() {
       ...h,
     ]);
     scrollToFirstChange(editor);
-    setNote(`${title}: ${count} changed (${what}). Changed lines are highlighted in yellow. Use Undo to bring it back.`);
+    setNote(`${lines.length} change${lines.length > 1 ? 's' : ''} applied from ${from}. ${what} Changed parts are highlighted in yellow. Use Undo to bring it back.`);
   }
 
   // Cancel in the confirm window: the document is not touched
@@ -479,7 +465,6 @@ export default function App() {
     let noEffect = 0; // edits that "succeeded" but did not change the document
     const blockedWhy = [...blockedFirst]; // edits refused by the checks (table row / locked label / unasked gender change)
     const appliedValues = []; // new texts that were really applied
-    const debugRows = []; // [voice-debug]
     const entries = []; // History entries of this instruction: added as ONE entry below
     let alsoFixed = 0;
     // Everything this instruction changes (all AI edits + the age/gender fix) is ONE undo step,
@@ -492,10 +477,6 @@ export default function App() {
         // (e.g. replacing a text with the same text "succeeds" but changes nothing)
         const changed = r.ok && !editor.state.doc.eq(docBefore);
         if (r.ok && !changed) entries.pop(); // its History entry (handleEdit added exactly one): nothing to record
-        if (DEBUG_VOICE) debugRows.push({
-          block_id: ed.block_id, operation: ed.operation, field_label: ed.field_label,
-          result: changed ? (r.moved ? 'moved to section text' : 'applied') : r.ok ? 'no change' : r.blocked ? 'blocked' : 'failed',
-        });
         if (r.ok && !changed) noEffect++;
         else if (r.ok) {
           applied++;
@@ -504,10 +485,6 @@ export default function App() {
         }
         else if (r.blocked) blockedWhy.push(`${ed.field_label || ed.block_id}: ${r.error}`);
         else skipped++;
-      }
-      if (DEBUG_VOICE) {
-        console.info(`[voice-debug] ${label}: model returned ${aiEditCount} edit(s)`);
-        if (debugRows.length) console.table(debugRows);
       }
 
       // Age / gender must be the same everywhere. If this command set a gender somewhere
@@ -569,7 +546,7 @@ export default function App() {
     const opts = { allowGender, fromFile: true };
     const preview = previewEdits(doc, ordered, opts);
     if (!preview.items.length && !preview.blocked.length) {
-      setNote(`No changes were needed from ${label}.${summary ? ` AI: ${summary}` : ''}`);
+      setNote(`No changes were detected in "${file.name}". The document is unchanged.${summary ? ` AI: ${summary}` : ''}`);
       return;
     }
     // the same dry run for the user's choice of tick boxes (the age / gender step depends on it)
@@ -583,6 +560,11 @@ export default function App() {
     const p = pending;
     setPending(null);
     if (!p) return;
+    // nothing selected: close the preview; NOTHING runs (no edit, no Undo step, no History entry, no highlight)
+    if (!selected.size && !consistency) {
+      setNote(`No changes were applied from "${p.fileName}". The document is unchanged.`);
+      return;
+    }
     if (!editor.state.doc.eq(p.doc)) {
       setNote('The document changed while the window was open, so nothing was changed. Please upload the file again.');
       return;
@@ -622,7 +604,7 @@ export default function App() {
     if (!voice) setApplying(true);
     try {
       // Typed command (no file, no voice): commands done by code are recognised BEFORE calling the AI
-      if (!file && !audio && runCodeCommand(text)) return true;
+      if (!file && !audio && runCodeCommand(text, 'typed')) return true;
 
       const { edits: aiEdits, summary: aiSummary, heard } = await extractEdits({
         file,
@@ -635,7 +617,30 @@ export default function App() {
       if (heard) setTranscript(heard);
 
       // Voice: the AI has turned the speech into text; now check for commands done by code
-      if (!file && audio && runCodeCommand([text, heard].filter(Boolean).join(' '))) return true;
+      if (!file && audio && runCodeCommand([text, heard].filter(Boolean).join(' '), 'voice')) return true;
+
+      // E. (typed and spoken commands, not files) The AI's restatement "Understood: ..." is never trusted by itself.
+      //    - a Malayalam command whose action the app cannot check is NEVER carried out (the AI's edits are dropped)
+      //    - a medicine removal understood by the AI is re-built by code and checked against the person's own words;
+      //      if it matches, the confirm window shows it; if not, the app asks. The AI's own edits are never used.
+      if (!file) {
+        const original = [text, heard].filter(Boolean).join(' ');
+        const understood = understoodFrom(aiSummary);
+        const stop = malayalamStop(original, understood);
+        if (stop) {
+          setNote(stop);
+          return true;
+        }
+        const inter = checkInterpretation(editor.state.doc, { original, understood, cursor: editor.state.selection.from });
+        if (inter.type === 'ask') {
+          setNote(inter.question);
+          return true;
+        }
+        if (inter.type === 'remove') {
+          showRemoval(inter, { source: voice ? 'voice' : 'typed', understood: inter.understood, original: inter.original });
+          return true;
+        }
+      }
 
       // C. When the command names a section ("inside COURSE IN HOSPITAL add ..."), the AI's edits must land
       //    there: added text is moved to that section, other changes elsewhere refuse the whole command.
@@ -670,6 +675,15 @@ export default function App() {
       // until Apply. Typed and spoken commands are applied straight away, as before.
       if (file) {
         showUploadPreview({ ordered, allowGender, label, text, file, summary });
+        return true;
+      }
+      // F. AI edits from a typed / spoken command may never remove SEVERAL medicines at once: that is only done
+      //    through the confirmation window. A dry run on a copy (the same code as the upload preview) counts the
+      //    medicine lines that would disappear; 2 or more -> nothing is applied.
+      const lost = medicinesLostByEdits(editor.state.doc, ordered, allowGender);
+      if (lost >= 2) {
+        setNote(`🔒 These AI changes would remove ${lost} medicines at once, so nothing was changed. Several medicines are removed only through ` +
+          'the confirmation window: say "remove all medicines from Advice", or name the medicines to remove.');
         return true;
       }
       applyAiEdits({ ordered, allowGender, label, text, heard, file, summary, voice, blockedFirst: tableCheck.blocked, aiEditCount: check.edits.length });
@@ -707,10 +721,6 @@ export default function App() {
       while (queue.current.length) {
         const clip = queue.current.shift();
         const { base64, seconds } = pcmChunksToWav(clip);
-        if (DEBUG_VOICE) {
-          const lv = clipLevels(clip);
-          console.info('[voice-debug] clip', { seconds: +seconds.toFixed(1), avgLevel: lv.avg, peakLevel: lv.peak, sent: seconds >= 0.5 });
-        }
         if (seconds < 0.5) continue;
         await runEdits({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
       }
@@ -1014,7 +1024,8 @@ export default function App() {
       ) : pending.kind === 'clear' ? (
         <ConfirmClear preview={pending.preview} onApply={applyClear} onCancel={cancelPending} />
       ) : (
-        <ConfirmChanges kind={pending.kind} plan={pending.plan} onApply={applyPending} onCancel={cancelPending} />
+        <ConfirmChanges kind={pending.kind} plan={pending.plan} understood={pending.understood} original={pending.original}
+          onApply={applyPending} onCancel={cancelPending} />
       )
     )}
     {toast && <div className="toast">{toast}</div>}

@@ -24,7 +24,7 @@ import { asOneUndoStep } from '../src/lib/undoStep.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = path.join(here, '.build-upload');
 fs.mkdirSync(tmp, { recursive: true });
-for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tables', 'previewEdits']) {
+for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tables', 'previewEdits', 'medicineText', 'sections']) {
   const src = fs.readFileSync(path.join(here, '../src/lib', `${f}.js`), 'utf8').replace(/from '\.\/([A-Za-z]+)'/g, "from './$1.js'");
   fs.writeFileSync(path.join(tmp, `${f}.js`), src);
 }
@@ -269,7 +269,7 @@ test('WINDOW: field, old value struck out, new value, tick box each; "will NOT b
   assert.match(html, /Nothing is changed until you press Apply/);
 });
 
-test('WINDOW: patient details start UNTICKED with a warning; Apply is disabled until something is ticked', () => {
+test('WINDOW: patient details start UNTICKED with a warning; with nothing ticked Apply stays usable and says it only closes', () => {
   const edits = [{ block_id: 'B8', operation: 'set', new_value: 'FEMALE', field_label: 'Sex' }];
   const html = renderToStaticMarkup(React.createElement(UploadPreview, {
     fileName: 'note.jpg', summary: '', preview: previewEdits(makeDoc(), edits, FILE),
@@ -279,5 +279,20 @@ test('WINDOW: patient details start UNTICKED with a warning; Apply is disabled u
   assert.match(html, /<em>patient detail<\/em>/);
   assert.match(html, /are NOT ticked/);
   assert.doesNotMatch(html, /checked=""/);
-  assert.match(html, /<button class="seg-btn on" disabled="">Apply<\/button>/);
+  // (was: Apply disabled) Apply stays usable; the footer says it only closes the window and changes nothing
+  assert.match(html, /<button class="seg-btn on">Apply<\/button>/);
+  assert.match(html, /Nothing selected: Apply closes the window and leaves the document unchanged\./);
+});
+
+test('WINDOW: every change from the file refused -> Apply still usable (no stuck window)', () => {
+  const edits = [{ block_id: 'B33', operation: 'clear', field_label: 'CRP' }]; // a file may never clear a value
+  const preview = previewEdits(makeDoc(), edits, FILE);
+  assert.equal(preview.items.length, 0);
+  assert.equal(preview.blocked.length, 1);
+  const html = renderToStaticMarkup(React.createElement(UploadPreview, {
+    fileName: 'lab.pdf', summary: '', preview, recompute: () => preview, onApply() {}, onCancel() {},
+  }));
+  assert.match(html, /will NOT be applied/);
+  assert.doesNotMatch(html, /disabled=""/);
+  assert.match(html, /Apply closes the window and leaves the document unchanged/);
 });
