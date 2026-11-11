@@ -3,6 +3,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
+import { liveEnabled, liveDescription, liveExtract } from './liveVoice.js'; // test branch: Gemini Live for voice only
+import { commandAddon, commandSchema, cleanCursorBlock, cleanRecent } from './commandPrompt.js'; // commands only, never uploads
+import { finishCommand } from './scopeGuard.js'; // commands only: scope check + English interpretation in summary
 
 const apiKey = process.env.GEMINI_API_KEY;
 const useVertex = String(process.env.GOOGLE_GENAI_USE_VERTEXAI).toLowerCase() === 'true';
@@ -58,6 +61,7 @@ const MODELS = [
     .filter(Boolean),
 ];
 console.log('Models:', MODELS.join(' -> '));
+console.log(liveDescription());
 
 const PER_TRY_TIMEOUT_MS = 120000; // one try may take up to 2 minutes
 const TOTAL_BUDGET_MS = 240000; // stop trying after 4 minutes in total
@@ -172,7 +176,9 @@ async function generateWithRetry(request) {
       if (remaining < 5000 || calls >= MAX_CALLS) throw finalError(lastErr, quotaSeen);
       calls++;
       try {
-        return await tryOnce(model, request, Math.min(PER_TRY_TIMEOUT_MS, remaining), attempt === 1);
+        const text = await tryOnce(model, request, Math.min(PER_TRY_TIMEOUT_MS, remaining), attempt === 1);
+        console.log(`AI: answered by ${model}`); // which model answered; never content
+        return text;
       } catch (e) {
         lastErr = e;
         if (e?.status === 400 && !noThinking.has(model) && /thinking/i.test(String(e?.message))) {
@@ -380,7 +386,7 @@ Examples (command -> what it means; names refer to whatever is in the EXISTING D
 
 app.post('/api/extract-edits', async (req, res) => {
   try {
-    const { outline, today, base64, mimeType, text, fileName, instruction, audioBase64, audioMimeType, templateId } = req.body || {};
+    const { outline, today, base64, mimeType, text, fileName, instruction, audioBase64, audioMimeType, templateId, cursorBlock, recent } = req.body || {};
     // Department template: must be a known id. No id = discharge summary.
     let template = null;
     if (templateId) {
@@ -393,6 +399,28 @@ app.post('/api/extract-edits', async (req, res) => {
     if (!outline || (!hasFile && !typed && !hasAudio)) {
       return res.status(400).json({ error: 'Speak, attach a file or type an instruction' });
     }
+    // A COMMAND (typed or spoken, no file) gets the extra lines of commandPrompt.js and more answer fields
+    // (understood, language, all_words), used by scopeGuard.js. A file upload gets exactly the prompt and answer
+    // format it had before.
+    const isCommand = !hasFile;
+    const prompt = buildExtractPrompt(outline, today, typed, hasFile, hasAudio, template) +
+      (isCommand ? commandAddon({ cursorBlock: cleanCursorBlock(cursorBlock), recent: cleanRecent(recent) }) : '');
+
+    // Test branch: a VOICE clip on its own (no file, no typed text) first tries Gemini Live (server/liveVoice.js).
+    // The prompt is the same; the answer is checked there (all-or-nothing). On ANY problem - error, time limit,
+    // empty transcript, missing or invalid function arguments, a non-WAV clip - the existing path below runs with
+    // the same request. Logs only the path, the time and a fixed reason; never audio, transcripts or document text.
+    if (hasAudio && !hasFile && !typed && liveEnabled() && (!audioMimeType || audioMimeType === 'audio/wav')) {
+      const t0 = Date.now();
+      try {
+        const result = await liveExtract({ prompt, audioBase64 });
+        console.log(`Voice: Live answered in ${Date.now() - t0} ms (${result.edits.length} edit(s))`);
+        // the person's words: Google's transcript (and the model's own, inside finishCommand)
+        return res.json(finishCommand(result, { outline, said: [result.transcript] }));
+      } catch (e) {
+        console.warn(`Voice: Live not used (${e?.message || 'error'}) after ${Date.now() - t0} ms -> existing path`);
+      }
+    }
 
     // Every model's quota is used up: answer straight away instead of sending requests that will fail
     if (allPaused()) {
@@ -403,11 +431,11 @@ app.post('/api/extract-edits', async (req, res) => {
     if (base64) parts.push({ inlineData: { mimeType, data: base64 } });
     else if (text) parts.push({ text: `UPLOADED FILE (${fileName || 'file'}):\n${text}` });
     if (hasAudio) parts.push({ inlineData: { mimeType: audioMimeType || 'audio/wav', data: audioBase64 } });
-    parts.push({ text: buildExtractPrompt(outline, today, typed, hasFile, hasAudio, template) });
+    parts.push({ text: prompt });
 
     const answer = await generateWithRetry({
       contents: [{ role: 'user', parts }],
-      config: { responseMimeType: 'application/json', responseSchema: editsSchema, temperature: 0 },
+      config: { responseMimeType: 'application/json', responseSchema: isCommand ? commandSchema(editsSchema) : editsSchema, temperature: 0 },
     });
 
     let data;
@@ -416,7 +444,9 @@ app.post('/api/extract-edits', async (req, res) => {
     } catch {
       return res.status(502).json({ error: 'The model returned an unreadable answer. Try again.' });
     }
-    res.json({ edits: data.edits || [], summary: data.summary || '', heard: data.heard || '' });
+    const out = { edits: data.edits || [], summary: data.summary || '', heard: data.heard || '' };
+    // commands (typed, or the backup voice path): scope check + English interpretation in summary. Uploads: as before.
+    res.json(isCommand ? finishCommand(data, { outline, said: [typed] }) : out);
   } catch (e) {
     console.error(e);
     const msg = String(e?.message || '');

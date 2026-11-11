@@ -48,11 +48,17 @@ async function toPayload(file) {
 // audio = { base64, mimeType } (a recorded voice command). Returns { edits, summary, heard }.
 // templateId: only for department templates (e.g. "nursing-assessment"). Summaries send none,
 // so the server uses exactly the same discharge summary prompt as before.
-export async function extractEdits({ file, instruction = '', audio = null, outline, today, templateId = '' }) {
+// cursorBlock / recent: COMMANDS only (never sent with a file): the block the cursor is in ("B12") and up to 3
+// commands applied earlier in the same document. Returns also understood and language for commands.
+export async function extractEdits({ file, instruction = '', audio = null, outline, today, templateId = '', cursorBlock = '', recent = [] }) {
   const payload = file ? await toPayload(file) : {};
 
   const body = { outline, today, instruction: instruction.trim(), fileName: file?.name, ...payload };
   if (templateId) body.templateId = templateId;
+  if (!file) {
+    if (cursorBlock) body.cursorBlock = cursorBlock;
+    if (recent.length) body.recent = recent.slice(-3);
+  }
   if (audio) {
     body.audioBase64 = audio.base64;
     body.audioMimeType = audio.mimeType;

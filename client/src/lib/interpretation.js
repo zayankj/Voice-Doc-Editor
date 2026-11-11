@@ -106,3 +106,66 @@ export function checkInterpretation(doc, { original, understood, cursor } = {}) 
   }
   return { type: 'remove', kind: r.kind, intent, plan: r.plan, understood: u, original: said };
 }
+
+// ---------- commands the app cannot check against the person's own words (approved option A) ----------
+// Non-English commands (any script other than Latin, or a language other than English reported by the AI, e.g.
+// Hindi / Urdu / Kannada written in English letters) are understood by the AI, but the app's checks above can only
+// read English. Such a command is NEVER applied directly: the AI's plain-English restatement ("understood") is run
+// through the existing checks and shown in a window next to the person's own words, and nothing changes until the
+// person presses Apply. English commands keep the path above, unchanged.
+
+// letters that are not Latin (Malayalam, Kannada, Devanagari, Arabic / Urdu ...)
+const NON_LATIN_LETTER = /(?![A-Za-zÀ-ɏ])\p{L}/u;
+// words that describe the KIND of English, not another language ("broken English", "informal English")
+const ENGLISH_KIND = /\b(?:broken|informal|simple|simplified|spoken|typed|casual|indian|grammatically|incorrect|poor|non-native|with|errors?|mixed|english)\b/gi;
+
+// The language(s) reported by the AI: true when any of them is not English. Empty / unknown -> false (the English
+// checks then run on the person's own words, which is the existing, stricter path).
+export function reportedNonEnglish(language) {
+  const parts = String(language || '').toLowerCase().replace(/\([^)]*\)/g, ' ').split(/[+,&/;]|\band\b/);
+  return parts.some((p) => p.replace(ENGLISH_KIND, ' ').replace(/[^a-z]/g, '') !== '' && !/english/.test(p));
+}
+
+// Must this command be shown in a window before anything changes?
+export function needsPreview(original, language = '') {
+  return NON_LATIN_LETTER.test(String(original || '')) || reportedNonEnglish(language);
+}
+
+// A command that reached the English checks (written in English letters, language reported as English or not at
+// all) but whose words contain NO English removal word, while the AI understood something: e.g. Malayalam / Hindi
+// written in English letters ("advice ella medicines um ozhivakki kalayan"). The English checks cannot read its
+// action, so instead of asking for an English word it is handled like a non-English command (window first).
+export function englishChecksCannotRead(original, understood) {
+  return Boolean(String(understood || '').trim()) && !REMOVE_ACTION.test(String(original || ''));
+}
+
+// Option A: the AI service puts the English interpretation of a non-English command at the start of summary
+// ("Understood: ... ."), because the gateway passes only edits / summary / heard. It is used for the checks, but
+// never shown: this is the summary without that sentence (no interpretation lines in windows or the side panel).
+export function summaryToShow(summary) {
+  return String(summary || '').replace(/^\s*Understood:\s*[\s\S]*?(?:\.(?=\s+[A-Z][a-z])|\.?\s*$)/, '').trim();
+}
+
+// What the AI's restatement means for the app (the person's words are NOT word-checked here; the window is the check)
+// Returns { type: 'ask', question }                     unclear / unsafe: ask, nothing changes
+//         { type: 'remove', kind, intent, plan }         a medicine removal: the existing medicine window
+//         { type: 'clear', section, preview }            clearing a section: the existing Clear-section window
+//         { type: 'edits' }                              anything else: the AI's edits go to the preview window
+export function interpretForPreview(doc, { original, understood, cursor } = {}) {
+  // the AI may write "Understood: remove all medicines from Advice." - the engine reads the plain command
+  const u = String(understood || '').trim().replace(/^understood\s*:\s*/i, '').replace(/\.\s*$/, '').trim();
+  if (!u) return { type: 'ask', question: 'The command was not understood clearly. Please say it again, or type it. Nothing was changed.' };
+  const r = classifyCommand(doc, u, { cursor });
+  if (r.type === 'ask') return { type: 'ask', question: r.question };
+  if (r.type === 'clear') return { type: 'clear', section: r.section, preview: r.preview };
+  if (r.type !== 'remove') return { type: 'edits' };
+  // dosing patterns are ticked only when the person's OWN words ask for them (e.g. "1-0-1"); otherwise shown unticked
+  if (r.intent?.patterns && !asksForPatterns(original)) {
+    const plan = {
+      ...r.plan,
+      changes: r.plan.changes.map((c) => ({ ...c, removals: c.removals.map((x) => (x.kind === 'pattern' ? { ...x, selected: false } : x)) })),
+    };
+    return { type: 'remove', kind: r.kind, intent: r.intent, plan };
+  }
+  return { type: 'remove', kind: r.kind, intent: r.intent, plan: r.plan };
+}

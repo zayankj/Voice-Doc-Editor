@@ -16,14 +16,17 @@ import { useEffect, useMemo, useState } from 'react';
 //   recompute  (selected: Set of edit indexes, consistency: boolean) -> dry run for exactly that choice
 //   onApply    called with { selected: Set, consistency: boolean }
 //   onCancel   called when the window is closed without applying
+//   command    (optional) the same window for a non-English COMMAND: { notIncluded }. Only the changes are shown
+//              (in English); every change starts ticked (it was asked for), and the person reviews it.
+//              Without this prop the window is exactly the upload preview.
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 const show = (t) => (String(t || '').trim() ? t : '(empty)');
 
-export default function UploadPreview({ fileName, summary, preview, recompute, onApply, onCancel }) {
-  // patient details are not ticked until the user confirms them
-  const [ticks, setTicks] = useState(() => new Set(preview.items.filter((i) => !i.patient).map((i) => i.index)));
-  const [syncOn, setSyncOn] = useState(false);
+export default function UploadPreview({ fileName, summary, preview, recompute, onApply, onCancel, command = null }) {
+  // file: patient details are not ticked until the user confirms them. command: everything starts ticked.
+  const [ticks, setTicks] = useState(() => new Set(preview.items.filter((i) => command || !i.patient).map((i) => i.index)));
+  const [syncOn, setSyncOn] = useState(Boolean(command));
 
   useEffect(() => {
     const onKey = (e) => e.key === 'Escape' && onCancel();
@@ -44,7 +47,7 @@ export default function UploadPreview({ fileName, summary, preview, recompute, o
 
   const patients = preview.items.filter((i) => i.patient).length;
   const chosen = ticks.size + (syncOn && sync.length ? 1 : 0);
-  const title = `Changes from ${fileName ? `"${fileName}"` : 'the uploaded file'}`;
+  const title = command ? 'Check this command before it is applied' : `Changes from ${fileName ? `"${fileName}"` : 'the uploaded file'}`;
   // nothing selected: Apply stays usable and only closes the window (the document is not touched)
   const footer = chosen
     ? `${ticks.size} of ${plural(preview.items.length, 'change', 'changes')} selected`
@@ -56,20 +59,23 @@ export default function UploadPreview({ fileName, summary, preview, recompute, o
         <div className="modal-head">
           <div>
             <b>{title}</b>
-            <span>Check every change against the file. Nothing is changed until you press Apply. All applied changes are one Undo step.</span>
+            <span>Check every change against {command ? 'your instruction' : 'the file'}. Nothing is changed until you press Apply. All applied changes are one Undo step.</span>
           </div>
           <button className="icon-btn" onClick={onCancel} aria-label="Close without changing">✕</button>
         </div>
 
         <div className="modal-body confirm-body">
           {summary && <p className="confirm-note">AI: {summary}</p>}
-          {(patients > 0 || sync.length > 0) && (
+          {command?.notIncluded?.length > 0 && (
+            <p className="confirm-note warn">Not included: {command.notIncluded.join('; ')}</p>
+          )}
+          {!command && (patients > 0 || sync.length > 0) && (
             <p className="confirm-note warn">
               Patient details (marked <i>patient detail</i>) and gender changes are NOT ticked. Check them against the file
               and tick them only if they are correct.
             </p>
           )}
-          {preview.items.length === 0 && <p className="confirm-note">The file does not change anything in this document.</p>}
+          {preview.items.length === 0 && <p className="confirm-note">The {command ? 'command' : 'file'} does not change anything in this document.</p>}
 
           <ul className="confirm-list">
             {preview.items.map((item) => {
@@ -127,14 +133,14 @@ export default function UploadPreview({ fileName, summary, preview, recompute, o
 
           {preview.blocked.length > 0 && (
             <details className="confirm-unchanged" open>
-              <summary>{plural(preview.blocked.length, 'change', 'changes')} from the file will NOT be applied</summary>
+              <summary>{plural(preview.blocked.length, 'change', 'changes')} from the {command ? 'command' : 'file'} will NOT be applied</summary>
               <ul>
                 {preview.blocked.map((b) => <li key={b.index}>{b.field}: {b.reason}</li>)}
               </ul>
             </details>
           )}
           {preview.unchanged > 0 && (
-            <p className="confirm-note">{plural(preview.unchanged, 'value', 'values')} in the file already match the document (nothing to change).</p>
+            <p className="confirm-note">{plural(preview.unchanged, 'value', 'values')} in the {command ? 'command' : 'file'} already match the document (nothing to change).</p>
           )}
         </div>
 

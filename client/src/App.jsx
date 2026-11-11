@@ -17,7 +17,7 @@ import { Flash, getFlashRanges } from './lib/flash';
 import { Placeholders } from './lib/placeholders';
 import { FontSize, LineHeight } from './lib/extensions';
 import { docxToHtml } from './lib/docxImport';
-import { buildOutline } from './lib/outline';
+import { buildOutline, getBlocks } from './lib/outline';
 import { applyVoiceEdit, applyPatientConsistency, ensurePatientConsistency, getPatientFacts } from './lib/voiceEdit';
 import { genderStatedIn } from './lib/consistency';
 import { scrollToPos, scrollToFirstChange } from './lib/scroll';
@@ -26,7 +26,7 @@ import { genderChangeAllowed } from './lib/guards';
 import { clearSection } from './lib/sectionCommands';
 import { applyRemovals, textAfter, removalSummary } from './lib/medicineText';
 import { classifyCommand } from './lib/commandIntent';
-import { understoodFrom, malayalamStop, checkInterpretation } from './lib/interpretation';
+import { understoodFrom, malayalamStop, checkInterpretation, needsPreview, interpretForPreview, englishChecksCannotRead, summaryToShow } from './lib/interpretation';
 import { asOneUndoStep } from './lib/undoStep';
 import { checkNamedSection, checkTableEdits } from './lib/verify';
 import ConfirmChanges from './components/ConfirmChanges';
@@ -74,6 +74,19 @@ const RESTART_ON_CLICK = true; // while reading, clicking in the document restar
 
 // Summaries are saved in this browser by lib/summaries.js (one entry per summary).
 
+// The AI's edits from the bottom of the document upwards, so a newly inserted line never shifts the blocks that
+// are still waiting to be edited
+function bottomUp(edits) {
+  const blockNo = (ed) => {
+    const n = parseInt(String(ed.block_id).replace(/\D/g, ''), 10);
+    return Number.isNaN(n) ? -1 : n;
+  };
+  return edits
+    .map((ed, i) => ({ ed, i }))
+    .sort((a, b) => blockNo(b.ed) - blockNo(a.ed) || b.i - a.i)
+    .map((x) => x.ed);
+}
+
 export default function App() {
   const [history, setHistory] = useState([]);
   const [status, setStatus] = useState('idle'); // idle | connecting | listening
@@ -94,6 +107,12 @@ export default function App() {
   const [toast, setToast] = useState('');
   // a code-based removal (remove phrases / generic names) waiting in the confirm window: { kind, plan, doc }
   const [pending, setPending] = useState(null);
+  // Commands applied earlier IN THIS DOCUMENT (context for the AI: "change it back"). At most 3, in memory only;
+  // emptied whenever another document is opened (loadIntoEditor), never saved, never shared between documents.
+  const recentCommands = useRef([]);
+  const currentCommand = useRef(''); // the command being handled now (remembered once it is really applied)
+  const openedWindows = useRef(0); // counts confirmation / preview windows (tells Apply Edit that a window opened)
+  const inputsWaitForWindow = useRef(false); // Apply Edit's text / file are cleared only when that window applies
   const live = useRef(null);
   const stopMic = useRef(null);
   const segmenter = useRef(null); // cuts the microphone stream into commands (audio mode)
@@ -175,6 +194,7 @@ export default function App() {
     setHistory([]);
     setNote(''); setError(''); setTranscript(''); setReply('');
     setAttached(null); setInstruction('');
+    recentCommands.current = []; // context never goes from one document (patient) to another
     setSaved(true);
   }
 
@@ -353,7 +373,7 @@ export default function App() {
     if (intent.type === 'clear') {
       // a section with medicines (Advice): ask first; nothing changes until "Clear section"
       if (intent.confirm) {
-        setPending({ kind: 'clear', section: intent.section, preview: intent.preview, doc: editor.state.doc });
+        openPending({ kind: 'clear', section: intent.section, preview: intent.preview, doc: editor.state.doc });
         setNote('Please check the window, then press Clear section or Cancel. Nothing has been changed yet.');
         return true;
       }
@@ -405,7 +425,7 @@ export default function App() {
   function showRemoval(intent, extra = {}) {
     // Removal: show the preview window. Remember the document as it is now: if it changes while the
     // window is open, the preview is outdated and Apply refuses.
-    setPending({
+    openPending({
       kind: intent.kind, plan: intent.plan, doc: editor.state.doc,
       source: extra.source || 'typed', understood: extra.understood || '', original: extra.original || '',
     });
@@ -453,6 +473,41 @@ export default function App() {
   function cancelPending() {
     setPending(null);
     setNote('Cancelled. Nothing was changed.');
+    windowClosed(false); // Apply Edit keeps the typed text / file
+  }
+
+  // ---------- windows, Apply Edit inputs and the recent-commands context ----------
+  // Every confirmation / preview window opens through here (the command it belongs to is kept with it)
+  function openPending(p) {
+    openedWindows.current++;
+    setPending({ ...p, command: currentCommand.current });
+  }
+  // Apply / Clear section in a window: did the document really change? Then the command is remembered and the
+  // Apply Edit inputs that opened the window are cleared. Otherwise they stay.
+  function finishWindow(p, apply) {
+    const before = editor.state.doc;
+    apply();
+    const applied = !editor.state.doc.eq(before);
+    if (applied && p?.command) remember(p.command);
+    windowClosed(applied);
+  }
+  function windowClosed(applied) {
+    if (inputsWaitForWindow.current && applied) clearInputs();
+    inputsWaitForWindow.current = false;
+  }
+  function clearInputs() {
+    setAttached(null);
+    setInstruction('');
+  }
+  function remember(command) {
+    const c = String(command || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (c) recentCommands.current = [...recentCommands.current, c].slice(-3);
+  }
+  // The block the cursor is in ("this paragraph", "this date"), e.g. "B12", or ''
+  function cursorBlockId() {
+    const from = editor.state.selection.from;
+    const b = getBlocks(editor.state.doc).find((x) => from > x.pos && from < x.pos + x.node.nodeSize);
+    return b ? `B${b.index}` : '';
   }
 
   // Applies the AI's edits (already checked and in bottom-up order) as ONE undo step with ONE History entry,
@@ -551,7 +606,7 @@ export default function App() {
     }
     // the same dry run for the user's choice of tick boxes (the age / gender step depends on it)
     const recompute = (selected, consistency) => previewEdits(doc, ordered, { ...opts, selected, consistency });
-    setPending({ kind: 'upload', doc, ordered, preview, recompute, allowGender, label, text, fileName: file.name, summary });
+    openPending({ kind: 'upload', doc, ordered, preview, recompute, allowGender, label, text, fileName: file.name, summary });
     setNote('Please check the changes from the file in the window, then press Apply or Cancel. Nothing has been changed yet.');
   }
 
@@ -582,6 +637,97 @@ export default function App() {
     });
   }
 
+  // ---------- a command the app cannot check against the person's own words (not English) ----------
+  // Approved option A: shown in a window BEFORE anything changes: the person's words, the AI's plain-English
+  // "understood", and every change. The existing checks run first, on "understood" (a check that refuses still
+  // refuses); the window is added on top of them. Medicine removals and section clears use their existing windows.
+  // The windows show only the changes, in English (no extra language / interpretation lines).
+  function previewCommand({ original, understood, aiEdits, aiSummary, text, heard, label, voice }) {
+    const doc = editor.state.doc;
+    const u = String(understood || '').trim();
+    // the AI asked a question / changes nothing: show it; nothing changes
+    if (!aiEdits.length && (!u || /\?/.test(aiSummary || ''))) {
+      setNote(aiSummary ? `AI: ${aiSummary}` : 'The command was not understood clearly. Please say it again, or type it. Nothing was changed.');
+      return;
+    }
+    const r = interpretForPreview(doc, { original, understood: u, cursor: editor.state.selection.from });
+    if (r.type === 'ask') {
+      setNote(r.question);
+      return;
+    }
+    if (r.type === 'remove') {
+      showRemoval(r, { source: voice ? 'voice' : 'typed' }); // the existing medicine window, exactly as for English
+      return;
+    }
+    if (r.type === 'clear') {
+      // every section, also those that an English command clears at once
+      openPending({ kind: 'clear', section: r.section, preview: r.preview, doc });
+      setNote('Please check the window, then press Clear section or Cancel. Nothing has been changed yet.');
+      return;
+    }
+    if (!aiEdits.length) {
+      // the interpretation is not a change the app can make (e.g. "removing Tab. DOLO ..."): ask, nothing changes
+      setNote('The command was not understood clearly. Please say it again more simply, or type it. Nothing was changed.');
+      return;
+    }
+    // the existing checks, on the AI's restatement plus the person's words (numbers written in digits count)
+    const command = `${u} ${original}`;
+    const check = checkNamedSection(doc, command, aiEdits);
+    if (check.reject) {
+      setNote(`🔒 ${check.reject}`);
+      return;
+    }
+    const tableCheck = checkTableEdits(doc, command, check.edits);
+    const ordered = bottomUp(tableCheck.edits);
+    const allowGender = genderChangeAllowed({ instruction: u, heard: original, hasFile: false });
+    const lost = medicinesLostByEdits(doc, ordered, allowGender);
+    if (lost >= 2) {
+      setNote(`🔒 These AI changes would remove ${lost} medicines at once, so nothing was changed. Several medicines are removed only through ` +
+        'the confirmation window.');
+      return;
+    }
+    const opts = { allowGender, fromFile: false };
+    const preview = previewEdits(doc, ordered, opts);
+    if (!preview.items.length && !preview.blocked.length) {
+      setNote(`${tableCheck.blocked.length ? `🔒 ${tableCheck.blocked.join('; ')}. ` : ''}No change can be made from this command. Nothing was changed.`);
+      return;
+    }
+    const recompute = (selected, consistency) => previewEdits(doc, ordered, { ...opts, selected, consistency });
+    openPending({
+      kind: 'command', doc, ordered, preview, recompute, allowGender, label, text, heard, voice,
+      summary: check.moved.length ? check.moved.map((m) => `${m.section}: added 1 line.`).join(' ') : aiSummary,
+      blockedFirst: tableCheck.blocked,
+    });
+    setNote('Please check the changes in the window, then press Apply or Cancel. Nothing has been changed yet.');
+  }
+
+  // Apply in the command window: only the ticked changes, as ONE undo step with ONE History entry
+  function applyCommandPreview({ selected, consistency }) {
+    const p = pending;
+    setPending(null);
+    if (!p) return;
+    if (!selected.size && !consistency) {
+      setNote('Nothing was selected, so nothing was changed.');
+      return;
+    }
+    if (!editor.state.doc.eq(p.doc)) {
+      setNote('The document changed while the window was open, so nothing was changed. Please give the command again.');
+      return;
+    }
+    applyAiEdits({
+      ordered: p.ordered.filter((_, i) => selected.has(i)),
+      allowGender: p.allowGender,
+      consistency,
+      label: p.label,
+      text: p.text,
+      heard: p.heard,
+      summary: p.summary,
+      voice: p.voice,
+      blockedFirst: p.blockedFirst,
+      aiEditCount: p.ordered.length,
+    });
+  }
+
   // A file is checked as soon as it is attached (file picker or drag-and-drop): a wrong type is never sent
   function attachFile(file) {
     if (!file) return;
@@ -601,23 +747,46 @@ export default function App() {
     stopReadingNow();
     setError('');
     setNote('');
+    if (!voice) setTranscript(''); // the "You: ..." line of an earlier voice command does not belong to this request
+    currentCommand.current = file ? '' : text; // files are never remembered as a command
     if (!voice) setApplying(true);
     try {
       // Typed command (no file, no voice): commands done by code are recognised BEFORE calling the AI
       if (!file && !audio && runCodeCommand(text, 'typed')) return true;
 
-      const { edits: aiEdits, summary: aiSummary, heard } = await extractEdits({
+      const answer = await extractEdits({
         file,
         instruction: text,
         audio,
         outline: buildOutline(editor.state.doc), // fresh snapshot of the document at this moment
         today: todayString(),
         templateId: openTemplateId(), // '' for discharge summaries
+        // commands only (never files): where the cursor is, and the commands applied earlier in THIS document
+        ...(file ? {} : { cursorBlock: cursorBlockId(), recent: recentCommands.current }),
       });
+      const { edits: aiEdits, summary: aiSummary } = answer;
+      // heard is the transcript of a VOICE command; for typed text the AI may echo the text, which is not used
+      const heard = audio ? answer.heard || '' : '';
       if (heard) setTranscript(heard);
+      if (heard) currentCommand.current = [text, heard].filter(Boolean).join(' ');
 
       // Voice: the AI has turned the speech into text; now check for commands done by code
       if (!file && audio && runCodeCommand([text, heard].filter(Boolean).join(' '), 'voice')) return true;
+
+      // G. (approved option A) Commands the app cannot check against the person's own words (not English):
+      //    NEVER applied directly. The AI's plain-English "understood" goes through the existing checks and is shown
+      //    in a window next to the person's words; nothing changes until Apply. English commands continue below.
+      //    The gateway passes only edits / summary / heard: the AI service puts the interpretation at the start of
+      //    summary ("Understood: ...", Option A), so it is read from there.
+      if (!file && needsPreview([text, heard].filter(Boolean).join(' '), answer.language)) {
+        const meaning = String(answer.understood || '').trim() || understoodFrom(aiSummary);
+        currentCommand.current = meaning || currentCommand.current;
+        previewCommand({
+          original: [text, heard].filter(Boolean).join(' '), understood: meaning,
+          aiEdits, aiSummary: summaryToShow(aiSummary), text, heard, label, voice,
+        });
+        return true;
+      }
 
       // E. (typed and spoken commands, not files) The AI's restatement "Understood: ..." is never trusted by itself.
       //    - a Malayalam command whose action the app cannot check is NEVER carried out (the AI's edits are dropped)
@@ -632,6 +801,14 @@ export default function App() {
           return true;
         }
         const inter = checkInterpretation(editor.state.doc, { original, understood, cursor: editor.state.selection.from });
+        // the words have no English removal word (e.g. Malayalam in English letters reported as English): not
+        // rejected; handled like a non-English command (the AI's meaning, the existing checks, a window first)
+        if (inter.type === 'ask' && englishChecksCannotRead(original, understood)) {
+          const meaning = String(answer.understood || '').trim() || understood;
+          currentCommand.current = meaning;
+          previewCommand({ original, understood: meaning, aiEdits, aiSummary: summaryToShow(aiSummary), text, heard, label, voice });
+          return true;
+        }
         if (inter.type === 'ask') {
           setNote(inter.question);
           return true;
@@ -655,18 +832,12 @@ export default function App() {
       const tableCheck = file ? { edits: check.edits, blocked: [] } : checkTableEdits(editor.state.doc, [text, heard].filter(Boolean).join(' '), check.edits);
       const edits = tableCheck.edits;
       // when text was moved to the right section, the AI's own summary ("added malaria to the diagnosis") is wrong
-      const summary = check.moved.length ? check.moved.map((m) => `${m.section}: added 1 line.`).join(' ') : aiSummary;
+      // (commands: the "Understood: ..." sentence is used for the checks only, never shown - Option A)
+      const summary = check.moved.length ? check.moved.map((m) => `${m.section}: added 1 line.`).join(' ') : file ? aiSummary : summaryToShow(aiSummary);
 
       // Apply from the bottom of the document upwards, so a newly inserted line
       // never shifts the blocks that are still waiting to be edited.
-      const blockNo = (ed) => {
-        const n = parseInt(String(ed.block_id).replace(/\D/g, ''), 10);
-        return Number.isNaN(n) ? -1 : n;
-      };
-      const ordered = edits
-        .map((ed, i) => ({ ed, i }))
-        .sort((a, b) => blockNo(b.ed) - blockNo(a.ed) || b.i - a.i)
-        .map((x) => x.ed);
+      const ordered = bottomUp(edits);
 
       // Gender may only change when the command talks about it (or a file was attached)
       const allowGender = genderChangeAllowed({ instruction: text, heard, hasFile: Boolean(file) });
@@ -697,18 +868,33 @@ export default function App() {
     }
   }
 
+  // runEdits, then: what happened? 'applied' (the document changed), 'window' (a confirmation / preview window
+  // opened; nothing changed yet), 'none' (a question, a safety refusal, nothing to change) or 'error'.
+  // A command that really changed the document is remembered as context for the next commands.
+  async function runAndReport(args) {
+    const docBefore = editor.state.doc;
+    const windowsBefore = openedWindows.current;
+    const ok = await runEdits(args);
+    if (!ok) return 'error';
+    if (openedWindows.current !== windowsBefore) return 'window';
+    if (editor.state.doc.eq(docBefore)) return 'none';
+    if (!args.file) remember(currentCommand.current);
+    return 'applied';
+  }
+
   // ---------- Apply Edit button: attached file and/or typed instruction ----------
+  // The typed text and the file are cleared only when the document REALLY changed. After a question, a safety
+  // refusal or an error they stay, so the person can correct them and press Apply Edit again. When a window
+  // opens, they are cleared only if Apply in that window changes the document (Cancel keeps them).
   async function handleApply() {
     if (!attached && !instruction.trim()) return;
-    const ok = await runEdits({
+    const outcome = await runAndReport({
       file: attached,
       text: instruction,
       label: attached ? `"${attached.name}"` : 'your instruction',
     });
-    if (ok) {
-      setAttached(null);
-      setInstruction('');
-    }
+    if (outcome === 'applied') clearInputs();
+    else if (outcome === 'window') inputsWaitForWindow.current = true;
   }
 
   // ---------- microphone, audio mode: always listening, one command per pause ----------
@@ -722,7 +908,7 @@ export default function App() {
         const clip = queue.current.shift();
         const { base64, seconds } = pcmChunksToWav(clip);
         if (seconds < 0.5) continue;
-        await runEdits({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
+        await runAndReport({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
       }
     } finally {
       working.current = false;
@@ -1020,12 +1206,17 @@ export default function App() {
     {pending && onEditor && (
       pending.kind === 'upload' ? (
         <UploadPreview fileName={pending.fileName} summary={pending.summary} preview={pending.preview}
-          recompute={pending.recompute} onApply={applyUpload} onCancel={cancelPending} />
+          recompute={pending.recompute} onApply={(c) => finishWindow(pending, () => applyUpload(c))} onCancel={cancelPending} />
+      ) : pending.kind === 'command' ? (
+        <UploadPreview summary={pending.summary} preview={pending.preview} recompute={pending.recompute}
+          command={{ notIncluded: pending.blockedFirst }}
+          onApply={(c) => finishWindow(pending, () => applyCommandPreview(c))} onCancel={cancelPending} />
       ) : pending.kind === 'clear' ? (
-        <ConfirmClear preview={pending.preview} onApply={applyClear} onCancel={cancelPending} />
+        <ConfirmClear preview={pending.preview}
+          onApply={() => finishWindow(pending, applyClear)} onCancel={cancelPending} />
       ) : (
         <ConfirmChanges kind={pending.kind} plan={pending.plan} understood={pending.understood} original={pending.original}
-          onApply={applyPending} onCancel={cancelPending} />
+          onApply={(plan) => finishWindow(pending, () => applyPending(plan))} onCancel={cancelPending} />
       )
     )}
     {toast && <div className="toast">{toast}</div>}
