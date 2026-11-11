@@ -113,6 +113,40 @@ test('ALL-OR-NOTHING: one invalid edit refuses the whole answer (never a partial
   }
 });
 
+test('spoken commands may use format / change_case / to_list / unlist; their fields are kept, wrong values refused', () => {
+  const look = [
+    { block_id: 'B3', operation: 'format', style: 'bold', find_text: 'DOLO', field_label: 'Advice' },
+    { block_id: 'B5', operation: 'change_case', case: 'upper', last_block_id: 'B9', field_label: 'Course in Hospital' },
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', lines: ['Tab. A', 'Tab. B'], field_label: 'Advice' },
+    { block_id: 'B12', operation: 'unlist', field_label: 'Diet' },
+    { block_id: 'B3', operation: 'insert_after', new_value: 'Tab. DOLO', find_text: 'Tab. A', duplicate_ok: true, field_label: 'Advice' },
+  ];
+  const r = checkLiveResult({ ...good, edits: look }, 'x');
+  assert.deepEqual(r.edits, look);
+  // to_list with select (the browser picks the lines) - with or without extra lines
+  const sel = [{ block_id: 'B3', operation: 'to_list', list_type: 'ordered', select: ['all_medicines'], lines: ['AZIPROPROTEIN POWDER 2 scoops'], field_label: 'Advice' },
+    { block_id: 'B3', operation: 'to_list', list_type: 'bullet', select: ['tablets', 'syrups'], field_label: 'Advice' }];
+  assert.deepEqual(checkLiveResult({ ...good, edits: sel }, 'x').edits, sel);
+  const withBad = (bad) => ({ ...good, edits: [look[0], bad] });
+  for (const bad of [
+    { block_id: 'B3', operation: 'format', field_label: 'A' }, // no style
+    { block_id: 'B3', operation: 'format', style: 'blink', field_label: 'A' },
+    { block_id: 'B3', operation: 'change_case', field_label: 'A' }, // no case
+    { block_id: 'B3', operation: 'change_case', case: 'random', field_label: 'A' },
+    { block_id: 'B3', operation: 'change_case', case: 'upper', last_block_id: '9', field_label: 'A' },
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', field_label: 'A' }, // no lines
+    { block_id: 'B3', operation: 'to_list', lines: ['a'], field_label: 'A' }, // no list_type
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', lines: [5], field_label: 'A' },
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', lines: Array(101).fill('a'), field_label: 'A' },
+    { block_id: 'B3', operation: 'insert_after', new_value: 'x', duplicate_ok: 'yes', field_label: 'A' },
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', select: ['vitamins'], field_label: 'A' }, // unknown kind
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', select: 'tablets', field_label: 'A' }, // not a list
+    { block_id: 'B3', operation: 'to_list', list_type: 'ordered', select: [], field_label: 'A' }, // neither select nor lines
+  ]) {
+    throwsLive(() => checkLiveResult(withBad(bad), 'some words'), /invalid edit/);
+  }
+});
+
 test('broken arguments -> refused', () => {
   for (const args of [null, undefined, 'text', [], {}, { edits: 'B2' }, { edits: {} }, { edits: [], understood: 'x', summary: 5 },
     { edits: [], summary: '' }, // understood is required

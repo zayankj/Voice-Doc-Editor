@@ -33,12 +33,44 @@ export function cleanRecent(v) {
     .slice(-MAX_RECENT);
 }
 
-// The answer format for commands: the existing one plus understood, language and all_words
+// Look-only edits and lists, for COMMANDS ONLY (uploads keep the five text operations). The browser applies them
+// (client/src/lib/voiceEdit.js) without changing any words.
+export const COMMAND_OPERATIONS = ['set', 'replace_text', 'append', 'clear', 'insert_after', 'format', 'change_case', 'to_list', 'unlist'];
+export const STYLES = ['bold', 'italic', 'underline', 'not_bold', 'not_italic', 'not_underline'];
+export const CASES = ['upper', 'lower', 'title', 'sentence'];
+export const LIST_TYPES = ['ordered', 'bullet'];
+// to_list select: the kinds of medicine lines the BROWSER picks from the document (client/src/lib/voiceEdit.js)
+export const SELECT_KINDS = ['all_medicines', 'tablets', 'capsules', 'syrups', 'suspensions', 'injections', 'drops', 'ointments', 'sachets', 'powders', 'inhalers'];
+// the extra fields of one edit (the same in the Live function, server/liveVoice.js)
+export const extraEditFields = (T) => ({
+  style: { type: T.STRING, enum: STYLES },
+  case: { type: T.STRING, enum: CASES },
+  list_type: { type: T.STRING, enum: LIST_TYPES },
+  lines: { type: T.ARRAY, items: { type: T.STRING } },
+  select: { type: T.ARRAY, items: { type: T.STRING, enum: SELECT_KINDS } },
+  last_block_id: { type: T.STRING },
+  duplicate_ok: { type: T.BOOLEAN },
+});
+
+// The answer format for commands: the existing one plus understood, language and all_words, and the edits may also
+// use the look-only / list operations and their fields. The existing schema object is not changed.
 export function commandSchema(editsSchema) {
+  const item = editsSchema.properties.edits.items;
   return {
     ...editsSchema,
     properties: {
       ...editsSchema.properties,
+      edits: {
+        ...editsSchema.properties.edits,
+        items: {
+          ...item,
+          properties: {
+            ...item.properties,
+            operation: { ...item.properties.operation, enum: COMMAND_OPERATIONS },
+            ...extraEditFields(Type),
+          },
+        },
+      },
       understood: { type: Type.STRING },
       language: { type: Type.STRING },
       all_words: { type: Type.STRING },
@@ -96,6 +128,43 @@ ${earlier}
   The rule "No medicine named = every medicine in the section" above is ONLY for removing PARTS of medicine lines
   (route, frequency, generic names ...). "Remove the medicine" without saying which one: ask "Which medicine should
   be removed?".
+- Formatting, lists and capital letters ARE edits for commands (this replaces the rule above that formatting is done
+  with the toolbar). Colour, font, size, alignment, saving, printing and reading aloud are still done with the toolbar.
+  These operations change only the look or the case, never the words:
+  format: style = bold | italic | underline | not_bold | not_italic | not_underline.
+  change_case: case = upper | lower | title | sentence. "Capitalize" / "capital letters" = upper. Use change_case
+  (never set) for every change of capital letters.
+  For both: the whole block, or only find_text inside it (one word, one name or one line); for a whole section or the
+  whole document use ONE edit with block_id = the first block and last_block_id = the last block. The scope is exactly
+  what was asked: a word, a line, a section (the text UNDER its heading, not the heading) or the whole document.
+  To change a heading itself, use find_text = the heading's words.
+  to_list: list_type = ordered (numbered) | bullet; block_id = a block of that section. Say WHICH lines with select
+  and/or lines: select = the kinds of medicine asked for (all_medicines | tablets | capsules | syrups | suspensions |
+  injections | drops | ointments | sachets | powders | inhalers); the app finds those lines itself (a line that starts
+  with that form, e.g. "Tab." / "Syp."). lines = the exact text, copied from the document, of other lines to include:
+  for "all medicines" also every medicine or treatment line that does not start with a form (e.g. a supplement or
+  powder written by its name); for specific lines asked for, only those. (A line is a paragraph, or one line of a
+  paragraph with line breaks.) Only what was asked ("all the tablets" = select tablets only); the other lines stay as
+  they are. to_list ALWAYS needs select or lines (without them nothing changes).
+  unlist: block_id = a block inside the list; the whole list becomes normal paragraphs.
+- A NEW entry, line, medicine or instruction is ALWAYS insert_after (never append, never set): block_id = the block it
+  goes after; when that block has several lines (line breaks), find_text = the exact line it goes after. No position
+  said: after the last line of the section. append only continues the SAME line (e.g. ", TYPHOID" after a diagnosis).
+- Adding a medicine: one new line, in the style of the existing lines, with ONLY what was said (name, and any strength,
+  route, frequency, timing or duration that was said); never add one that was not said. If a medicine with the same
+  name is already in that section, ask whether to change it or add another entry; set duplicate_ok = true only when
+  the command clearly asks for another entry of the same medicine. No position said: it goes right after the LAST
+  MEDICINE entry of the section (block_id = that entry; when the medicines are a numbered or bullet list, its last
+  item), never after a review / follow-up line or other advice below the medicines.
+- Age and gender: Patient Details (the header) are the source. When the text to write states another age or gender,
+  write it as said - the app puts the Patient Details age / gender into it - and NEVER change Patient Details or any
+  other section because of it. Change Patient Details (and the other places) only when the command explicitly asks
+  to change the patient's age or gender. (For commands this replaces the rule above about updating every block that
+  states the age or gender.)
+- Moving text to another section: remove it from where it is (replace_text with an empty new_value, or clear) and add
+  it at the new place, in the same answer.
+- The app cannot see the selected text or the cursor: "the selected text", "this word" must be clear from the command
+  itself; otherwise ask.
 - all_words: the exact word or words of the command (as typed or spoken, in its own language and letters) that
   mean all / every / everything, e.g. "all", "ella", "sab". Empty when the command has no such word. Nothing else.
 - heard: the person's words as before. Whatever the language, write English words (also when said inside a

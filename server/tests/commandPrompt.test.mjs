@@ -73,8 +73,56 @@ test('general treatment instruction rule: in every command prompt, never in the 
   assert.doesNotMatch(index, /general instruction is not a prescription/);
 });
 
+// the same shape as editsSchema in index.js (the upload answer format)
+const UPLOAD_OPS = ['set', 'replace_text', 'append', 'clear', 'insert_after'];
+const baseSchema = () => ({
+  type: Type.OBJECT,
+  properties: {
+    heard: { type: Type.STRING }, summary: { type: Type.STRING },
+    edits: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { block_id: {}, operation: { type: Type.STRING, enum: [...UPLOAD_OPS] }, new_value: {}, find_text: {}, field_label: {} }, required: ['block_id', 'operation', 'field_label'] } },
+  },
+  required: ['edits', 'summary'],
+});
+
+test('commands (not uploads) may use format / change_case / to_list / unlist and their fields', () => {
+  const base = baseSchema();
+  const copy = JSON.stringify(base);
+  const item = commandSchema(base).properties.edits.items;
+  assert.deepEqual(item.properties.operation.enum, [...UPLOAD_OPS, 'format', 'change_case', 'to_list', 'unlist']);
+  for (const k of ['style', 'case', 'list_type', 'lines', 'select', 'last_block_id', 'duplicate_ok']) assert.ok(item.properties[k], k);
+  // to_list select: only the kinds the browser can pick from the document
+  assert.deepEqual(item.properties.select.items.enum, ['all_medicines', 'tablets', 'capsules', 'syrups', 'suspensions', 'injections', 'drops', 'ointments', 'sachets', 'powders', 'inhalers']);
+  assert.match(commandAddon(), /the app finds those lines itself/);
+  assert.match(commandAddon(), /for "all medicines" also every medicine or treatment line that does not start with a form/);
+  assert.match(commandAddon(), /to_list ALWAYS needs select or lines/);
+  assert.deepEqual(item.required, ['block_id', 'operation', 'field_label']);
+  // the upload schema keeps exactly the five text operations
+  assert.equal(JSON.stringify(base), copy);
+  assert.match(index, /operation: \{ type: Type\.STRING, enum: \['set', 'replace_text', 'append', 'clear', 'insert_after'\] \}/);
+});
+
+test('command rules: formatting is an edit, new entries are insert_after, medicines are never invented, the selection is never guessed', () => {
+  const a = commandAddon();
+  assert.match(a, /Formatting, lists and capital letters ARE edits for commands \(this replaces the rule above/);
+  assert.match(a, /Colour, font, size, alignment, saving, printing and reading aloud are still done with the toolbar/);
+  assert.match(a, /"Capitalize" \/ "capital letters" = upper/); // the existing meaning of "capitalize" is kept
+  assert.match(a, /Use change_case\s+\(never set\) for every change of capital letters/);
+  assert.match(a, /A NEW entry, line, medicine or instruction is ALWAYS insert_after \(never append, never set\)/);
+  assert.match(a, /never add one that was not said/);
+  assert.match(a, /already in that section, ask whether\s+to change it or add another entry/);
+  assert.match(a, /The app cannot see the selected text or the cursor/);
+  // a new medicine goes after the LAST medicine entry (the list's last item), not after review / follow-up lines
+  assert.match(a, /No position said: it goes right after the LAST\s+MEDICINE entry of the section/);
+  // Patient Details are the source of age / gender: never change them or other sections because of dictated text
+  assert.match(a, /Age and gender: Patient Details \(the header\) are the source/);
+  assert.match(a, /NEVER change Patient Details or any\s+other section because of it/);
+  // uploads: none of these lines (the base prompt keeps "formatting is done with the toolbar")
+  const build = loadBuildExtractPrompt();
+  for (const [k, args] of Object.entries(CASES)) assert.doesNotMatch(build(...args), /change_case|to_list|ALWAYS insert_after/, k);
+});
+
 test('command schema =the existing schema + understood (required) + language + all_words; the existing one is not changed', () => {
-  const base = { type: Type.OBJECT, properties: { edits: {}, summary: {}, heard: {} }, required: ['edits', 'summary'] };
+  const base = baseSchema();
   const copy = JSON.stringify(base);
   const s = commandSchema(base);
   assert.deepEqual(Object.keys(s.properties).sort(), ['all_words', 'edits', 'heard', 'language', 'summary', 'understood']);

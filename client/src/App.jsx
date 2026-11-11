@@ -19,7 +19,6 @@ import { FontSize, LineHeight } from './lib/extensions';
 import { docxToHtml } from './lib/docxImport';
 import { buildOutline, getBlocks } from './lib/outline';
 import { applyVoiceEdit, applyPatientConsistency, ensurePatientConsistency, getPatientFacts } from './lib/voiceEdit';
-import { genderStatedIn } from './lib/consistency';
 import { scrollToPos, scrollToFirstChange } from './lib/scroll';
 import { findMissingFields } from './lib/validate';
 import { genderChangeAllowed } from './lib/guards';
@@ -514,14 +513,18 @@ export default function App() {
   // and shows what happened. Used for typed / spoken commands, and by Apply in the upload preview.
   // consistency = false: skip the final age / gender step (the user did not tick it in the upload preview)
   function applyAiEdits({ ordered, allowGender, fromFile = false, consistency = true, label, text = '', heard = '', file = null,
-    summary = '', voice = false, blockedFirst = [], aiEditCount = ordered.length }) {
+    summary = '', voice = false, blockedFirst = [], aiEditCount = ordered.length, keptFacts = [] }) {
     let applied = 0;
     let skipped = 0;
     let noEffect = 0; // edits that "succeeded" but did not change the document
     const blockedWhy = [...blockedFirst]; // edits refused by the checks (table row / locked label / unasked gender change)
-    const appliedValues = []; // new texts that were really applied
     const entries = []; // History entries of this instruction: added as ONE entry below
     let alsoFixed = 0;
+    // Patient Details (the header) are the source of age and gender: remembered to tell an explicit change of them
+    // apart from text that only MENTIONS another age / sex
+    const factsStart = getPatientFacts(editor.state.doc);
+    const oldTexts = new Set(getBlocks(editor.state.doc).map((b) => b.node.textContent));
+    let usedDetails = null; // the Patient Details written into the new text instead of the dictated age / sex
     // Everything this instruction changes (all AI edits + the age/gender fix) is ONE undo step,
     // even when the changes are far apart ("change the age to 31": table + Presenting Complaint)
     asOneUndoStep(editor.view, () => {
@@ -533,21 +536,23 @@ export default function App() {
         const changed = r.ok && !editor.state.doc.eq(docBefore);
         if (r.ok && !changed) entries.pop(); // its History entry (handleEdit added exactly one): nothing to record
         if (r.ok && !changed) noEffect++;
-        else if (r.ok) {
-          applied++;
-          // only CHANGED text can set a new gender; added sentences ("append") follow the patient's gender
-          if (ed.operation === 'set' || ed.operation === 'replace_text') appliedValues.push(ed.new_value || '');
-        }
+        else if (r.ok) applied++;
         else if (r.blocked) blockedWhy.push(`${ed.field_label || ed.block_id}: ${r.error}`);
         else skipped++;
       }
 
-      // Age / gender must be the same everywhere. If this command set a gender somewhere
-      // (e.g. only in Course in Hospital), that gender goes to the header and everywhere else too.
-      // Also repairs places that were already wrong.
+      // Age / gender follow PATIENT DETAILS (the header), which change only when asked:
+      //   - Patient Details were changed by this command ("change the age to 45"): every place follows, as before
+      //   - otherwise only the text THIS command wrote follows Patient Details ("a 22-year-old male …" is written
+      //     with the header's age / sex); no other section and not the header are touched
       if (applied && consistency) {
-        const target = allowGender ? genderStatedIn(appliedValues) : null;
-        alsoFixed = recordConsistency(ensurePatientConsistency(editor, target), entries);
+        const factsNow = getPatientFacts(editor.state.doc);
+        const detailsChanged = factsNow.age !== factsStart.age || factsNow.gender !== factsStart.gender;
+        const fixes = detailsChanged
+          ? ensurePatientConsistency(editor)
+          : ensurePatientConsistency(editor, null, (node) => !oldTexts.has(node.textContent));
+        alsoFixed = recordConsistency(fixes, entries);
+        if (!detailsChanged && fixes.length) { usedDetails = factsNow; alsoFixed = 0; }
       }
     }); // end of the one undo step
 
@@ -585,12 +590,17 @@ export default function App() {
       ? `🔒 Blocked ${blockedWhy.length} change${blockedWhy.length > 1 ? 's' : ''} (${blockedWhy.join('; ')}).`
       : '';
     const fixedNote = alsoFixed ? `Also updated ${alsoFixed} other place${alsoFixed > 1 ? 's' : ''} so age and gender match everywhere.` : '';
+    // the dictated age / sex differed from Patient Details: say so (Patient Details and other sections unchanged)
+    const details = usedDetails ? [usedDetails.age && `${usedDetails.age} years`, usedDetails.gender].filter(Boolean).join(', ') : '';
+    const factsNote = usedDetails || keptFacts.length
+      ? `⚠️ The age or gender in your words differs from Patient Details${details ? ` (${details})` : ''}, so Patient Details were used in the new text${keptFacts.length ? ` and ${keptFacts.join(', ')} ${keptFacts.length > 1 ? 'were' : 'was'} not changed` : ''}. Patient Details were not changed; to change them, say for example "change the age to …".`
+      : '';
     // The AI's own summary describes what it TRIED. Show it only when something was applied. When the AI
     // returned no edit at all, its text is a question or explanation ("Which date do you mean?"): show it as such.
     // When it returned edits but none could be applied, its "done" summary would be wrong: leave it out.
     const aiNote = applied ? summary : aiEditCount === 0 && summary ? `AI: ${summary}` : '';
     const noEffectNote = noEffect ? `${noEffect} edit${noEffect > 1 ? 's' : ''} from the AI did not change anything.` : '';
-    setNote([head, fixedNote, blockedNote, skipped ? `${skipped} could not be applied.` : '', noEffectNote, aiNote].filter(Boolean).join(' '));
+    setNote([head, fixedNote, factsNote, blockedNote, skipped ? `${skipped} could not be applied.` : '', noEffectNote, aiNote].filter(Boolean).join(' '));
   }
 
   // ---------- upload preview ----------
@@ -697,6 +707,7 @@ export default function App() {
       kind: 'command', doc, ordered, preview, recompute, allowGender, label, text, heard, voice,
       summary: check.moved.length ? check.moved.map((m) => `${m.section}: added 1 line.`).join(' ') : aiSummary,
       blockedFirst: tableCheck.blocked,
+      keptFacts: check.skipped || [],
     });
     setNote('Please check the changes in the window, then press Apply or Cancel. Nothing has been changed yet.');
   }
@@ -725,6 +736,7 @@ export default function App() {
       voice: p.voice,
       blockedFirst: p.blockedFirst,
       aiEditCount: p.ordered.length,
+      keptFacts: p.keptFacts || [],
     });
   }
 
@@ -857,7 +869,8 @@ export default function App() {
           'the confirmation window: say "remove all medicines from Advice", or name the medicines to remove.');
         return true;
       }
-      applyAiEdits({ ordered, allowGender, label, text, heard, file, summary, voice, blockedFirst: tableCheck.blocked, aiEditCount: check.edits.length });
+      applyAiEdits({ ordered, allowGender, label, text, heard, file, summary, voice, blockedFirst: tableCheck.blocked, aiEditCount: check.edits.length,
+        keptFacts: check.skipped || [] });
       return true;
     } catch (err) {
       console.error(err);

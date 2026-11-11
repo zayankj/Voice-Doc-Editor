@@ -49,7 +49,7 @@ function sectionBodyEnd(doc, blocks, headingIdx) {
 // in a MEDICINE SECTION (by its heading) and only when the line STARTS with a medicine form, so ordinary text
 // in other sections ("Treated with Tab. DOLO ...") is never treated as a medicine list.
 const MEDICINE_TITLE = /\b(advice|medication|medications|medicine|medicines|treatment|drugs?|prescription|rx)\b/i;
-const FORM_START = /^\s*(?:tab|tabs|tablet|tablets|cap|caps|capsule|capsules|syp|syr|syrup|syrups|susp|suspension|inj|injection|drop|drops|oint|ointment|cream|gel|lotion|sachet|powder|inhaler|neb|nebulisation|nebulization|spray|rotacap)\.?\s+\S/i;
+const FORM_START = /^\s*(?:tab|tabs|tablet|tablets|cap|caps|capsule|capsules|syp|syr|syrup|syrups|susp|suspension|inj|injection|drop|drops|oint|ointment|cream|gel|lotion|sachet|powder|inhaler|neb|nebulisation|nebulization|spray|rotacap)(?:\.\s*|\s+)\S/i; // "Tab. X", "Tab X", "TAB.X"
 // a medicine that starts in the middle of a line ("... 2 daysTab. METRONIDAZOLE ...")
 const MID_MEDICINE = /(?:Tab|Tabs|Cap|Caps|Syp|Syr|Inj|Susp)\.\s+(?=[A-Za-z(])/gi;
 const isMedicineLine = (t) => FORM_START.test(t);
@@ -122,32 +122,492 @@ function medicineLinesIn(value) {
 
 // Adds medicines as NEW LINES: after a line break in the same paragraph when the list uses line breaks,
 // otherwise as new paragraphs after the block. Returns the dispatched result.
-function addMedicineLines(editor, target, newLines) {
-  const { pos, node } = target;
-  const schema = editor.schema;
-  const usesLineBreaks = linesOf(node, pos + 1).length > 1;
-  let tr = editor.state.tr;
-  if (usesLineBreaks) {
-    // same paragraph: line break + medicine, for each new medicine (highlight the paragraph)
-    const end = pos + node.nodeSize - 1;
-    tr = tr.insert(end, newLines.flatMap((l) => [schema.nodes.hardBreak.create(), schema.text(l)]));
-    tr.setMeta(flashKey, { add: { from: pos, to: pos + tr.doc.nodeAt(pos).nodeSize } });
-  } else {
-    // medicines in separate paragraphs: one new paragraph per medicine (highlight the first new one)
-    const at = pos + node.nodeSize;
-    const paragraphs = newLines.map((l) => schema.nodes.paragraph.create(null, schema.text(l)));
-    tr = tr.insert(at, paragraphs);
-    tr.setMeta(flashKey, { add: { from: at, to: at + paragraphs[0].nodeSize } });
+// (same paragraph after a line break when the list uses line breaks; new paragraphs, or new list items in a list,
+// otherwise - see addNewLines). afterLine: the index of the line they go after (default: at the end).
+function addMedicineLines(editor, target, newLines, afterLine = null) {
+  return addNewLines(editor, target, newLines, afterLine);
+}
+
+// The position where the list holding this block starts (its outermost list), or null
+function listStartOf(doc, b) {
+  const $p = doc.resolve(b.pos);
+  for (let d = 1; d <= $p.depth; d++) {
+    const n = $p.node(d);
+    if (n.type.name === 'orderedList' || n.type.name === 'bulletList') return $p.before(d);
   }
-  editor.view.dispatch(tr);
-  scheduleClear(editor);
-  // before = '' : nothing existing changes, lines are only ADDED (the upload preview must not look like a deletion)
-  return { ok: true, before: '', after: newLines.join('\n'), pos };
+  return null;
+}
+
+// NEW medicines go right after the LAST MEDICINE ENTRY of the section - the next item of a numbered list, never after
+// a "Review after 1 week …" line, a general instruction or the heading. When the place the AI chose IS a medicine
+// entry ("after HYDROXYZINE"), that place is kept.
+function placeNewMedicines(editor, blocks, index, medLines, afterLine = null) {
+  const doc = editor.state.doc;
+  const target = blocks[index];
+  const lines = linesOf(target.node, target.pos + 1);
+  const spot = afterLine != null ? lines[afterLine]?.text : lines[lines.length - 1]?.text;
+  if (!isHeadingBlock(doc, target) && isMedicineLine(spot || '')) return addMedicineLines(editor, target, medLines, afterLine);
+  const section = isHeadingBlock(doc, target) ? bodyUnder(doc, blocks, index) : sectionBlocks(doc, blocks, index);
+  for (let i = section.length - 1; i >= 0; i--) {
+    const b = section[i];
+    if (inTable(doc, b)) continue;
+    const ls = linesOf(b.node, b.pos + 1);
+    let k = ls.length - 1;
+    while (k >= 0 && !isMedicineLine(ls[k].text)) k--;
+    if (k < 0) continue;
+    // inside a list: after the LAST item of that list (the next number), whatever that item is
+    const listAt = listStartOf(doc, b);
+    if (listAt != null) {
+      const items = section.filter((x) => listStartOf(doc, x) === listAt && inListItem(doc, x));
+      const lastItem = items[items.length - 1];
+      return addMedicineLines(editor, lastItem, medLines, null);
+    }
+    return addMedicineLines(editor, b, medLines, ls.length > 1 ? k : null);
+  }
+  return addMedicineLines(editor, target, medLines, afterLine); // no medicine in the section yet: where the AI said
 }
 
 const squash = (t) => String(t).replace(/\s+/g, ' ').trim().toLowerCase();
 // "Tab. DOLO (Paracetamol) 650 mg" -> "tab dolo": the form and the name of a medicine
 const medicineKey = (t) => squash(t).replace(/[.()]/g, ' ').split(/\s+/).filter(Boolean).slice(0, 2).join(' ');
+// "Tab. DOLO (Paracetamol) 650 mg" -> "dolo": the name only (the form may be written differently: Tab / Tablet)
+// ("Ointment for Ringworm …" -> "ringworm": small linking words after the form are skipped)
+const medicineName = (t) => squash(t).replace(/[.()]/g, ' ').split(/\s+/).filter(Boolean).slice(1)
+  .find((w) => !/^(?:for|of|to|the|a|an|on|in)$/.test(w)) || '';
+// ", Tab. DOLO …" -> "Tab. DOLO …": a separator the AI put in front of a new entry is not part of it
+const stripLead = (v) => String(v).replace(/^[\s,;:—–-]+/u, '');
+
+// ---------- new lines (a new entry is never glued onto an existing line) ----------
+// Is this text block the paragraph of a list item?
+const inListItem = (doc, b) => {
+  const $p = doc.resolve(b.pos);
+  return $p.depth > 0 && $p.parent.type.name === 'listItem';
+};
+
+// A section HEADING, strictly: a heading node, a known label line ("ADVICE", "Diagnosis :"), or a short ALL-CAPS line
+// that is entirely bold - never inside a table or a list. (Plain capital-letter content such as "ENTERIC FEVER" is not
+// a heading.) Same rule as isSectionTitle in sections.js.
+function isHeadingBlock(doc, b) {
+  if (!b) return false;
+  const $p = doc.resolve(b.pos);
+  for (let d = $p.depth; d > 0; d--) if (/^(tableCell|tableHeader|listItem)$/.test($p.node(d).type.name)) return false;
+  const t = b.node.textContent.trim();
+  if (!t) return false;
+  if (b.node.type.name === 'heading' || isLabelText(t)) return true;
+  let any = false;
+  let allBold = true;
+  b.node.forEach((c) => { if (c.isText && c.text.trim()) { any = true; if (!c.marks.some((m) => m.type.name === 'bold')) allBold = false; } });
+  return any && allBold && t.length <= 40 && t.split(/\s+/).length <= 6 && /^[A-Z][A-Z &/()',-]*:?$/.test(t);
+}
+
+// The text blocks of the section this block is in (between the headings around it; the headings themselves excluded)
+function sectionBlocks(doc, blocks, index) {
+  let a = index;
+  while (a > 0 && !isHeadingBlock(doc, blocks[a])) a--;
+  let z = index + 1;
+  while (z < blocks.length && !isHeadingBlock(doc, blocks[z])) z++;
+  return blocks.slice(isHeadingBlock(doc, blocks[a]) ? a + 1 : a, z);
+}
+
+// The blocks under a heading (up to the next heading)
+function bodyUnder(doc, blocks, headingIndex) {
+  const out = [];
+  for (let j = headingIndex + 1; j < blocks.length && !isHeadingBlock(doc, blocks[j]); j++) out.push(blocks[j]);
+  return out;
+}
+
+// A NEW medicine whose name is already in the same section (e.g. Tab. DOLO added to an Advice that has Tab. DOLO).
+// Returns that name, or ''. The AI sets duplicate_ok only when the command clearly asks for another entry.
+function duplicateMedicine(doc, blocks, index, newLines) {
+  const have = new Set();
+  for (const b of sectionBlocks(doc, blocks, index)) {
+    for (const l of linesOf(b.node, b.pos + 1)) if (isMedicineLine(l.text)) have.add(medicineName(l.text));
+  }
+  const dup = newLines.filter(isMedicineLine).map(medicineName).find((n) => n && have.has(n));
+  return dup || '';
+}
+
+// The line of a paragraph (with line breaks) that find_text points at: the line equal to it, else the ONE line
+// containing it. Returns its index, -1 (not found) or -2 (more than one line contains it).
+function lineIndexOf(lines, find) {
+  const f = squash(find);
+  if (!f) return -1;
+  const equal = lines.findIndex((l) => squash(l.text) === f);
+  if (equal !== -1) return equal;
+  const hits = lines.map((l, i) => (squash(l.text).includes(f) ? i : -1)).filter((i) => i !== -1);
+  return hits.length === 1 ? hits[0] : hits.length ? -2 : -1;
+}
+
+// Adds lines as NEW lines next to target, in the layout of the place:
+//   - a paragraph with line breaks: line break + line, after line `afterLine` (default: the last line)
+//   - a list item: new list items after it
+//   - otherwise: new paragraphs after the block
+// Nothing that exists is changed. Returns the result for applyVoiceEdit.
+// Where each line of a paragraph ENDS (the position just before the next line break, or the paragraph's end)
+function lineEnds(node, pos) {
+  const ends = [];
+  node.forEach((child, offset) => { if (child.type.name === 'hardBreak') ends.push(pos + 1 + offset); });
+  ends.push(pos + node.nodeSize - 1);
+  return ends;
+}
+
+function addNewLines(editor, target, newLines, afterLine = null) {
+  const { pos, node } = target;
+  const schema = editor.schema;
+  const doc = editor.state.doc;
+  const ends = lineEnds(node, pos);
+  let tr = editor.state.tr;
+  if (ends.length > 1) {
+    const insertAt = ends[afterLine ?? ends.length - 1];
+    tr = tr.insert(insertAt, newLines.flatMap((l) => [schema.nodes.hardBreak.create(), schema.text(l)]));
+    tr.setMeta(flashKey, { add: { from: pos, to: pos + tr.doc.nodeAt(pos).nodeSize } });
+  } else if (inListItem(doc, target)) {
+    const $p = doc.resolve(pos);
+    const at = $p.after($p.depth); // after the list item
+    const items = newLines.map((l) => schema.nodes.listItem.create(null, schema.nodes.paragraph.create(null, schema.text(l))));
+    tr = tr.insert(at, items);
+    tr.setMeta(flashKey, { add: { from: at, to: at + items.reduce((n, x) => n + x.nodeSize, 0) } });
+  } else {
+    const at = pos + node.nodeSize;
+    const paragraphs = newLines.map((l) => schema.nodes.paragraph.create(null, schema.text(l)));
+    tr = tr.insert(at, paragraphs);
+    tr.setMeta(flashKey, { add: { from: at, to: at + paragraphs.reduce((n, x) => n + x.nodeSize, 0) } });
+  }
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  // before = '' : nothing existing changes, lines are only ADDED
+  return { ok: true, before: '', after: newLines.join('\n'), pos };
+}
+
+// ---------- look-only edits and lists (commands): the WORDS never change ----------
+// format       style: bold | italic | underline | not_bold | not_italic | not_underline
+// change_case  case:  upper | lower | title | sentence  (only the case of letters; same length, marks and breaks kept)
+// Both work on one block, on find_text inside it, or on a range of blocks (block_id .. last_block_id).
+// to_list      list_type: ordered | bullet; lines: the exact lines to put in the list (paragraphs or lines of a
+//              paragraph with line breaks); the other lines stay where they are, as they are
+// unlist       the list that contains block_id becomes normal paragraphs
+const STYLES = {
+  bold: ['bold', true], italic: ['italic', true], underline: ['underline', true],
+  not_bold: ['bold', false], not_italic: ['italic', false], not_underline: ['underline', false],
+};
+const CASES = new Set(['upper', 'lower', 'title', 'sentence']);
+const fail = (error) => ({ ok: false, error });
+
+// The blocks an edit covers: block_id alone, or block_id .. last_block_id
+function blockRange(blocks, index, lastId) {
+  if (lastId == null || String(lastId).trim() === '') return [blocks[index]];
+  const last = parseInt(String(lastId).replace(/\D/g, ''), 10);
+  if (Number.isNaN(last) || last < index || !blocks[last]) return null;
+  return blocks.slice(index, last + 1);
+}
+
+// The block's text with "\n" for line breaks, and the document position of every character (-1 for a break)
+function textWithBreaks(node, start) {
+  let text = '';
+  const map = [];
+  node.forEach((child, offset) => {
+    if (child.isText) {
+      for (let k = 0; k < child.text.length; k++) map.push(start + offset + k);
+      text += child.text;
+    } else {
+      map.push(-1);
+      text += '\n';
+    }
+  });
+  return { text, map };
+}
+
+// The part of a block an edit covers: [{ from, to, text }] (find_text: its first match; else the whole text)
+function spansOf(b, find) {
+  const { text, map } = textWithBreaks(b.node, b.pos + 1);
+  if (!text.trim()) return [];
+  if (!find) return [{ block: b, from: b.pos + 1, to: b.pos + b.node.nodeSize - 1, text, map, i: 0 }];
+  const i = text.toLowerCase().indexOf(find.toLowerCase());
+  if (i === -1 || map[i] === -1 || map[i + find.length - 1] === -1) return [];
+  return [{ block: b, from: map[i], to: map[i + find.length - 1] + 1, text: text.slice(i, i + find.length), map: map.slice(i, i + find.length), i }];
+}
+
+// Same-length case change (letters whose upper / lower form has another length stay as they are)
+function recase(text, kind) {
+  const one = (c, up) => { const x = up ? c.toUpperCase() : c.toLowerCase(); return x.length === 1 ? x : c; };
+  const out = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (kind === 'upper') out.push(one(c, true));
+    else if (kind === 'lower') out.push(one(c, false));
+    else if (kind === 'title') out.push(one(c, !/[\p{L}\p{N}'’]/u.test(text[i - 1] || '')));
+    else {
+      // sentence: the first letter of the text, of each line and after . ! ? is a capital; the rest small
+      const before = text.slice(0, i).replace(/[\s"'(“‘]+$/u, '');
+      out.push(one(c, before === '' || /[.!?\n]$/.test(before)));
+    }
+  }
+  return out.join('');
+}
+
+function applyLook(editor, blocks, index, args) {
+  const isCase = args.operation === 'change_case';
+  let markType = null;
+  let add = true;
+  if (isCase) {
+    if (!CASES.has(args.case)) return fail(`change_case needs case: upper, lower, title or sentence (got "${args.case ?? ''}")`);
+  } else {
+    const spec = STYLES[args.style];
+    if (!spec) return fail(`format needs style: bold, italic, underline, not_bold, not_italic or not_underline (got "${args.style ?? ''}")`);
+    markType = editor.schema.marks[spec[0]];
+    if (!markType) return fail(`${spec[0]} is not available in this editor`);
+    add = spec[1];
+  }
+  const range = blockRange(blocks, index, args.last_block_id);
+  if (!range) return fail(`last_block_id ${args.last_block_id} is not a block after ${args.block_id}`);
+  const find = String(args.find_text ?? '').trim();
+  const spans = range.flatMap((b) => spansOf(b, find));
+  if (!spans.length) return fail(find ? `"${find}" not found in ${args.block_id}` : 'there is no text to change there');
+
+  let tr = editor.state.tr;
+  const before = [];
+  const after = [];
+  for (const s of spans) {
+    before.push(s.text);
+    if (!isCase) {
+      tr = add ? tr.addMark(s.from, s.to, markType.create()) : tr.removeMark(s.from, s.to, markType);
+      continue;
+    }
+    // the case is worked out on the WHOLE block text (sentences, words); each piece of text keeps its own marks
+    const fresh = recase(textWithBreaks(s.block.node, 0).text, args.case).slice(s.i, s.i + s.text.length);
+    after.push(fresh);
+    const k0 = new Map(s.map.map((p, k) => [p, k]));
+    const pieces = [];
+    editor.state.doc.nodesBetween(s.from, s.to, (n, p) => {
+      if (!n.isText) return;
+      const a = Math.max(p, s.from);
+      const z = Math.min(p + n.nodeSize, s.to);
+      const now = fresh.slice(k0.get(a), k0.get(z - 1) + 1);
+      if (now !== n.text.slice(a - p, z - p)) pieces.push({ a, z, now, marks: n.marks });
+    });
+    // same length: the positions of the other pieces stay valid
+    for (const x of pieces) tr = tr.replaceWith(x.a, x.z, editor.schema.text(x.now, x.marks));
+  }
+  const from = range[0].pos;
+  const last = range[range.length - 1];
+  tr.setMeta(flashKey, { add: { from, to: last.pos + tr.doc.nodeAt(last.pos).nodeSize } });
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  const show = (xs) => xs.join(' | ').replace(/\n/g, ' / ');
+  return { ok: true, before: show(before), after: isCase ? show(after) : `${show(before)} (${args.style.replace('_', ' ')})`, pos: from };
+}
+
+// The lines of a top-level paragraph: [{ nodes, text }] (split at line breaks; marks kept)
+function paragraphLines(node) {
+  const out = [{ nodes: [], text: '' }];
+  node.forEach((c) => {
+    if (c.type.name === 'hardBreak') out.push({ nodes: [], text: '' });
+    else { out[out.length - 1].nodes.push(c); if (c.isText) out[out.length - 1].text += c.text; }
+  });
+  return out;
+}
+// ---------- which lines a list takes (to_list "select") ----------
+// Medicine forms at the start of a line: the same forms as FORMS in medicineText.js (the medicine engine)
+const FORM_LINES = {
+  tab: 'tab|tabs|tablet|tablets', cap: 'cap|caps|capsule|capsules', syp: 'syp|syr|syrup|syrups', susp: 'susp|suspension',
+  inj: 'inj|injection|injections', drops: 'drop|drops|eye drops|ear drops', oint: 'oint|ointment|cream|gel|lotion',
+  sachet: 'sachet|sachets|powder', inhaler: 'inhaler|neb|nebulisation|nebulization|spray|rotacap',
+};
+const FORM_WORDS = Object.values(FORM_LINES).join('|');
+const kindAtStart = (t) => Object.keys(FORM_LINES).find((k) => new RegExp(`^\\s*(?:${FORM_LINES[k]})(?:\\.\\s*|\\s+)\\S`, 'i').test(t)) || null;
+// select values -> form keys (all_medicines = any form)
+const SELECT_KINDS = {
+  all_medicines: '*', tablets: ['tab'], capsules: ['cap'], syrups: ['syp'], suspensions: ['susp'], injections: ['inj'],
+  drops: ['drops'], ointments: ['oint'], sachets: ['sachet'], powders: ['sachet'], inhalers: ['inhaler'],
+};
+const kindWanted = (kinds, k) => kinds.some((s) => SELECT_KINDS[s] === '*' || SELECT_KINDS[s]?.includes(k));
+// Where a SECOND entry starts inside a line: after a comma / semicolon ("…sleep,Tab. DOLO …", "…; Ointment X …"),
+// or a short form with a dot in the middle of the line ("… 2 daysTab. Y …" - the same rule as MID_MEDICINE above)
+const JOIN_AT = new RegExp(`(?:[,;]\\s*)(?=(?:${FORM_WORDS})\\.?\\s+\\S)|(?=(?:Tab|Tabs|Cap|Caps|Syp|Syr|Inj|Susp)\\.\\s+[A-Za-z(])`, 'gi');
+// A line split into its entries (one piece = one entry)
+function entryPieces(text) {
+  const cuts = [0];
+  for (const m of String(text).matchAll(JOIN_AT)) if (m.index > 0) cuts.push(m.index);
+  cuts.push(text.length);
+  const out = [];
+  for (let i = 0; i + 1 < cuts.length; i++) out.push(text.slice(cuts[i], cuts[i + 1]).replace(/^[\s,;]+/, ''));
+  return out.filter((p) => p.trim());
+}
+// The kinds of the entries in a line: [] (no medicine), ['tab'], or several when entries are joined ('oint', 'tab')
+function kindsOfLine(text) {
+  const pieces = entryPieces(text);
+  if (pieces.length > 1) return pieces.map((p) => kindAtStart(p) || 'text');
+  const k = kindAtStart(text);
+  return k ? [k] : [];
+}
+// For comparing lines: dashes, spaces (also non-breaking), capitals and a trailing comma / full stop do not matter.
+// (Used only to FIND a line; the document's own text and positions are what change.)
+const normLine = (t) => String(t).normalize('NFC').toLowerCase().replace(/[\s ]+/g, ' ').replace(/\s*[—–-]\s*/g, ' - ')
+  .replace(/[\s,.;]+$/, '').trim();
+
+const LIST_TYPES = { ordered: 'orderedList', bullet: 'bulletList' };
+const isList = (n) => n.type.name === 'orderedList' || n.type.name === 'bulletList';
+// is this text block inside a list?
+function blocksInList(doc, b) {
+  const $p = doc.resolve(b.pos);
+  for (let d = 1; d <= $p.depth; d++) if (isList($p.node(d))) return true;
+  return false;
+}
+
+function applyToList(editor, blocks, index, args) {
+  const listName = LIST_TYPES[args.list_type];
+  const schema = editor.schema;
+  if (!listName || !schema.nodes[listName]) return fail('it was not clear whether the list should be numbered or bulleted. Please say "numbered list" or "bullet list". Nothing was changed');
+  const wanted = (Array.isArray(args.lines) ? args.lines : []).map((l) => String(l)).filter((l) => l.trim());
+  const kinds = (Array.isArray(args.select) ? args.select : args.select ? [args.select] : []).map((s) => String(s));
+  const unknownKind = kinds.find((k) => !SELECT_KINDS[k]);
+  if (unknownKind) return fail(`"${unknownKind}" is not a kind of entry the app can pick. Nothing was changed`);
+  if (!wanted.length && !kinds.length) return fail('it was not clear which lines should be in the list. Please name them (for example "all the tablets in Advice"). Nothing was changed');
+  const doc = editor.state.doc;
+  const own = doc.resolve(blocks[index].pos).index(0); // the top-level node of the AI's block
+
+  // already a list: change its kind (bullet <-> numbered) when exactly its items were asked for
+  const top = doc.child(own);
+  if (isList(top)) {
+    const items = [];
+    top.forEach((li) => items.push(normLine(li.textContent)));
+    const asked = wanted.length ? wanted.map(normLine) : [];
+    const byKind = [];
+    top.forEach((li) => { if (kinds.length && kindsOfLine(li.textContent).some((k) => kindWanted(kinds, k))) byKind.push(normLine(li.textContent)); });
+    const named = [...new Set([...asked, ...byKind])];
+    if (named.length !== items.length || !named.every((w) => items.includes(w))) {
+      return fail('only part of an existing list was named; to change a list, name all of its lines. Nothing was changed');
+    }
+    if (top.type.name === listName) return { ok: true, before: '', after: '', pos: blocks[index].pos, unchanged: true };
+    let at = 0;
+    for (let i = 0; i < own; i++) at += doc.child(i).nodeSize;
+    const tr = editor.state.tr.setNodeMarkup(at, schema.nodes[listName], listName === 'orderedList' ? { start: 1 } : null);
+    tr.setMeta(flashKey, { add: { from: at, to: at + top.nodeSize } });
+    editor.view.dispatch(tr);
+    scheduleClear(editor);
+    return { ok: true, before: wanted.join('\n'), after: wanted.map((w, i) => (listName === 'orderedList' ? `${i + 1}. ${w}` : `• ${w}`)).join('\n'), pos: at };
+  }
+
+  // the region: the WHOLE section of that block ("all the syrups" means all of them, wherever the AI's block_id is),
+  // or block_id .. last_block_id when a range was given
+  let startIdx = index;
+  if (!args.last_block_id) {
+    while (startIdx > 0 && !isHeadingBlock(doc, blocks[startIdx - 1]) && !isHeadingBlock(doc, blocks[startIdx])) startIdx--;
+  }
+  const start = doc.resolve(blocks[startIdx].pos).index(0);
+  let endBlock = index;
+  if (args.last_block_id) {
+    endBlock = parseInt(String(args.last_block_id).replace(/\D/g, ''), 10);
+    if (Number.isNaN(endBlock) || endBlock < index || !blocks[endBlock]) return fail(`last_block_id ${args.last_block_id} is not a block after ${args.block_id}`);
+  } else {
+    while (endBlock + 1 < blocks.length && !isHeadingBlock(doc, blocks[endBlock + 1])) endBlock++;
+  }
+  const end = doc.resolve(blocks[endBlock].pos).index(0);
+
+  // every line of every top-level paragraph in the region
+  const rows = []; // { child, lines: [{ nodes, text, pick }] } or { child } for anything that is not a paragraph
+  for (let i = start; i <= end; i++) {
+    const child = doc.child(i);
+    rows.push(child.type.name === 'paragraph' ? { child, lines: paragraphLines(child).map((l) => ({ ...l, pick: false })) } : { child });
+  }
+  const all = rows.flatMap((r) => r.lines || []);
+  const joinedMsg = (l) => `two entries appear to be joined on one line: "${l.text.trim()}". Please put each entry on its own line and try again. Nothing was changed`;
+
+  // 1. the kinds asked for ("all medicines", "tablets", "syrups" ...): picked by the browser from the document itself
+  //    (a line counts when it STARTS with that medicine form, the same rule as the medicine checks)
+  for (const l of all) {
+    if (!kinds.length || !l.text.trim()) continue;
+    const pieces = kindsOfLine(l.text);
+    if (pieces.length > 1 && pieces.some((k) => kindWanted(kinds, k))) return fail(joinedMsg(l)); // e.g. "…sleep,Tab. DOLO …"
+    if (pieces.length === 1 && kindWanted(kinds, pieces[0])) l.pick = true;
+  }
+  // 2. the lines the AI named (e.g. a supplement written without "Tab." / "Syp."): each must be exactly ONE whole line
+  //    of the section, compared without differences in dashes, spaces, capitals or a trailing comma / full stop
+  for (const w of wanted) {
+    const f = normLine(w);
+    const hits = all.filter((l) => normLine(l.text) === f);
+    if (hits.length > 1) return fail(`the line "${w}" appears more than once in that section; it is not clear which one is meant. Nothing was changed`);
+    if (hits.length === 1) {
+      if (kindsOfLine(hits[0].text).length > 1) return fail(joinedMsg(hits[0]));
+      hits[0].pick = true;
+      continue;
+    }
+    // part of a line that holds two entries ("Tab. DOLO …" inside "…sleep,Tab. DOLO …")
+    const glued = all.find((l) => kindsOfLine(l.text).length > 1 && entryPieces(l.text).some((p) => normLine(p) === f));
+    if (glued) return fail(joinedMsg(glued));
+    return fail(`the line "${w}" was not found in that section. Nothing was changed`);
+  }
+  if (!all.some((l) => l.pick)) {
+    // those lines are already in a list (e.g. a second edit of the same command): nothing more to do
+    const listed = rows.some((r) => !r.lines && isList(r.child) && kinds.length &&
+      (() => { let hit = false; r.child.forEach((li) => { if (kindsOfLine(li.textContent).some((k) => kindWanted(kinds, k))) hit = true; }); return hit; })());
+    if (listed && !wanted.length) return { ok: true, before: '', after: '', pos: blocks[index].pos, unchanged: true };
+    return fail(`no ${kinds.join(' / ').replace(/_/g, ' ')} were found in that section. Nothing was changed`);
+  }
+  const first = rows.findIndex((r) => r.lines?.some((l) => l.pick));
+  const lastRow = rows.length - 1 - [...rows].reverse().findIndex((r) => r.lines?.some((l) => l.pick));
+  const span = rows.slice(first, lastRow + 1);
+
+  // rebuild that span: picked lines -> list items; the other lines stay together in their paragraph (line breaks kept);
+  // a numbered list that is interrupted continues its numbering (1, 2, <syrup line>, 3)
+  const out = [];
+  let items = [];
+  let count = 0;
+  const flushList = () => {
+    if (!items.length) return;
+    out.push(schema.nodes[listName].create(listName === 'orderedList' ? { start: count - items.length + 1 } : null, items));
+    items = [];
+  };
+  for (const r of span) {
+    if (!r.lines) { flushList(); out.push(r.child); continue; }
+    let plain = [];
+    const flushPlain = () => {
+      if (!plain.length) return;
+      out.push(schema.nodes.paragraph.create(r.child.attrs, plain.flatMap((l, k) => (k ? [schema.nodes.hardBreak.create(), ...l.nodes] : l.nodes))));
+      plain = [];
+    };
+    for (const l of r.lines) {
+      if (l.pick) { flushPlain(); items.push(schema.nodes.listItem.create(null, schema.nodes.paragraph.create(r.child.attrs, l.nodes))); count++; }
+      else { flushList(); plain.push(l); }
+    }
+    flushPlain();
+  }
+  flushList();
+
+  // safety: exactly the same words before and after (only the structure changes)
+  const words = (nodes) => nodes.map((n) => n.textContent).join('').replace(/\s+/g, '');
+  if (words(span.map((r) => r.child)) !== words(out)) return fail('the list would change the text, so nothing was changed');
+  let from = 0;
+  for (let i = 0; i < start + first; i++) from += doc.child(i).nodeSize;
+  const to = from + span.reduce((n, r) => n + r.child.nodeSize, 0);
+  const tr = editor.state.tr.replaceWith(from, to, out);
+  tr.setMeta(flashKey, { add: { from, to: from + out.reduce((n, x) => n + x.nodeSize, 0) } });
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  const picked = all.filter((l) => l.pick).map((l) => l.text);
+  return { ok: true, before: picked.join('\n'), after: picked.map((t, i) => (listName === 'orderedList' ? `${i + 1}. ${t}` : `• ${t}`)).join('\n'), pos: from };
+}
+
+function applyUnlist(editor, blocks, index) {
+  const doc = editor.state.doc;
+  const $p = doc.resolve(blocks[index].pos);
+  let depth = -1;
+  for (let d = 1; d <= $p.depth; d++) if (isList($p.node(d))) { depth = d; break; } // the outermost list
+  if (depth === -1) return fail(`${'B' + index} is not in a list`);
+  const list = $p.node(depth);
+  const paragraphs = [];
+  list.descendants((n) => {
+    if (n.isTextblock) { paragraphs.push(n.type.name === 'paragraph' ? n : editor.schema.nodes.paragraph.create(n.attrs, n.content)); return false; }
+    return true;
+  });
+  const from = $p.before(depth);
+  const tr = editor.state.tr.replaceWith(from, from + list.nodeSize, paragraphs);
+  tr.setMeta(flashKey, { add: { from, to: from + paragraphs.reduce((n, x) => n + x.nodeSize, 0) } });
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  const texts = paragraphs.map((n) => n.textContent);
+  return { ok: true, before: texts.map((t) => `• ${t}`).join('\n'), after: texts.join('\n'), pos: from };
+}
 
 // A WHOLE medicine list proposed by the AI (e.g. from an uploaded prescription), compared line by line with the list
 // in the document. Returns
@@ -265,6 +725,89 @@ function addTableRow(editor, info, value) {
   return { ok: true, before: '', after: parts.join(' | '), pos: at };
 }
 
+// ---------- headings stay locked, the content under them stays editable ----------
+// A new text without the heading / label the AI may have repeated in front of it ("COURSE IN HOSPITAL : Patient …")
+const withoutLabel = (value, label) => {
+  const v = String(value ?? '');
+  const l = String(label).trim().replace(/[\s:]+$/, '');
+  return l && v.trim().toLowerCase().startsWith(l.toLowerCase()) ? v.trim().slice(l.length).replace(/^[\s:\-–]+/, '') : v.trim();
+};
+const textNodes = (schema, value) => String(value).split(/\r?\n/).flatMap((l, i) => [...(i ? [schema.nodes.hardBreak.create()] : []), ...(l ? [schema.text(l)] : [])]);
+
+// set / clear aimed at a section HEADING (its own paragraph): the paragraphs UNDER it change; the heading does not.
+// One paragraph -> that paragraph is set / cleared with all the usual checks. Several plain paragraphs -> replaced by
+// one in ONE step. Returns null (= stay blocked) when it is not safe: tables or lists under the heading, medicines
+// (they are removed only through the confirmation window), or a gender change that was not asked for.
+function replaceSectionContent(editor, blocks, index, args, opts) {
+  const doc = editor.state.doc;
+  const body = bodyUnder(doc, blocks, index);
+  const heading = blocks[index].node.textContent;
+  const value = args.operation === 'set' ? withoutLabel(args.new_value, heading) : '';
+  if (!body.length) {
+    if (args.operation === 'clear') return { ok: true, before: '', after: '', pos: blocks[index].pos, unchanged: true };
+    return value ? { ...applyVoiceEdit(editor, { ...args, operation: 'insert_after', new_value: value }, opts), redirected: true } : null;
+  }
+  if (body.length === 1) return { ...applyVoiceEdit(editor, { ...args, block_id: `B${body[0].index}`, new_value: value }, opts), redirected: true };
+  if (body.some((b) => doc.resolve(b.pos).depth !== 0)) return null; // a table or a list under the heading: say which part
+  const oldText = body.map((b) => b.node.textContent).join('\n');
+  if (body.some((b) => linesOf(b.node, b.pos + 1).some((l) => isMedicineLine(l.text)))) return null;
+  if (opts.allowGender === false && changesGender(oldText, value)) {
+    return { ok: false, blocked: true, error: 'it would change the gender, which you did not ask for' };
+  }
+  const from = body[0].pos;
+  const last = body[body.length - 1];
+  const para = editor.schema.nodes.paragraph.create(body[0].node.attrs, textNodes(editor.schema, value));
+  const tr = editor.state.tr.replaceWith(from, last.pos + last.node.nodeSize, para);
+  tr.setMeta(flashKey, { add: { from, to: from + para.nodeSize } });
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  return { ok: true, before: oldText, after: value, pos: from };
+}
+
+// set / clear of a paragraph that STARTS with its label or heading ("Course in Hospital : text", "COURSE IN
+// HOSPITAL↵text"): the label / heading stays exactly as it is (its words and its bold), only the text after it
+// changes. Returns null (= stay blocked) when there is no such label, or the text holds medicines.
+function replaceAfterLabel(editor, target, args, opts) {
+  const { pos, node } = target;
+  const schema = editor.schema;
+  const full = node.textContent;
+  let contentFrom = null; // where the content starts
+  let label = '';
+  let firstLine = false;
+  const prefix = labelPrefix(full);
+  if (prefix) {
+    label = prefix;
+    // the position after the label and the spaces that follow it
+    const { text: withBreaks, map } = textWithBreaks(node, pos + 1); // same characters as the text, "\n" = a break
+    let n = prefix.length;
+    while (n < withBreaks.length && (map[n] === -1 || /\s/.test(withBreaks[n]))) n++;
+    contentFrom = n < map.length ? map[n] : pos + node.nodeSize - 1;
+  } else {
+    let head = '';
+    let br = -1;
+    node.forEach((c, offset) => { if (br === -1) { if (c.isText) head += c.text; else br = offset; } });
+    if (br === -1 || !isLabelText(head.trim())) return null;
+    label = head;
+    firstLine = true;
+    contentFrom = pos + 1 + br + 1; // after the line break
+  }
+  const end = pos + node.nodeSize - 1;
+  const oldContent = editor.state.doc.textBetween(contentFrom, end, '\n');
+  const lines = linesOf(node, pos + 1);
+  if (lines.some((l) => isMedicineLine(l.text)) || [...full.matchAll(MID_MEDICINE)].length) return null; // medicines: existing rules
+  const value = args.operation === 'set' ? withoutLabel(args.new_value, label) : '';
+  if (opts.allowGender === false && changesGender(oldContent, value)) {
+    return { ok: false, blocked: true, error: 'it would change the gender, which you did not ask for' };
+  }
+  let tr = editor.state.tr;
+  if (value) tr = tr.replaceWith(contentFrom, end, textNodes(schema, value));
+  else tr = tr.delete(firstLine ? contentFrom - 1 : contentFrom, end); // clear: the heading line alone (no empty line)
+  tr.setMeta(flashKey, { add: { from: pos, to: pos + tr.doc.nodeAt(pos).nodeSize } });
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  return { ok: true, before: full, after: tr.doc.nodeAt(pos).textContent, pos };
+}
+
 // Applies ONE edit instruction to ONE text block. Everything else stays untouched.
 // Formatting (bold, italic...) of the edited text is preserved by ProseMirror's insertText.
 // allowGender = false: refuse edits that change gender words (the command did not mention gender)
@@ -285,7 +828,48 @@ export function applyVoiceEdit(editor, args, opts = {}) {
   const end = pos + node.nodeSize - 1; // last position inside the block
   const before = node.textContent;
 
-  // Add a NEW paragraph after this block (used by file uploads)
+  // Look-only edits and lists (typed / spoken commands only; an uploaded file never sends them): the words stay the
+  // same, so no medicine can be lost; the medicine count check in App.jsx still runs on them like on every edit
+  if (['format', 'change_case', 'to_list', 'unlist'].includes(operation)) {
+    if (fromFile) return { ok: false, blocked: true, error: 'an uploaded file cannot change formatting or lists' };
+    const doc = editor.state.doc;
+    let a = args;
+    let i = index;
+    // aimed at a section HEADING (without find_text): it means the section's text, as for added text (the heading
+    // itself is only changed with find_text = its words, or as part of a range that goes beyond its section)
+    if (!String(args.find_text ?? '').trim() && isHeadingBlock(doc, target)) {
+      const body = bodyUnder(doc, blocks, index);
+      if (!body.length) return { ok: false, blocked: true, error: `there is no text under ${before.trim()}` };
+      const lastIdx = args.last_block_id ? parseInt(String(args.last_block_id).replace(/\D/g, ''), 10) : index;
+      const insideSection = lastIdx <= body[body.length - 1].index;
+      if (insideSection) {
+        if (operation === 'unlist') {
+          const inList = body.find((b) => doc.resolve(b.pos).depth > 0 && blocksInList(doc, b));
+          if (!inList) return { ok: false, blocked: true, error: `there is no list under ${before.trim()}` };
+          i = inList.index;
+        } else {
+          i = body[0].index;
+          if (operation !== 'to_list') a = { ...args, last_block_id: `B${body[body.length - 1].index}` };
+        }
+        a = { ...a, block_id: `B${i}` };
+      }
+    }
+    // refusals here are shown with their reason (nothing was changed)
+    const r = operation === 'to_list' ? applyToList(editor, blocks, i, a)
+      : operation === 'unlist' ? applyUnlist(editor, blocks, i)
+        : applyLook(editor, blocks, i, a);
+    return r.ok ? r : { ...r, blocked: true };
+  }
+
+  // A medicine that is already in this section: ask, unless the command clearly asked for another entry
+  // (duplicate_ok). Not for uploaded files (a prescription is compared with the list instead).
+  const isDuplicate = (newLines) => {
+    if (fromFile || args.duplicate_ok === true) return '';
+    const name = duplicateMedicine(editor.state.doc, blocks, index, newLines);
+    return name ? `${name.toUpperCase()} is already in this section. Do you want to change the existing entry, or add another ${name.toUpperCase()} entry? Nothing was changed` : '';
+  };
+
+  // Add NEW line(s) after this block - or, in a paragraph with line breaks, after the line find_text points at
   if (operation === 'insert_after') {
     if (!new_value.trim()) return { ok: false, error: 'insert_after needs new_value' };
     if (!allowGender && changesGender('', new_value)) {
@@ -295,19 +879,50 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     // (A single value added to a cell of an ordinary table, e.g. a second address line, works as before.)
     const cellInfo = cellAt(editor.state.doc, pos);
     if (cellInfo && (isDataTable(cellInfo.table) || new_value.includes('|'))) return addTableRow(editor, cellInfo, new_value);
-    // a medicine added to a medicine list: each medicine on its own line, in the same layout as the list
-    if (inMedicineSection(editor.state.doc, blocks, index) && node.textContent.trim()) {
-      const medLines = medicineLinesIn(new_value);
-      if (medLines.length) return addMedicineLines(editor, target, medLines);
+    // which line it goes after: find_text in a paragraph with line breaks ("after the DOLO line")
+    const lines = linesOf(node, start);
+    let afterLine = null;
+    if (find_text.trim() && lines.length > 1) {
+      afterLine = lineIndexOf(lines, find_text);
+      if (afterLine === -1) return { ok: false, error: `"${find_text}" not found in ${block_id}` };
+      if (afterLine === -2) return { ok: false, blocked: true, error: `more than one line contains "${find_text}"; say which line` };
     }
+    // a medicine added to a medicine list: each medicine on its own line, in the same layout as the list
+    // (a separator the AI put in front - ", Tab. DOLO …" - is not part of the new entry)
+    if ((inMedicineSection(editor.state.doc, blocks, index) || (isHeadingBlock(editor.state.doc, target) && MEDICINE_TITLE.test(before))) && node.textContent.trim()) {
+      const medLines = medicineLinesIn(stripLead(new_value));
+      if (medLines.length) {
+        const dup = isDuplicate(medLines);
+        if (dup) return { ok: false, blocked: true, error: dup };
+        return placeNewMedicines(editor, blocks, index, medLines, afterLine);
+      }
+    }
+    // a new line never starts or ends with stray spaces (or a stray comma); several lines -> several new lines
+    const newLines = String(new_value).split(/\r?\n/).map((l) => l.replace(/^[\s,;]+/, '').trim()).filter(Boolean);
+    if (afterLine != null) return addNewLines(editor, target, newLines, afterLine);
+    if (inListItem(editor.state.doc, target)) return addNewLines(editor, target, newLines);
     const insertPos = pos + node.nodeSize;
-    // a new line never starts or ends with stray spaces
-    const para = editor.schema.nodes.paragraph.create(null, editor.schema.text(new_value.trim()));
-    const tr = editor.state.tr.insert(insertPos, para);
-    tr.setMeta(flashKey, { add: { from: insertPos, to: insertPos + para.nodeSize } });
+    const paras = newLines.map((l) => editor.schema.nodes.paragraph.create(null, editor.schema.text(l)));
+    const tr = editor.state.tr.insert(insertPos, paras);
+    tr.setMeta(flashKey, { add: { from: insertPos, to: insertPos + paras.reduce((n, x) => n + x.nodeSize, 0) } });
     editor.view.dispatch(tr);
     scheduleClear(editor);
     return { ok: true, before: '', after: new_value, pos: insertPos };
+  }
+
+  // "append" whose text starts with a new line: the AI means a NEW line, never glued onto the last one
+  if (operation === 'append' && /^[ \t]*\r?\n/.test(new_value) && node.textContent.trim() && !inTable(editor.state.doc, target)) {
+    const newLines = String(new_value).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (!newLines.length) return { ok: false, error: 'append needs new_value' };
+    if (!allowGender && changesGender('', new_value)) {
+      return { ok: false, blocked: true, error: 'it would add gender details you did not ask for' };
+    }
+    if (inMedicineSection(editor.state.doc, blocks, index)) {
+      const dup = isDuplicate(newLines);
+      if (dup) return { ok: false, blocked: true, error: dup };
+      if (newLines.every(isMedicineLine)) return placeNewMedicines(editor, blocks, index, newLines);
+    }
+    return addNewLines(editor, target, newLines);
   }
 
   // Map every character of the block's text to its document position
@@ -380,7 +995,8 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     // The heading stays locked, but the new text is moved to where it belongs: under the heading.
     const head = text.trim();
     const isHeading = !inTable(editor.state.doc, target) && isLockedLabel(editor.state.doc, target);
-    if (isHeading && after.trim().toLowerCase().startsWith(head.toLowerCase())) {
+    // (set = replace: "COURSE IN HOSPITAL: <new text>" replaces the section's text - see replaceSectionContent below)
+    if (isHeading && operation !== 'set' && after.trim().toLowerCase().startsWith(head.toLowerCase())) {
       const extra = after.trim().slice(head.length).replace(/^[\s:\-–]+/, '').trim();
       if (extra) {
         const end = sectionBodyEnd(editor.state.doc, blocks, index);
@@ -397,6 +1013,17 @@ export function applyVoiceEdit(editor, args, opts = {}) {
       const v = toValueCell(editor, blocks, target, args, text);
       if (v) return { ...applyVoiceEdit(editor, v, opts), redirected: true };
     }
+    // "Clear / rewrite <section>" aimed at the heading or label: the HEADING stays locked, the CONTENT changes
+    // (typed and spoken commands; an uploaded file still cannot delete)
+    if (!fromFile && (operation === 'set' || operation === 'clear')) {
+      if (isHeading) {
+        const r = replaceSectionContent(editor, blocks, index, args, opts);
+        if (r) return r;
+      } else if (!inTable(editor.state.doc, target)) {
+        const r = replaceAfterLabel(editor, target, args, opts);
+        if (r) return r;
+      }
+    }
     return { ok: false, blocked: true, error: locked };
   }
   if (!allowGender && changesGender(text, after)) {
@@ -406,10 +1033,50 @@ export function applyVoiceEdit(editor, args, opts = {}) {
   // Medicine lists (only inside a medicine section such as Advice)
   if (inMedicineSection(editor.state.doc, blocks, index)) {
     const lines = linesOf(node, start);
+    // a NEW entry is never joined onto an existing line ("…going to sleep, Tab. DOLO …"): when the text was only ADDED
+    // at the end of a line, the new medicine becomes its own line right after it; anything else is refused
+    if ((operation === 'append' || operation === 'replace_text') && text.trim()) {
+      const k = operation === 'append' ? lines.length - 1 : lines.findIndex((l) => l.map.includes(from));
+      const line = lines[k];
+      if (line && line.map.length) {
+        const a = operation === 'append' ? line.text.length : line.map.indexOf(from);
+        const lineAfter = line.text.slice(0, a) + insert + line.text.slice(a + (to - from));
+        if (entryPieces(lineAfter).length > entryPieces(line.text).length && kindsOfLine(lineAfter).some((x) => x !== 'text')) {
+          const atLineEnd = to === line.map[line.map.length - 1] + 1;
+          const added = operation === 'append' ? insert
+            : atLineEnd && new_value.toLowerCase().startsWith(find_text.toLowerCase()) ? new_value.slice(find_text.length) : null;
+          const newMeds = added != null ? medicineLinesIn(stripLead(added)) : [];
+          if (!newMeds.length) {
+            return { ok: false, blocked: true, error: `this would join a new entry onto the line "${line.text.trim()}"; a new entry must be on its own line. Nothing was changed` };
+          }
+          const dup = isDuplicate(newMeds);
+          if (dup) return { ok: false, blocked: true, error: dup };
+          return operation === 'append'
+            ? placeNewMedicines(editor, blocks, index, newMeds, lines.length > 1 ? k : null)
+            : addMedicineLines(editor, target, newMeds, lines.length > 1 ? k : null);
+        }
+      }
+    }
     // a NEW medicine goes on its own line, never onto the end of the last medicine
     if (operation === 'append' && text.trim()) {
-      const medLines = medicineLinesIn(new_value);
-      if (medLines.length) return addMedicineLines(editor, target, medLines);
+      const medLines = medicineLinesIn(stripLead(new_value));
+      if (medLines.length) {
+        const dup = isDuplicate(medLines);
+        if (dup) return { ok: false, blocked: true, error: dup };
+        return placeNewMedicines(editor, blocks, index, medLines);
+      }
+      // a new instruction ("Take only if ...", "Avoid oily food.") after a medicine line is a NEW line, never glued
+      // onto that medicine: text that starts like a sentence (a capital letter, two or more words), or a whole
+      // sentence after a dash ("— Take only if the temperature is above 100 F": five or more words before any further
+      // dash). Text that only continues the line (", SOS", "— 5 days", "— Once Daily before food", "for 5 days") is
+      // still appended.
+      const added = new_value.trim();
+      const lastLine = lines[lines.length - 1].text;
+      const afterDash = added.match(/^[—–-]\s*(.+)$/u)?.[1] || '';
+      const sentenceAfterDash = /^\p{Lu}/u.test(afterDash) && afterDash.split(/\s+[—–-]\s+/u)[0].split(/\s+/).length >= 5;
+      if (isMedicineLine(lastLine) && ((/^\p{Lu}/u.test(added) && added.split(/\s+/).length >= 2) || sentenceAfterDash)) {
+        return addNewLines(editor, target, [sentenceAfterDash ? afterDash.trim() : added]);
+      }
     }
     const count = medicineCount(lines);
     // The AI sent the WHOLE list again (an uploaded prescription, or "change the Dolo dose"): compare it line by
@@ -418,7 +1085,11 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     if (operation === 'set' && count >= 1 && (count >= 2 || proposedLines(new_value).length > 1)) {
       const plan = medicineListUpdate(lines, new_value);
       if (plan?.same) return { ok: true, before, after: before, pos, unchanged: true };
-      if (plan?.add) return addMedicineLines(editor, target, plan.add);
+      if (plan?.add) {
+        const dup = isDuplicate(plan.add);
+        if (dup) return { ok: false, blocked: true, error: dup };
+        return addMedicineLines(editor, target, plan.add);
+      }
       if (plan?.change) return changeMedicineLines(editor, target, plan.change);
       return {
         ok: false,
@@ -455,6 +1126,27 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     return { ok: false, blocked: true, error: 'the file would replace the existing text of this paragraph; a file may add to it, but not replace it' };
   }
 
+  // Removing ONE WHOLE LINE of a paragraph with line breaks ("remove Drink plenty of water"): its line break goes
+  // too, so no empty line is left and the lines around it are never joined
+  if (operation === 'replace_text' && !new_value && !fromFile) {
+    const lines = linesOf(node, start);
+    if (lines.length > 1) {
+      const k = lines.findIndex((l) => l.map.length && l.map[0] === from && l.map[l.map.length - 1] + 1 === to);
+      if (k > 0) from = lines[k - 1].map.length ? lines[k - 1].map[lines[k - 1].map.length - 1] + 1 : from - 1; // the break before it
+      else if (k === 0) to += 1; // the first line: the break after it
+    }
+  }
+
+  // Clearing a paragraph of its own (not a table cell, not a list item) when its section has other text: the empty
+  // paragraph goes too (a removed instruction leaves no blank line). A section's only paragraph stays, empty.
+  if (operation === 'clear' && !fromFile && text.trim() && editor.state.doc.resolve(pos).depth === 0 &&
+      sectionBlocks(editor.state.doc, blocks, index).some((b) => b !== target && b.node.textContent.trim())) {
+    const tr = editor.state.tr.delete(pos, pos + node.nodeSize);
+    editor.view.dispatch(tr);
+    scheduleClear(editor);
+    return { ok: true, before, after: '', pos: Math.min(pos, tr.doc.content.size) };
+  }
+
   const tr = editor.state.tr.insertText(insert, from, to);
   const changed = tr.doc.nodeAt(pos);
   tr.setMeta(flashKey, { add: { from: pos, to: pos + changed.nodeSize } });
@@ -482,7 +1174,9 @@ export function applyPatientConsistency(editor, factsBefore) {
 // targetGender: the gender the user just set somewhere (e.g. in Course in Hospital). It becomes the
 // header value too. Without it, the header is the truth and the rest of the document follows it.
 // Returns the changed blocks: [{ pos, before, after }]
-export function ensurePatientConsistency(editor, targetGender = null) {
+// only (optional): limit the narrative fixes to these blocks ((node) => boolean), e.g. the text a command just wrote:
+// Patient Details stay the truth and no other section is touched.
+export function ensurePatientConsistency(editor, targetGender = null, only = null) {
   const flash = (tr, pos, node) => tr.setMeta(flashKey, { add: { from: pos, to: pos + node.nodeSize } });
   const changes = [];
   if (targetGender) {
@@ -491,7 +1185,7 @@ export function ensurePatientConsistency(editor, targetGender = null) {
   }
   const facts = getPatientFacts(editor.state.doc);
   if (targetGender) facts.gender = targetGender;
-  changes.push(...syncPatientFacts(editor, facts, flash));
+  changes.push(...syncPatientFacts(editor, facts, flash, only));
   if (changes.length) scheduleClear(editor);
   return changes;
 }

@@ -130,16 +130,19 @@ function applyHits(editor, pos, node, map, hits, onBlockChanged) {
 
 // Rewrites every age/gender phrase, "male patient", he/she words and the name title (Mr./Ms.)
 // so they match `facts`. The header value itself is not touched here (see setHeaderGender).
+// only (optional): (node) => true for the blocks that may change (e.g. only the text a command just wrote);
+// without it every block is checked, as before.
 // Returns the list of changed blocks: [{ pos, before, after }]
-export function syncPatientFacts(editor, facts, onBlockChanged) {
+export function syncPatientFacts(editor, facts, onBlockChanged, only = null) {
   if (!facts.age && !facts.gender) return [];
   const changes = [];
   const blocks = getBlocks(editor.state.doc);
-  const nameIdx = facts.gender ? findNameBlock(blocks.map((b) => b.node.textContent)) : -1;
+  const nameIdx = facts.gender && !only ? findNameBlock(blocks.map((b) => b.node.textContent)) : -1;
 
   // From the bottom up, so earlier positions stay valid
   for (let b = blocks.length - 1; b >= 0; b--) {
     const { pos, node } = blocks[b];
+    if (only && !only(node)) continue;
     const { text, map } = blockText(pos, node);
     const hits = findFixes(text, facts);
     if (b === nameIdx) {

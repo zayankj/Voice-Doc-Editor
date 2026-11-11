@@ -4,6 +4,7 @@ import {
 } from './medicineText.js';
 import { findClearSectionCommand, clearPreview, BARE_ALL, findInlineSection, isClearIntent } from './sectionCommands.js';
 import { getSections, findSectionsInCommand } from './sections.js';
+import { getBlocks } from './outline.js';
 
 // ONE place that understands a command, used for BOTH typed instructions and the voice transcript.
 //
@@ -291,7 +292,16 @@ export function classifyCommand(doc, command, { cursor } = {}) {
       scope: medicineOnly || forms.length ? 'medicine_entries' : 'section_lines',
     };
     if (!plan.changes.some((ch) => ch.removals.some((r) => r.selected))) {
-      const asked = [...phrases, ...categories.map(labelOf), ...(patterns ? ['dosing patterns'] : [])].join(', ');
+      // Quoted words that are not part of any medicine line but ARE ordinary text of that section ("remove 'Drink
+      // plenty of water' from the advice"): not a medicine removal. The normal AI editing handles it, with all its
+      // checks (named section, at most one medicine line lost, Undo, History). Medicine words, categories, dosing
+      // patterns, named medicines and "this medicine" never come here: they keep the confirmation window / question.
+      if (phrases.length && !categories.length && !patterns && !target.names.length && !target.entries.length) {
+        const blocks = getBlocks(doc);
+        const sectionText = pick.section.body.map((i) => blocks[i]?.node.textContent || '').join('\n').toLowerCase();
+        if (phrases.every((p) => sectionText.includes(String(p).toLowerCase()))) return { type: 'ai' };
+      }
+      const asked =[...phrases, ...categories.map(labelOf), ...(patterns ? ['dosing patterns'] : [])].join(', ');
       const where = target.names.length ? `${target.names.map((n) => n.toUpperCase()).join(', ')} in ` : target.entries.length ? 'this medicine in ' : '';
       return { type: 'ask', question: `I found no ${asked} in ${where}${nice(pick.section.title)}. Nothing was changed.`, intent };
     }

@@ -3,7 +3,7 @@
 // preview shows what Apply will do. The real editor, its Undo history and its highlights are never touched.
 import { EditorState } from '@tiptap/pm/state';
 import { applyVoiceEdit, applyPatientConsistency, ensurePatientConsistency, getPatientFacts } from './voiceEdit.js';
-import { genderStatedIn } from './consistency.js';
+import { getBlocks } from './outline.js';
 import { changesGender, isLabelText } from './guards.js';
 import { cellAt, dataCellRole, rowName } from './tables.js';
 import { countMedicineLines } from './medicineText.js';
@@ -57,7 +57,6 @@ export function previewEdits(doc, edits, { allowGender = true, fromFile = true, 
   const ed = copyEditor(doc);
   const items = [];
   const blocked = [];
-  const values = [];
   let unchanged = 0;
   edits.forEach((e, index) => {
     if (selected && !selected.has(index)) return;
@@ -84,12 +83,17 @@ export function previewEdits(doc, edits, { allowGender = true, fromFile = true, 
       patient: also.length > 0 || isPatientDetail(now, r.pos, r.before || '', r.after || ''),
       also,
     });
-    if (e.operation === 'set' || e.operation === 'replace_text') values.push(e.new_value || '');
   });
+  // the final age / gender step, exactly as App.jsx applyAiEdits does it: Patient Details (the header) are the source;
+  // when they did not change, only the text these edits wrote follows them (no other place, never the header)
   let extra = [];
   if (items.length && consistency) {
-    const target = allowGender ? genderStatedIn(values) : null;
-    extra = ensurePatientConsistency(ed, target).map((c) => ({ before: c.before, after: c.after }));
+    const start = getPatientFacts(doc);
+    const now = getPatientFacts(ed.state.doc);
+    const oldTexts = new Set(getBlocks(doc).map((b) => b.node.textContent));
+    const detailsChanged = now.age !== start.age || now.gender !== start.gender;
+    extra = (detailsChanged ? ensurePatientConsistency(ed) : ensurePatientConsistency(ed, null, (node) => !oldTexts.has(node.textContent)))
+      .map((c) => ({ before: c.before, after: c.after }));
   }
   ed.isDestroyed = true;
   return { items, blocked, unchanged, consistency: extra, doc: ed.state.doc };

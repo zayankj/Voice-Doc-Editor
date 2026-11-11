@@ -18,8 +18,11 @@
 // Nothing here logs keys, audio, transcripts or document text.
 
 import { GoogleGenAI, Modality, Type } from '@google/genai';
+import { COMMAND_OPERATIONS, STYLES, CASES, LIST_TYPES, SELECT_KINDS, extraEditFields } from './commandPrompt.js';
 
-const OPERATIONS = ['set', 'replace_text', 'append', 'clear', 'insert_after'];
+// Live is only used for spoken COMMANDS, so it has the same operations as typed commands (commandPrompt.js)
+const OPERATIONS = COMMAND_OPERATIONS;
+const MAX_LINES = 100; // lines in one to_list edit
 const MAX_SECONDS = 60; // the app's clips are at most ~31 s
 const MAX_EDITS = 50;
 const MAX_TEXT = 10000; // characters per text field
@@ -106,9 +109,21 @@ export function checkLiveResult(args, transcript) {
     // what each operation needs
     if (['set', 'append', 'insert_after'].includes(e.operation) && typeof e.new_value !== 'string') fail('invalid edit');
     if (e.operation === 'replace_text' && (typeof e.find_text !== 'string' || !e.find_text || typeof e.new_value !== 'string')) fail('invalid edit');
+    // the look-only / list fields: only known values
+    if (e.style !== undefined && !STYLES.includes(e.style)) fail('invalid edit');
+    if (e.case !== undefined && !CASES.includes(e.case)) fail('invalid edit');
+    if (e.list_type !== undefined && !LIST_TYPES.includes(e.list_type)) fail('invalid edit');
+    if (e.last_block_id !== undefined && (typeof e.last_block_id !== 'string' || !/^B\d{1,6}$/.test(e.last_block_id))) fail('invalid edit');
+    if (e.duplicate_ok !== undefined && typeof e.duplicate_ok !== 'boolean') fail('invalid edit');
+    if (e.lines !== undefined && (!Array.isArray(e.lines) || e.lines.length > MAX_LINES || !e.lines.every(text))) fail('invalid edit');
+    if (e.operation === 'format' && e.style === undefined) fail('invalid edit');
+    if (e.operation === 'change_case' && e.case === undefined) fail('invalid edit');
+    if (e.select !== undefined && (!Array.isArray(e.select) || e.select.length > SELECT_KINDS.length || !e.select.every((k) => SELECT_KINDS.includes(k)))) fail('invalid edit');
+    if (e.operation === 'to_list' && (e.list_type === undefined || (!e.lines?.length && !e.select?.length))) fail('invalid edit');
     const out = { block_id: e.block_id, operation: e.operation, field_label: e.field_label };
-    if (e.new_value !== undefined) out.new_value = e.new_value;
-    if (e.find_text !== undefined) out.find_text = e.find_text;
+    for (const k of ['new_value', 'find_text', 'style', 'case', 'list_type', 'lines', 'select', 'last_block_id', 'duplicate_ok']) {
+      if (e[k] !== undefined) out[k] = e[k];
+    }
     return out;
   });
   return {
@@ -144,6 +159,7 @@ const proposeEdits = {
             new_value: { type: Type.STRING },
             find_text: { type: Type.STRING },
             field_label: { type: Type.STRING },
+            ...extraEditFields(Type),
           },
           required: ['block_id', 'operation', 'field_label'],
         },

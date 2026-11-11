@@ -1,5 +1,5 @@
 import { getBlocks } from './outline.js';
-import { getSections, sectionOf, findSectionsInCommand } from './sections.js';
+import { getSections, sectionOf, findSectionsInCommand, nameWords } from './sections.js';
 import { cellAt, dataCellRole, rowName, rowNames } from './tables.js';
 
 // Checks the AI's edits BEFORE they are applied.
@@ -17,6 +17,7 @@ import { cellAt, dataCellRole, rowName, rowNames } from './tables.js';
 //      or { reject: 'message for the Smart Edit panel' }
 
 const ADDING = new Set(['append', 'insert_after']);
+const LOOK_ONLY = new Set(['format', 'change_case', 'to_list', 'unlist']);
 
 function inTableCell(doc, b) {
   const $p = doc.resolve(b.pos);
@@ -69,17 +70,36 @@ export function checkNamedSection(doc, command, edits) {
 
   const target = found.best;
   const blocks = getBlocks(doc);
+  // Moving text "from <section> to <section>": the command names BOTH sections, so the removal in the source section
+  // is allowed (the text added there is still moved to the destination, as before). Only when "from" comes right
+  // before the other section's name, so a section merely mentioned is never opened up.
+  const source = found.matches.find((s) => s !== target &&
+    new RegExp(`\\bfrom\\s+(?:the\\s+)?${nameWords(s.title).map((w) => `${w}\\w*`).join('\\W+(?:\\w+\\W+)?')}`, 'i').test(command));
   // last line of text in the named section (not inside a table); the heading when the section is empty
   const lastLine = [...target.body].reverse().find((i) => !inTableCell(doc, blocks[i])) ?? target.headingIndex;
 
   const out = [];
   const moved = [];
+  const skipped = []; // age / gender "consistency" edits outside the named section: not applied (Patient Details rule)
+  // the new text written INTO the named section (to recognise a header change that only copies an age / sex from it)
+  const intoTarget = edits.filter((e) => { const k = parseInt(String(e.block_id).replace(/\D/g, ''), 10); return blocks[k] && sectionOf(sections, k) === target; })
+    .map((e) => String(e.new_value || '')).join('\n');
   for (const e of edits) {
     const i = parseInt(String(e.block_id).replace(/\D/g, ''), 10);
     const b = blocks[i];
     if (!b) { out.push(e); continue; } // unknown block: applyVoiceEdit reports it
     const inTarget = sectionOf(sections, i) === target;
-    if (inTarget || inTableCell(doc, b)) { out.push(e); continue; }
+    if (inTarget) { out.push(e); continue; }
+    // Patient Details (Age / Sex in the header) change only when asked, never because the text dictated for the
+    // named section mentions another age or sex ("… add: a 22-year-old male presented …")
+    if (inTableCell(doc, b)) {
+      if (copiesFactFromText(doc, b, e, intoTarget)) { skipped.push(placeLabel(doc, b, sections, i)); continue; }
+      out.push(e);
+      continue;
+    }
+    // another section changed ONLY in its age / gender words: the AI keeping the document "consistent" - not applied
+    if (onlyPatientFacts(b.node.textContent, e)) { skipped.push(placeLabel(doc, b, sections, i)); continue; }
+    if (source && sectionOf(sections, i) === source && !ADDING.has(e.operation)) { out.push(e); continue; }
     if (ADDING.has(e.operation)) {
       // the AI's text when it is a real sentence ("She is stable."); when it is a fragment shaped for the
       // wrong section (", MALARIA"), the user's own words from the command
@@ -95,8 +115,49 @@ export function checkNamedSection(doc, command, edits) {
       reject: `You asked about ${nice(target.title)}, but the change was for ${other?.title ? nice(other.title) : 'another part'}. Nothing was changed. Please say it again.`,
     };
   }
-  return { edits: out, moved };
+  return { edits: out, moved, skipped };
 }
+
+// ---------- age / gender: Patient Details are the source ----------
+const AGE_WORDS = /\b\d{1,3}(\s*-?\s*(?:years?|yrs?|yr|y)\b(?:\s*-?\s*old)?)/gi;
+const GENDER_WORD = /\b(?:male|female|man|woman|lady|gentleman|boy|girl|he|she|him|his|her|hers|himself|herself|mr|ms|mrs|miss|m|f)\b/gi;
+const factless = (t) => String(t).toLowerCase().replace(AGE_WORDS, '#$1').replace(GENDER_WORD, '@').replace(/\s+/g, ' ').trim();
+
+// Would this edit change ONLY ages and gender words of the block ("49-year-old" -> "22-year-old")?
+function onlyPatientFacts(oldText, e) {
+  let next;
+  if (e.operation === 'set') next = String(e.new_value ?? '');
+  else if (e.operation === 'replace_text' && e.find_text) {
+    const at = oldText.toLowerCase().indexOf(String(e.find_text).toLowerCase());
+    if (at === -1) return false;
+    next = oldText.slice(0, at) + String(e.new_value ?? '') + oldText.slice(at + String(e.find_text).length);
+  } else return false;
+  return next !== oldText && factless(next) === factless(oldText);
+}
+
+// A header Age / Sex value whose new value only repeats the age / sex of the text written into the named section
+function copiesFactFromText(doc, b, e, intoTarget) {
+  const info = cellAt(doc, b.pos);
+  if (!info || info.col === 0 || !intoTarget) return false;
+  const label = info.row.child(info.col - 1).textContent.trim().toLowerCase().replace(/[\s:.]+$/, '');
+  const value = String(e.new_value ?? e.find_text ?? '');
+  if (/^(?:age|age\/sex|age\/gender)$/.test(label) || /^age\b/.test(label)) {
+    const n = value.match(/\d{1,3}/)?.[0];
+    return Boolean(n) && new RegExp(`\\b${n}\\s*-?\\s*(?:years?|yrs?|yr|y)\\b`, 'i').test(intoTarget);
+  }
+  if (/^(?:sex|gender|sex\/age|gender\/age)$/.test(label)) {
+    const g = value.trim().toLowerCase();
+    const word = g.startsWith('f') ? /\b(?:female|woman|lady|girl|she|her)\b/i : g.startsWith('m') ? /\b(?:male|man|gentleman|boy|he|his|him)\b/i : null;
+    return Boolean(word) && word.test(intoTarget);
+  }
+  return false;
+}
+
+const placeLabel = (doc, b, sections, i) => {
+  const info = cellAt(doc, b.pos);
+  if (info && info.col > 0) return info.row.child(info.col - 1).textContent.trim().replace(/[\s:]+$/, '');
+  return nice(sectionOf(sections, i)?.title || 'another section');
+};
 
 // ---------- table rows: the right row, the number that was said ----------
 // For a typed or spoken command that changes a DATA TABLE (Lab Investigations: "Investigation | Result"):
@@ -192,16 +253,59 @@ export function numbersSaid(command) {
 const numbersIn = (t) => (String(t || '').replace(/(\d),(?=\d)/g, '$1').match(/\d+(?:\.\d+)?/g) || []).map(parseFloat);
 const nice2 = (t) => t.trim().toUpperCase();
 
+// A NEW medicine line added by a typed / spoken command (Advice, Medications, Treatment ...): every number in it
+// (strength, dose, dosing pattern, duration) must have been said - the same rule as for lab values above, so a
+// strength or duration the AI made up ("Tab. DOLO 650 mg ... 5 days" when only "Dolo at night" was said) is never
+// added. (Words such as a route or frequency cannot be checked this way; the AI is told never to add them.)
+const MEDICINE_SECTION = /\b(advice|medication|medications|medicine|medicines|treatment|drugs?|prescription|rx)\b/i;
+const MEDICINE_LINE = /^\s*(?:tab|tabs|tablet|tablets|cap|caps|capsule|capsules|syp|syr|syrup|syrups|susp|suspension|inj|injection|drop|drops|oint|ointment|cream|gel|lotion|sachet|powder|inhaler|neb|nebulisation|nebulization|spray|rotacap)(?:\.\s*|\s+)\S/i; // "Tab. X", "Tab X", "TAB.X"
+
+// Dosing patterns: "1-0-1", "(0-0-1)", "1-0-0-1" in a medicine line (digits 0-3 joined by dashes)
+const DOSING_IN_LINE = /(?<![\d.])[0-3](?:\s*[-–]\s*[0-3]){2,3}(?!\.?\d)/g;
+// The patterns a command says, as digit strings ("001"): "001", "0-0-1", "0 0 1", "zero zero one", "1-0-0-1".
+// Only digits 0-3 make a pattern, so a strength such as "500" is never read as one.
+export function patternsSaid(command) {
+  const s = wordsToDigits(String(command || '').toLowerCase());
+  const out = new Set();
+  // (a full stop at the end of the sentence is not a decimal point: "... daily night 001.")
+  for (const m of s.matchAll(/(?<![\d.])[0-3](?:[\s,\-–/]*[0-3]){2,3}(?!\.?\d)/g)) out.add(m[0].replace(/\D/g, ''));
+  return out;
+}
+
 export function checkTableEdits(doc, command, edits) {
   if (!command || !edits.length) return { edits, blocked: [] };
   const blocks = getBlocks(doc);
+  const sections = getSections(doc);
   const cmd = plain(command);
   const said = numbersSaid(command);
   const out = [];
   const blocked = [];
   for (const e of edits) {
-    const b = blocks[parseInt(String(e.block_id).replace(/\D/g, ''), 10)];
+    // bold / italic / capital letters / lists change no row and no number: nothing to check here
+    if (LOOK_ONLY.has(e.operation)) { out.push(e); continue; }
+    const at = parseInt(String(e.block_id).replace(/\D/g, ''), 10);
+    const b = blocks[at];
     const info = b && cellAt(doc, b.pos);
+    // the text a command ADDS: append / insert_after, or what a replace_text adds after the text it keeps
+    // ("sleep" -> "sleep, Tab. DOLO …"); a separator in front (", Tab. DOLO …") is not part of the new entry
+    const keeps = e.operation === 'replace_text' && e.find_text && String(e.new_value || '').toLowerCase().startsWith(String(e.find_text).toLowerCase());
+    const addedText = ADDING.has(e.operation) ? String(e.new_value || '') : keeps ? String(e.new_value).slice(String(e.find_text).length) : '';
+    if (b && !info && addedText && MEDICINE_SECTION.test(sectionOf(sections, at)?.title || '')) {
+      const newMeds = addedText.split(/\r?\n/).map((l) => l.replace(/^[\s,;:—–-]+/u, '').trim()).filter((l) => MEDICINE_LINE.test(l));
+      // a dosing pattern ("(0-0-1)") is checked as ONE pattern against the patterns said ("001", "0-0-1", "0 0 1",
+      // "zero zero one"); every other number (strength, dose, duration) must have been said, as before
+      const patterns = patternsSaid(command);
+      const badPatterns = [];
+      const rest = newMeds.map((l) => l.replace(DOSING_IN_LINE, (m) => {
+        if (!patterns.has(m.replace(/\D/g, ''))) badPatterns.push(m.replace(/\s+/g, ''));
+        return ' ';
+      }));
+      const unsaid = [...new Set([...badPatterns, ...rest.flatMap(numbersIn).filter((n) => !said.some((s) => Math.abs(s - n) < 1e-9))])];
+      if (unsaid.length) {
+        blocked.push(`${nice2(e.field_label || 'Advice')}: the new medicine line contains ${unsaid.join(', ')}, which was not in your command, so it was not added. Please say the medicine again with only the details you want`);
+        continue;
+      }
+    }
     const role = dataCellRole(info);
     if (!role || role === 'title') { out.push(e); continue; } // not a data-table row: other checks apply
 
