@@ -2,7 +2,8 @@
 // Run:  cd server  &&  node --test tests/
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wavToPcm, checkLiveResult, liveEnabled, liveDescription } from '../liveVoice.js';
+import fs from 'node:fs';
+import { wavToPcm, checkLiveResult, liveEnabled, liveDescription, isModelAudio } from '../liveVoice.js';
 import { pcmChunksToWav } from '../../client/src/lib/wav.js'; // the browser's own WAV writer = the real format
 
 // 0.5 s of dummy 16-bit samples, as base64 chunks like the microphone sends them
@@ -172,4 +173,84 @@ test('Live is off unless GEMINI_LIVE_MODEL is set; the description never shows a
     if (saved.model === undefined) delete process.env.GEMINI_LIVE_MODEL; else process.env.GEMINI_LIVE_MODEL = saved.model;
     if (saved.key === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = saved.key;
   }
+});
+
+// ---------- early backup: the model SPEAKS instead of calling the function ----------
+const audioPart = (mimeType = 'audio/pcm;rate=24000', data = 'AAAA') => ({ inlineData: { mimeType, data } });
+
+test('isModelAudio: only the model\'s own spoken reply counts', () => {
+  assert.equal(isModelAudio({ serverContent: { modelTurn: { parts: [audioPart()] } } }), true);
+  assert.equal(isModelAudio({ serverContent: { modelTurn: { parts: [{ text: 'x' }, audioPart('AUDIO/PCM')] } } }), true);
+  for (const m of [
+    { serverContent: { inputTranscription: { text: 'add name test patient' } } }, // Google's transcript of the person
+    { serverContent: { modelTurn: { parts: [{ text: 'thinking' }] } } }, // text only
+    { serverContent: { modelTurn: { parts: [] } } }, { serverContent: { modelTurn: {} } }, // empty
+    { serverContent: { modelTurn: { parts: [audioPart('audio/pcm', '')] } } }, // no audio data
+    { serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: 'image/png', data: 'AAAA' } }] } } },
+    { serverContent: { turnComplete: true } }, { serverContent: { generationComplete: true } }, // status messages
+    { toolCall: { functionCalls: [{ id: '1', name: 'propose_edits', args: {} }] } }, // the function call itself
+    {}, null, undefined, 'audio/pcm',
+  ]) assert.equal(isModelAudio(m), false, JSON.stringify(m));
+});
+
+test('liveExtract: the function call is taken FIRST; audio only ends an attempt that has no call; the backup gets the original request', () => {
+  const live = fs.readFileSync(new URL('../liveVoice.js', import.meta.url), 'utf8');
+  const handler = live.slice(live.indexOf('onmessage: (m) => {'), live.indexOf('onerror:'));
+  const callAt = handler.indexOf("const fc = m.toolCall?.functionCalls?.find((f) => f.name === 'propose_edits');");
+  const audioAt = handler.indexOf("if (!call && isModelAudio(m)) settle.reject(new LiveError('model spoke instead of calling the function'));");
+  const turnAt = handler.indexOf("if (m.serverContent?.turnComplete && !call) settle.reject(new LiveError('no function call'));");
+  assert.ok(callAt > 0 && audioAt > callAt && turnAt > audioAt, 'order: call, then audio, then turn complete');
+  assert.equal((handler.match(/settle\.resolve\(\)/g) || []).length, 1); // success only through the call
+  // after the attempt: the session is always closed (a late Live message changes nothing)
+  assert.match(live, /try \{ session\?\.close\(\); \} catch/);
+  // the backup path (index.js) still uses the original audio and the same prompt
+  const index = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  assert.match(index, /const result = await liveExtract\(\{ prompt, audioBase64 \}\);/);
+  assert.match(index, /if \(hasAudio\) parts\.push\(\{ inlineData: \{ mimeType: audioMimeType \|\| 'audio\/wav', data: audioBase64 \} \}\);/);
+  assert.match(index, /parts\.push\(\{ text: prompt \}\);/);
+});
+
+// ---------- Live answer format: descriptions only; types, allowed values and checks unchanged ----------
+test('Live-only wording: the function says where each value goes; the answer format itself is unchanged', async () => {
+  const { liveFunctionDeclaration, liveSuffix } = await import('../liveVoice.js');
+  const { extraEditFields, COMMAND_OPERATIONS } = await import('../commandPrompt.js');
+  const { Type } = await import('@google/genai');
+  const decl = liveFunctionDeclaration();
+  const strip = (o) => JSON.parse(JSON.stringify(o, (k, v) => (k === 'description' ? undefined : v)));
+  // the same shape as before the wording (types, enums, required)
+  assert.deepEqual(strip(decl.parameters), {
+    type: Type.OBJECT,
+    properties: {
+      heard: { type: Type.STRING }, understood: { type: Type.STRING }, language: { type: Type.STRING },
+      all_words: { type: Type.STRING }, summary: { type: Type.STRING },
+      edits: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: {
+        block_id: { type: Type.STRING }, operation: { type: Type.STRING, enum: COMMAND_OPERATIONS },
+        new_value: { type: Type.STRING }, find_text: { type: Type.STRING }, field_label: { type: Type.STRING },
+        ...strip(extraEditFields(Type)) }, required: ['block_id', 'operation', 'field_label'] } },
+    },
+    required: ['heard', 'understood', 'edits', 'summary'],
+  });
+  const f = decl.parameters.properties.edits.items.properties;
+  assert.match(f.new_value.description, /REQUIRED for set, append, insert_after and replace_text/);
+  assert.match(f.new_value.description, /never in lines/);
+  assert.match(f.block_id.description, /Exactly ONE block id .* like "B12"/);
+  assert.match(f.lines.description, /^ONLY for to_list\. Never use it to add new text/);
+  assert.match(f.select.description, /^ONLY for to_list/);
+  assert.match(decl.description, /also to ask a question .* Never answer by speaking\./);
+  // the Live-only text: the earlier lines, plus the format checklist
+  const s = liveSuffix();
+  assert.match(s, /call the function propose_edits exactly once/);
+  assert.match(s, /Never answer in any other way\./);
+  assert.match(s, /set, append and insert_after: the text to write is ALWAYS in new_value \(never in lines\)/);
+  assert.match(s, /block_id: ONE id exactly like B12/);
+  assert.match(s, /A question goes in summary with an empty edits list, inside the function call\. Never speak a question or an answer\./);
+});
+
+test('the main prompt is not changed by the Live wording (it is only added for Live sessions)', async () => {
+  const index = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(index, /FORMAT OF THE FUNCTION CALL/);
+  const cp = fs.readFileSync(new URL('../commandPrompt.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(cp, /FORMAT OF THE FUNCTION CALL/);
+  const live = fs.readFileSync(new URL('../liveVoice.js', import.meta.url), 'utf8');
+  assert.match(live, /systemInstruction: prompt \+ LIVE_SUFFIX,/);
 });

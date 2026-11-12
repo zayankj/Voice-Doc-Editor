@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import { liveEnabled, liveDescription, liveExtract } from './liveVoice.js'; // test branch: Gemini Live for voice only
+import { timingLine } from './timingLog.js'; // performance lines for the terminal: numbers and fixed labels only
 import { commandAddon, commandSchema, cleanCursorBlock, cleanRecent } from './commandPrompt.js'; // commands only, never uploads
 import { finishCommand } from './scopeGuard.js'; // commands only: scope check + English interpretation in summary
 
@@ -175,9 +176,10 @@ async function generateWithRetry(request) {
       const remaining = deadline - Date.now();
       if (remaining < 5000 || calls >= MAX_CALLS) throw finalError(lastErr, quotaSeen);
       calls++;
+      const tryFrom = Date.now();
       try {
         const text = await tryOnce(model, request, Math.min(PER_TRY_TIMEOUT_MS, remaining), attempt === 1);
-        console.log(`AI: answered by ${model}`); // which model answered; never content
+        console.log(`AI: answered by ${model} in ${Date.now() - tryFrom} ms`); // which model answered and how fast; never content
         return text;
       } catch (e) {
         lastErr = e;
@@ -410,15 +412,25 @@ app.post('/api/extract-edits', async (req, res) => {
     // The prompt is the same; the answer is checked there (all-or-nothing). On ANY problem - error, time limit,
     // empty transcript, missing or invalid function arguments, a non-WAV clip - the existing path below runs with
     // the same request. Logs only the path, the time and a fixed reason; never audio, transcripts or document text.
+    // Timing lines (server/timingLog.js): numbers and fixed labels only; printed here, never sent to the browser
+    const requestFrom = Date.now();
+    let liveTried = false;
     if (hasAudio && !hasFile && !typed && liveEnabled() && (!audioMimeType || audioMimeType === 'audio/wav')) {
       const t0 = Date.now();
+      liveTried = true;
       try {
         const result = await liveExtract({ prompt, audioBase64 });
         console.log(`Voice: Live answered in ${Date.now() - t0} ms (${result.edits.length} edit(s))`);
+        console.log(timingLine('Voice timing', {
+          live: 'ok', ...result.timing, model_audio: Boolean(result.timing?.model_audio), live_ms: Date.now() - t0, edits: result.edits.length,
+        }));
         // the person's words: Google's transcript (and the model's own, inside finishCommand)
         return res.json(finishCommand(result, { outline, said: [result.transcript] }));
       } catch (e) {
         console.warn(`Voice: Live not used (${e?.message || 'error'}) after ${Date.now() - t0} ms -> existing path`);
+        console.log(timingLine('Voice timing', {
+          live: 'failed', reason: e?.message, ...e?.timing, model_audio: Boolean(e?.timing?.model_audio), live_ms: Date.now() - t0, backup: true,
+        }));
       }
     }
 
@@ -433,10 +445,15 @@ app.post('/api/extract-edits', async (req, res) => {
     if (hasAudio) parts.push({ inlineData: { mimeType: audioMimeType || 'audio/wav', data: audioBase64 } });
     parts.push({ text: prompt });
 
+    const backupFrom = Date.now();
     const answer = await generateWithRetry({
       contents: [{ role: 'user', parts }],
       config: { responseMimeType: 'application/json', responseSchema: isCommand ? commandSchema(editsSchema) : editsSchema, temperature: 0 },
     });
+    // voice clips only: how long the existing (backup) path took, and the whole request on the server
+    if (hasAudio && !hasFile) {
+      console.log(timingLine('Backup timing', { backup: 'done', live_tried: liveTried, backup_ms: Date.now() - backupFrom, total_ms: Date.now() - requestFrom }));
+    }
 
     let data;
     try {

@@ -109,7 +109,8 @@ test('command rules: formatting is an edit, new entries are insert_after, medici
   assert.match(a, /Use change_case\s+\(never set\) for every change of capital letters/);
   assert.match(a, /A NEW entry, line, medicine or instruction is ALWAYS insert_after \(never append, never set\)/);
   assert.match(a, /never add one that was not said/);
-  assert.match(a, /already in that section, ask whether\s+to change it or add another entry/);
+  // (approved change: an ADD of a medicine already there adds a new line; the existing entry is never changed)
+  assert.match(a, /a command that ADDS a medicine always adds a NEW line, also when the same\s+medicine is already in that section/);
   assert.match(a, /The app cannot see the selected text or the cursor/);
   // a new medicine goes after the LAST medicine entry (the list's last item), not after review / follow-up lines
   assert.match(a, /No position said: it goes right after the LAST\s+MEDICINE entry of the section/);
@@ -128,4 +129,43 @@ test('command schema =the existing schema + understood (required) + language + a
   assert.deepEqual(Object.keys(s.properties).sort(), ['all_words', 'edits', 'heard', 'language', 'summary', 'understood']);
   assert.deepEqual(s.required, ['edits', 'summary', 'understood']);
   assert.equal(JSON.stringify(base), copy);
+});
+
+test('adding a medicine (Option A): missing parts are not a reason to ask; name or section unclear -> ask; nothing invented; never in uploads', () => {
+  const NEW = /A missing strength, route, frequency, food timing or duration is NOT a reason to ask/;
+  for (const a of [commandAddon(), commandAddon({ cursorBlock: 'B7', recent: ['add tab test 5 mg to advice'] })]) {
+    assert.match(a, NEW);
+    assert.match(a, /add the line with only what was said, and write words such as\s+"as prescribed" or "as directed" as said\./);
+    // "Still ask" (not "Ask only"): Option A never overrides the name, section or duplicate questions
+    assert.match(a, /Still ask when the medicine name is missing or unclear\. This rule never\s+allows skipping that question\./);
+    // no section said: the discharge-medicine section (Advice ...), no section question; Treatment Given only when named
+    assert.match(a, /No section said \(and none shown by the cursor\): the section where the discharge medicines are listed \(Advice,\s+Discharge Medications, Medications on Discharge \.\.\.\); do not ask which section\. Treatment Given \(what was given in\s+hospital\) only when it is named\. Ask about the section only when the document has no such section\./);
+    assert.match(a, /\(Adding a NEW medicine without a section is the exception: see "Adding a medicine" below\.\)/);
+    // a medicine line said on its own = add it
+    assert.match(a, /A medicine line said on its own, without an action word \(e\.g\. "Tab\. Amoxil 500 mg oral once daily before food"\),\s+means: add it\./);
+    assert.doesNotMatch(a, /Ask only when/);
+    // the existing medicine safety lines are still there, word for word
+    assert.match(a, /Adding a medicine: one new line, in the style of the existing lines, with ONLY what was said \(name, and any strength,\s+route, frequency, timing or duration that was said\); never add one that was not said\./);
+    // form and unit only when said; the name exactly as said
+    assert.match(a, /Write the medicine name\s+exactly as said, a form \(Tab\. \/ Cap\. \/ Syp\. \.\.\.\) only when it was said, and a unit \(mg, mcg, g, ml \.\.\.\) only when\s+it was said with that number \("Dolo 650" -> "DOLO 650", never "DOLO 650 mg"\)\./);
+    // duplicates: ask, no edit; duplicate_ok only for an explicit other entry; never replace to add
+    // an ADD always adds a new line (no duplicate question); the existing entry is never changed
+    assert.match(a, /- The same medicine already there: a command that ADDS a medicine always adds a NEW line, also when the same\s+medicine is already in that section; set duplicate_ok = true and do not ask\. Never change, replace or remove the\s+existing entry in order to add the new one\./);
+    assert.doesNotMatch(a, /ask whether to change it or add another entry/);
+    // existing medicines: only the named part changes
+    assert.match(a, /Changing an existing medicine: change only the part the command names\. Its name, form \(Tab\. \/ Cap\. \/ Syp\. \.\.\.\),\s+strength, route, frequency, food timing and duration stay exactly as they are unless the command says to change them\./);
+    // advice sentences stay ordinary lines
+    assert.match(a, /A sentence of advice that is not a medicine to take \(e\.g\. "Do not stop medication without cardiologist advice",\s+"Continue medication as directed by the treating physician", "Come after the medicine completes"\) is ONE ordinary\s+line, written as said: never a medicine entry \(no Tab\. \/ Cap\., no dashes, no dose, route or frequency added\) and\s+never inside or between the medicine entries\. No position said: after the last line of the section\./);
+    assert.match(a, /"Remove the medicine" without saying which one: ask "Which medicine should\s+be removed\?"/);
+    assert.match(a, /never invent values, ask when\s+anything is unclear/);
+    // the earlier "several medicine sections: ask which" rule is gone (approved change)
+    assert.doesNotMatch(a, /several medicine sections/);
+  }
+  // the base prompt keeps "never fill a gap from medical knowledge" (typed, Live voice and backup voice all use it)
+  const build = loadBuildExtractPrompt();
+  for (const [k, args] of Object.entries(CASES)) {
+    const p = build(...args);
+    assert.match(p, /Never fill a gap from medical knowledge: never add a dose, strength, route, frequency, duration, unit, lab value/, k);
+    assert.doesNotMatch(p, NEW, k); // uploads: the base prompt alone, which never contains the new rule
+  }
 });

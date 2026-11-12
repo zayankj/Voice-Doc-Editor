@@ -119,6 +119,7 @@ ${earlier}
 - summary, understood and any question are ALWAYS in simple English, whatever the language of the command.
 - Never widen the scope: "all / every medicine" only when the command itself says all or every (in any language).
   A command that does not say which medicine, field or section (and the cursor does not show it) is unclear: ask.
+  (Adding a NEW medicine without a section is the exception: see "Adding a medicine" below.)
 - Adding a general instruction is not a prescription. When the command asks to add a general treatment instruction
   without a medicine name (e.g. "add a ringworm ointment, apply it before sleep", "drink plenty of water"), add ONE
   new line to the section said (Advice when no section is said), in simple English, using only what was said, e.g.
@@ -151,11 +152,30 @@ ${earlier}
   goes after; when that block has several lines (line breaks), find_text = the exact line it goes after. No position
   said: after the last line of the section. append only continues the SAME line (e.g. ", TYPHOID" after a diagnosis).
 - Adding a medicine: one new line, in the style of the existing lines, with ONLY what was said (name, and any strength,
-  route, frequency, timing or duration that was said); never add one that was not said. If a medicine with the same
-  name is already in that section, ask whether to change it or add another entry; set duplicate_ok = true only when
-  the command clearly asks for another entry of the same medicine. No position said: it goes right after the LAST
+  route, frequency, timing or duration that was said); never add one that was not said. Write the medicine name
+  exactly as said, a form (Tab. / Cap. / Syp. ...) only when it was said, and a unit (mg, mcg, g, ml ...) only when
+  it was said with that number ("Dolo 650" -> "DOLO 650", never "DOLO 650 mg").
+  A missing strength, route, frequency, food timing or duration is NOT a reason to ask (for these parts this replaces
+  "a new value is missing" in the rules above): add the line with only what was said, and write words such as
+  "as prescribed" or "as directed" as said. Still ask when the medicine name is missing or unclear. This rule never
+  allows skipping that question.
+  No section said (and none shown by the cursor): the section where the discharge medicines are listed (Advice,
+  Discharge Medications, Medications on Discharge ...); do not ask which section. Treatment Given (what was given in
+  hospital) only when it is named. Ask about the section only when the document has no such section.
+  A medicine line said on its own, without an action word (e.g. "Tab. Amoxil 500 mg oral once daily before food"),
+  means: add it.
+  No position said: it goes right after the LAST
   MEDICINE entry of the section (block_id = that entry; when the medicines are a numbered or bullet list, its last
   item), never after a review / follow-up line or other advice below the medicines.
+- The same medicine already there: a command that ADDS a medicine always adds a NEW line, also when the same
+  medicine is already in that section; set duplicate_ok = true and do not ask. Never change, replace or remove the
+  existing entry in order to add the new one.
+- Changing an existing medicine: change only the part the command names. Its name, form (Tab. / Cap. / Syp. ...),
+  strength, route, frequency, food timing and duration stay exactly as they are unless the command says to change them.
+- A sentence of advice that is not a medicine to take (e.g. "Do not stop medication without cardiologist advice",
+  "Continue medication as directed by the treating physician", "Come after the medicine completes") is ONE ordinary
+  line, written as said: never a medicine entry (no Tab. / Cap., no dashes, no dose, route or frequency added) and
+  never inside or between the medicine entries. No position said: after the last line of the section.
 - Age and gender: Patient Details (the header) are the source. When the text to write states another age or gender,
   write it as said - the app puts the Patient Details age / gender into it - and NEVER change Patient Details or any
   other section because of it. Change Patient Details (and the other places) only when the command explicitly asks

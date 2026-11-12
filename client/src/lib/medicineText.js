@@ -35,7 +35,7 @@ const CLEAR_ALL = /\b(everything|all(?: of)?(?: the)? (?:content|contents|text|d
 
 // ---------- medicine forms ----------
 // Medicine forms written at the start of an entry, and the words people use for them in a command
-const FORMS = [
+export const FORMS = [
   { key: 'tab', line: 'tab|tabs|tablet|tablets', said: 'tab|tabs|tablet|tablets' },
   { key: 'cap', line: 'cap|caps|capsule|capsules', said: 'cap|caps|capsule|capsules' },
   { key: 'syp', line: 'syp|syr|syrup|syrups', said: 'syp|syrup|syrups' },
@@ -46,12 +46,12 @@ const FORMS = [
   { key: 'sachet', line: 'sachet|sachets|powder', said: 'sachet|sachets|powder|powders' },
   { key: 'inhaler', line: 'inhaler|neb|nebulisation|nebulization|spray|rotacap', said: 'inhaler|inhalers|nebulisation|nebulization|spray|sprays' },
 ];
-const FORM_AT_START = new RegExp(`^\\s*(${FORMS.map((f) => f.line).join('|')})\\.?\\s+`, 'i');
-const formKeyOf = (word) => FORMS.find((f) => new RegExp(`^(?:${f.line})$`, 'i').test(word.trim()))?.key || null;
+export const FORM_AT_START = new RegExp(`^\\s*(${FORMS.map((f) => f.line).join('|')})\\.?\\s+`, 'i');
+export const formKeyOf = (word) => FORMS.find((f) => new RegExp(`^(?:${f.line})$`, 'i').test(word.trim()))?.key || null;
 // A NEW medicine starting in the middle of a line: "... 2 daysTab. METRONIDAZOLE ..." (needs the dot)
 const MID_START = /(?:Tab|Tabs|Cap|Caps|Syp|Syr|Inj|Susp)\.\s+(?=[A-Za-z(])/gi;
 // A strength / amount: "200 mg", "10 ml", "2 scoops"
-const STRENGTH = /\b\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|gm|ml|iu|units?|scoops?|puffs?|drops?|sachets?|tabs?|caps?)\b/i;
+export const STRENGTH = /\b\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|gm|ml|iu|units?|scoops?|puffs?|drops?|sachets?|tabs?|caps?)\b/i;
 
 // ---------- generic names (brackets right after the brand) ----------
 //   "Tab. CIPLOX (Ciprofloxacin) 200 mg ..." -> "(Ciprofloxacin)". The bracket must be the FIRST bracket of
@@ -144,7 +144,7 @@ export const DOSING_PATTERN =
   /\(\s*[0-4½](?:\s*-\s*[0-4½]){2,3}\s*\)|(?<![\d½-])[0-4½](?:-[0-4½]){2,3}(?![\d½-])/g;
 
 const sortedTerms = (terms) => [...terms].sort((a, b) => b.length - a.length);
-const categoryRegex = (key) =>
+export const categoryRegex = (key) =>
   new RegExp(`(?<![A-Za-z0-9])(?:${sortedTerms(CATEGORIES[key].terms).join('|')})(?![A-Za-z0-9])`, 'gi');
 
 // Which category does one example term belong to? "Oral" -> 'route', "Twice Daily" -> 'frequency', "SOS" -> 'as_needed'
@@ -210,7 +210,7 @@ export function sectionEntries(doc, section) {
 
 export const MEDICINE_TITLE = /\b(advice|medication|medications|medicine|medicines|treatment|drugs?|prescription|rx)\b/i;
 
-const isMedicineEntry = (text, medicineSection) =>
+export const isMedicineEntry = (text, medicineSection) =>
   FORM_AT_START.test(text) ||
   (medicineSection && (STRENGTH.test(text) || Boolean(findGenericBracket(text, { allowWithoutForm: true }))) && /^\s*[A-Za-z]/.test(text));
 

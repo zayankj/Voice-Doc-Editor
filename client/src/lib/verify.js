@@ -1,6 +1,10 @@
 import { getBlocks } from './outline.js';
 import { getSections, sectionOf, findSectionsInCommand, nameWords } from './sections.js';
 import { cellAt, dataCellRole, rowName, rowNames } from './tables.js';
+import {
+  FORMS, FORM_AT_START, formKeyOf, CATEGORIES, categoryRegex, categoryOfTerm, isMedicineEntry, brandOf, findGenericBracket,
+  sectionEntries,
+} from './medicineText.js';
 
 // Checks the AI's edits BEFORE they are applied.
 //
@@ -218,10 +222,20 @@ function wordsToDigits(t) {
   return s.replace(/\b(\d+) point (\d+)\b/g, '$1.$2');
 }
 
-// Every number the command states, also spoken ones: "5 lakh 86 thousand" -> 586000 (and 5, 86)
+// A number written right next to a unit or ending ("500mg", "1.5g", "5days", "20th") is split from it, so the
+// number is read. Only these known units / endings ("b12", "d3" stay one word, as before).
+const UNIT_SUFFIX = 'mg|mgs|mcg|µg|ug|g|gm|gms|kg|ml|mls|iu|units?|days?|weeks?|wks?|months?|years?|yrs?|hrs?|hours?|mins?|minutes?|tabs?|caps?|puffs?|drops?|scoops?|sachets?|st|nd|rd|th|lakhs?|lacs?';
+const splitUnits = (t) => String(t).replace(new RegExp(`(\\d)(${UNIT_SUFFIX})(?![a-z])`, 'gi'), '$1 $2');
+// (Spoken "six fifty" stays 6 and 50, never 650: it could also mean 6.50. Refused, never guessed - as before.)
+
+// Every number the command states, also spoken ones: "5 lakh 86 thousand" -> 586000 (and 5, 86); "500mg" -> 500
 export function numbersSaid(command) {
+  return numbersOf(splitUnits(String(command || '').toLowerCase()));
+}
+
+function numbersOf(text) {
   // (a full stop at the end of a sentence is not part of the number: "... to 2.2.")
-  const words = wordsToDigits(String(command || '').toLowerCase()).split(/[^a-z0-9.]+/)
+  const words = wordsToDigits(text).split(/[^a-z0-9.]+/)
     .map((w) => w.replace(/^\.+|\.+$/g, '')).filter(Boolean);
   const out = new Set();
   let total = null;
@@ -342,4 +356,395 @@ export function checkTableEdits(doc, command, edits) {
     out.push(e);
   }
   return { edits: out, blocked };
+}
+
+// =====================================================================================================================
+// MEDICINE SAFETY for typed and spoken commands (never file uploads): checkMedicineEdits(doc, { said, extra, edits })
+//
+// Every edit that adds or changes text in a medicine section (Advice, Medications, Treatment ...) is checked against
+// the PERSON'S OWN WORDS (`said`: the typed text and / or the voice transcript). Nothing is guessed:
+//   a NEW medicine entry (a line starting with Tab. / Cap. / ..., or with a strength, dosing pattern or generic bracket):
+//     - name: the name from the AI is used for now (not matched; proper name rules come later). Placeholders
+//       ("NEW MEDICINE") are refused.
+//     - optional details NOT said are REMOVED from the line (not refused): form (Tab. / Cap. / Syp. ...; "tablet" =
+//       Tab.), generic / description bracket, route, frequency, food timing, as needed (the controlled lists of
+//       medicineText.js, in any of the equivalent forms: "BD" = "twice a day" = "Twice Daily"; "orally" = "Oral"),
+//       and phrases such as "as directed", "as prescribed"
+//     - every number said; every dosing pattern said; every number WITH ITS UNIT said (strict: "650" said -> "650 mg"
+//       is refused; mg = milligram, ml = millilitre ...); durations with their unit ("5 days" needs 5 days said)
+//     - an ADD of a medicine already in that section (name or generic) always adds a NEW line; the existing entry is
+//       never changed. (Any other operation still asks, unless the words explicitly ask for another entry.)
+//       duplicate_ok is set from this check, never from the AI's own flag.
+//   a CHANGED medicine entry: everything new follows the rules above; a part that disappears or is replaced (name,
+//     form, number, route, frequency, food timing, as needed, generic) needs the command to name that kind of part
+//   a REMOVED medicine entry: its name must be in the command
+//   an ordinary ADVICE line (not a medicine entry): no invented route / frequency / food / as-needed words or phrases,
+//     and a medicine named inside it ("... Tab. DOLO ...") must have been said. Numbers are not checked here (dates).
+// `extra` (only for commands the app cannot read word by word, e.g. Malayalam): the AI's plain-English restatement,
+// used ONLY for route / frequency / food / as-needed words and phrases - never for names, forms, numbers or units.
+// Those commands always end in a window that the person checks before Apply.
+//
+// Returns { medicine: boolean (a medicine entry is added, changed or removed), newEntries: [indexes of `edits` that add
+// a new line of a medicine that is already there], edits: [the edits, with the details nobody said removed from new
+// medicine lines - App.jsx applies THESE], reject?: 'message' }.
+// One failing check refuses the WHOLE command (all or nothing).
+
+const MED_SECTION = /\b(advice|medication|medications|medicine|medicines|treatment|drugs?|prescription|rx)\b/i; // = MEDICINE_SECTION
+const WORDS_ONLY = new Set(['append', 'insert_after', 'set', 'replace_text', 'clear']);
+const ADD_OPS = new Set(['insert_after', 'append']); // operations that only ADD text (existing lines stay as they are)
+
+// units, with the words people say for them
+const UNIT_CANON = [
+  ['mg', 'mg|mgs|milligrams?'], ['mcg', 'mcg|µg|ug|micrograms?'], ['g', 'g|gm|gms|grams?'], ['kg', 'kg|kilograms?'],
+  ['ml', 'ml|mls|millilit(?:re|er)s?'], ['iu', 'iu|i\\.u\\.|international units?'], ['unit', 'units?'],
+  ['day', 'days?'], ['week', 'weeks?|wks?'], ['month', 'months?'], ['year', 'years?|yrs?'], ['hour', 'hours?|hrs?'],
+  ['min', 'mins?|minutes?'], ['tab', 'tabs?|tablets?'], ['cap', 'caps?|capsules?'], ['puff', 'puffs?'], ['drop', 'drops?'],
+  ['scoop', 'scoops?'], ['sachet', 'sachets?'],
+];
+const UNIT_RE = () => new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${UNIT_CANON.map(([, r]) => r).join('|')})(?![a-z])`, 'gi');
+const unitKey = (u) => UNIT_CANON.find(([, r]) => new RegExp(`^(?:${r})$`, 'i').test(u))?.[0] || u.toLowerCase();
+
+// the person's words, ready for matching: lower case, numbers split from units, spoken numbers as digits; also with
+// "a week" read as "1 week" (the reading without it stays, so "twice a day" is still a frequency)
+function saidForms(text) {
+  const digits = wordsToDigits(splitUnits(String(text || '').toLowerCase()));
+  return [...new Set([digits, digits.replace(/\b(?:a|an)\s+(day|week|month|year|hour)\b/g, '1 $1')])];
+}
+const pairsIn = (text) => new Set([...splitUnits(String(text || '')).matchAll(UNIT_RE())].map((m) => `${parseFloat(m[1])} ${unitKey(m[2])}`));
+// in the words said, the whole number before a unit counts ("6 hundred 50 mg" -> 650 mg)
+const NUM_PART = '(?:\\d+(?:\\.\\d+)?|hundred|thousand|lakhs?|lacs?|crores?|million|and)';
+const SAID_UNIT_RE = () => new RegExp(`(${NUM_PART}(?:\\s+${NUM_PART})*)\\s*(${UNIT_CANON.map(([, r]) => r).join('|')})(?![a-z])`, 'gi');
+const saidPairsIn = (text) => new Set([...String(text || '').matchAll(SAID_UNIT_RE())]
+  .flatMap((m) => numbersOf(m[1]).map((n) => `${n} ${unitKey(m[2])}`)));
+
+// route / frequency / food / as needed: every term, as a canonical value ("frequency:x2"), so equivalent forms match
+const NUM_WORD = { four: 4, six: 6, eight: 8, twelve: 12 };
+function canonTerm(key, term) {
+  const t = term.toLowerCase().replace(/[().]/g, '').replace(/\s+/g, ' ').trim();
+  if (key === 'route') {
+    if (/^(?:per oral|per os|orally|oral|po)$/.test(t)) return 'oral';
+    if (/^(?:intravenous(?:ly)?|iv)$/.test(t)) return 'iv';
+    if (/^(?:intramuscular(?:ly)?|im)$/.test(t)) return 'im';
+    if (/^(?:subcutaneous(?:ly)?|sc)$/.test(t)) return 'sc';
+    if (/^(?:topical(?:ly)?|local application|locally)$/.test(t)) return 'topical';
+    if (/inhal|nebuli/.test(t)) return 'inhaled';
+    if (/^(?:sublingual(?:ly)?|s\/l)$/.test(t)) return 'sublingual';
+    if (/rect/.test(t)) return 'rectal';
+    if (/nasal/.test(t)) return 'nasal';
+    return t;
+  }
+  if (key === 'frequency') {
+    const per = '(?: daily| a day| per day| in a day)';
+    if (new RegExp(`^(?:(?:once|1 time)${per}|daily|every day|od)$`).test(t)) return 'x1';
+    if (new RegExp(`^(?:(?:twice|2 times)${per}|bd|bid)$`).test(t)) return 'x2';
+    if (new RegExp(`^(?:(?:thrice|three times|3 times)${per}|thrice|tds|tid)$`).test(t)) return 'x3';
+    if (new RegExp(`^(?:(?:four times|4 times)${per}|qid|qds)$`).test(t)) return 'x4';
+    if (/^(?:hs|qhs|at bedtime)$/.test(t)) return 'bedtime';
+    if (/^(?:weekly|once weekly|once a week)$/.test(t)) return 'week1';
+    if (/^(?:twice weekly|twice a week)$/.test(t)) return 'week2';
+    if (/^(?:on alternate days?|alternate days?|every other day)$/.test(t)) return 'alternate';
+    const h = t.match(/^(?:every (\d+|four|six|eight|twelve) (?:hours|hrs|hourly)|(\d+|four|six|eight|twelve) hourly|q(\d+)h)$/);
+    if (h) { const n = h[1] || h[2] || h[3]; return `every${NUM_WORD[n] || n}h`; }
+    return t;
+  }
+  if (key === 'as_needed') return 'as needed';
+  if (key === 'food') {
+    if (/empty stomach/.test(t)) return 'empty stomach';
+    const f = t.match(/(after|before|with) (food|meals?|breakfast|lunch|dinner)$/);
+    return f ? `${f[1]} ${/^meals?$/.test(f[2]) ? 'food' : f[2]}` : t;
+  }
+  return t;
+}
+const CATEGORY_NAME = { route: 'route', frequency: 'frequency', as_needed: '"as needed" (SOS)', food: 'food timing' };
+function termsIn(text) {
+  const out = new Map(); // "frequency:x2" -> the words as written
+  for (const key of Object.keys(CATEGORIES)) {
+    for (const m of String(text || '').matchAll(categoryRegex(key))) out.set(`${key}:${canonTerm(key, m[0])}`, m[0].trim());
+  }
+  return out;
+}
+// words of a kind of part, for "the command names this kind of part"
+const PART_WORDS = {
+  route: /\b(?:route|routes)\b/i, frequency: /\b(?:frequenc(?:y|ies)|how often|times?|timings?|schedule)\b/i,
+  as_needed: /\b(?:as needed|sos|prn|when required|if needed)\b/i, food: /\b(?:food|meals?|stomach|timings?)\b/i,
+};
+// "as directed / as prescribed / as advised / as per doctor": never added unless said
+const PHRASE_RE = () => /\bas\s+(?:directed|prescribed|advised|instructed)\b|\bas\s+per\s+(?:the\s+)?(?:doctor|physician|consultant|advice)\b/gi;
+const phrasesIn = (text) => new Set([...String(text || '').matchAll(PHRASE_RE())].map((m) => m[0].toLowerCase().replace(/\s+/g, ' ')));
+
+// names: words as plain() writes them; "a new entry / a new line / another entry / a second entry / a separate line"
+// = explicitly another entry ("again", "another Dolo" alone are not)
+const PLACEHOLDER = new Set(['new', 'medicine', 'medicines', 'medication', 'medications', 'drug', 'drugs', 'test', 'name', 'placeholder',
+  'unknown', 'sample', 'dummy', 'brand', 'entry', 'item', 'xyz', 'abc', 'another', 'some', 'other']);
+const FORM_WORD = new RegExp(`^(?:${FORMS.map((f) => `${f.line}|${f.said}`).join('|')})$`, 'i');
+const ANOTHER_ENTRY = /\b(?:new|another|second|2nd|separate|additional|one more)\s+(?:separate\s+|new\s+)?(?:entry|entries|line)\b/i;
+const nameWordsOf = (t) => plain(t).trim().split(' ').filter((w) => w && !/^\d/.test(w) && !FORM_WORD.test(w) && !categoryOfTerm(w));
+// medicine named inside an ordinary sentence: "... Tab. DOLO ..." (form word, then the name)
+const MID_MEDICINE = /\b(tab|tabs|tablet|tablets|cap|caps|capsule|capsules|syp|syr|syrup|inj|injection|susp|suspension)\.?\s+([A-Za-z][A-Za-z0-9-]*)/gi;
+const DETAIL_WORDS = /\b(?:doses?|dosages?|strengths?|durations?|days?|weeks?|months?|mg|mcg|ml|g|grams?|units?|quantity)\b/i;
+const FORM_PART = /\b(?:form|formulation)\b/i;
+const GENERIC_PART = /\b(?:generics?|salt|composition|brackets?)\b/i;
+
+// The text of a block, one entry per line (line breaks -> "\n")
+const blockLines = (node) => node.textBetween(0, node.content.size, '\n', '\n').split('\n').map((l) => l.trim()).filter(Boolean);
+const linesOfValue = (t) => String(t).split('\n').map((l) => l.trim()).filter(Boolean);
+
+export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = {}) {
+  const blocks = getBlocks(doc);
+  const sections = getSections(doc);
+  const forms = saidForms(said);
+  const saidPlain = plain(said).trim();
+  const saidList = saidPlain ? saidPlain.split(' ') : [];
+  const saidWords = new Set(saidList);
+  const saidJoins = new Set();
+  for (let i = 0; i < saidList.length; i++) for (let k = 1; k <= 4 && i + k <= saidList.length; k++) saidJoins.add(saidList.slice(i, i + k).join(''));
+  const saidNumbers = [...new Set([...numbersSaid(said), ...forms.flatMap(numbersOf)])]; // + "for a week" = 1
+  const saidPatterns = patternsSaid(said);
+  const saidPairs = new Set(forms.flatMap((f) => [...saidPairsIn(f)]));
+  const saidTerms = new Set(forms.flatMap((f) => [...termsIn(f).keys()]));
+  const saidPhrases = new Set(phrasesIn(said));
+  if (extra) {
+    for (const k of termsIn(wordsToDigits(String(extra).toLowerCase())).keys()) saidTerms.add(k);
+    for (const p of phrasesIn(extra)) saidPhrases.add(p);
+  }
+  const anyTermOf = (key) => [...saidTerms].some((k) => k.startsWith(`${key}:`)) || PART_WORDS[key].test(said);
+  const nameSaid = (words) => words.length > 0 && (saidJoins.has(words.join('')) || words.every((w) => saidWords.has(w)));
+  const formSaid = (key) => {
+    const f = FORMS.find((x) => x.key === key);
+    return !f || new RegExp(`\\b(?:${f.line}|${f.said})\\b`, 'i').test(said);
+  };
+  const NAME = (t) => t.toUpperCase();
+  const refuse = (section, why) => ({ medicine: true, reject: `${section}: ${why}. Nothing was changed. Please say it again with only the details you want` });
+  let medicine = false;
+  const newEntries = new Set(); // edits adding a new line of a medicine that is already in that section
+  const out = [...edits]; // the edits, with the details nobody said removed from NEW medicine lines
+  const wasMedicine = new Set(); // cleaned lines that were medicine lines before cleaning
+
+  // A NEW medicine line: the optional details the AI added that were NOT said are REMOVED (not the whole command
+  // refused): a form at the start (Tab. / Cap. ...), a generic / description bracket, route, frequency, food timing,
+  // as needed (SOS) and phrases such as "as directed". Numbers, units and dosing patterns are never removed: an
+  // invented one still refuses the command (checked below). The line is only ever shortened, never added to.
+  const FILLER_LEFT = /^(?:\s|\b(?:route|routes|by|the|for|with|at|in|and|of|on|a|an|to)\b|[.;:])*$/i;
+  const tidy = (t) => t.replace(/\(\s*\)/g, ' ')
+    .replace(/\s*([—–,])(?:\s*[—–,])+/g, ' $1') // a run of separators -> the first
+    .replace(/\s+/g, ' ').replace(/\s+,/g, ',')
+    .replace(/^[\s—–,]+|[\s—–,]+$/g, '')
+    .replace(/\s*([—–])\s*/g, ' $1 ').replace(/,(?=\S)/g, ', ')
+    .trim();
+  const trimUnsaid = (line) => {
+    let l = line;
+    let changed = false;
+    const fm = l.match(FORM_AT_START);
+    if (fm && !formSaid(formKeyOf(fm[1]))) { l = l.slice(fm[0].length); changed = true; }
+    const br = findGenericBracket(l, { allowWithoutForm: true });
+    if (br && !nameSaid(nameWordsOf(br.text))) { l = l.slice(0, br.from) + l.slice(br.to); changed = true; }
+    // only AFTER the medicine's name (a name such as "Inj. IV PARACETAMOL" is never cut)
+    const brand = brandOf(l);
+    const cut = brand ? l.indexOf(brand) + brand.length : 0;
+    const parts = l.slice(cut).split(/([—–,])/).map((seg, i) => {
+      if (i % 2) return seg; // a separator
+      if ([...phrasesIn(seg)].some((p) => !saidPhrases.has(p))) { changed = true; return ''; } // "as directed by ..." -> the part
+      let s = seg;
+      for (const key of Object.keys(CATEGORIES)) {
+        // removed only when the person said NOTHING of that kind; a DIFFERENT one than said ("Twice Daily" when "once
+        // daily" was said) is a mistake, not an extra: it stays, and the check below refuses the command
+        const saidKind = [...saidTerms].some((k) => k.startsWith(`${key}:`));
+        s = s.replace(categoryRegex(key), (m) => (saidKind || saidTerms.has(`${key}:${canonTerm(key, m)}`) ? m : ((changed = true), '')));
+      }
+      return s !== seg && FILLER_LEFT.test(s.replace(/\(\s*\)/g, '')) ? '' : s;
+    });
+    return changed ? tidy(l.slice(0, cut) + parts.join('')) : line;
+  };
+
+  // the parts of one line
+  const partsOf = (line) => {
+    const bracket = findGenericBracket(line, { allowWithoutForm: true });
+    const formMatch = line.match(FORM_AT_START);
+    return {
+      name: nameWordsOf(brandOf(line)),
+      generic: bracket ? nameWordsOf(bracket.text) : [],
+      form: formMatch ? formKeyOf(formMatch[1]) : null,
+      formWord: formMatch ? formMatch[1].trim() : '',
+      patterns: (line.match(DOSING_IN_LINE) || []).map((m) => m.replace(/\D/g, '')),
+      numbers: numbersIn(line.replace(DOSING_IN_LINE, ' ')),
+      pairs: pairsIn(line),
+      terms: termsIn(line),
+      phrases: phrasesIn(line),
+    };
+  };
+
+  // the checks for what a line ADDS (everything of a new line; of a changed line only what is new in it)
+  function checkAdded(line, now, before, isMed) {
+    const quoted = `"${line}"`;
+    for (const [k, words] of now.terms) {
+      if (before?.terms.has(k)) continue;
+      if (!saidTerms.has(k)) return `${quoted} contains the ${CATEGORY_NAME[k.split(':')[0]]} "${words}", which was not in your command`;
+    }
+    for (const p of now.phrases) if (!before?.phrases.has(p) && !saidPhrases.has(p)) return `${quoted} contains "${p}", which was not in your command`;
+    if (!isMed) {
+      // (the medicine's NAME is not matched for now: the name from the AI is used - proper name rules come later)
+      for (const m of line.matchAll(MID_MEDICINE)) {
+        if (!formSaid(formKeyOf(m[1]))) return `${quoted} names a medicine form (${m[1]}) that was not in your command`;
+      }
+      return '';
+    }
+    const nameChanged = !before || before.name.join('') !== now.name.join('');
+    if (nameChanged) {
+      if (!now.name.length || now.name.every((w) => PLACEHOLDER.has(w))) return `${quoted} has no real medicine name`;
+      // a NEW medicine: the name from the AI is used (not matched for now; proper name rules come later).
+      // Another name for an EXISTING medicine still needs the new name in the words said.
+      if (before && !nameSaid(now.name)) return `the medicine name ${NAME(now.name.join(' '))} was not in your command (names must match exactly). Please say the medicine name clearly`;
+    }
+    if (now.generic.length && (!before || before.generic.join('') !== now.generic.join('')) && !nameSaid(now.generic)) {
+      return `${quoted} adds "${NAME(now.generic.join(' '))}" in brackets, which was not in your command`;
+    }
+    if (now.form && (!before || before.form !== now.form) && !formSaid(now.form)) {
+      return `${quoted} starts with a medicine form (${now.formWord}) that was not in your command`;
+    }
+    for (const p of now.patterns) {
+      if (!before?.patterns.includes(p) && !saidPatterns.has(p)) return `${quoted} contains the dosing pattern ${p.split('').join('-')}, which was not in your command`;
+    }
+    for (const n of now.numbers) {
+      if (!before?.numbers.includes(n) && !saidNumbers.some((s) => Math.abs(s - n) < 1e-9)) return `${quoted} contains ${n}, which was not in your command`;
+    }
+    for (const pr of now.pairs) {
+      if (!before?.pairs.has(pr) && !saidPairs.has(pr)) return `${quoted} contains "${pr}", which was not in your command (a number needs the same unit as said)`;
+    }
+    return '';
+  }
+
+  // the checks for what disappears from a changed medicine line
+  function checkRemoved(now, before) {
+    const name = NAME(before.name.join(' ') || 'this medicine');
+    // another medicine in its place: only when the command names the old one ("replace DOLO with CROCIN");
+    // then the whole entry is replaced (what is new in it was checked above)
+    if (before.name.join('') !== now.name.join('')) return nameSaid(before.name) ? '' : `it would replace ${name}, which your command did not name`;
+    for (const [k] of before.terms) {
+      if (now.terms.has(k)) continue;
+      const key = k.split(':')[0];
+      if (!saidTerms.has(k) && !anyTermOf(key)) return `it would change or remove the ${CATEGORY_NAME[key]} of ${name}, which your command did not ask for`;
+    }
+    const lostNumber = before.numbers.some((n) => !now.numbers.includes(n)) || [...before.pairs].some((p) => !now.pairs.has(p));
+    if (lostNumber && !saidNumbers.length && !DETAIL_WORDS.test(said)) return `it would change the strength, dose or duration of ${name}, which your command did not ask for`;
+    if (before.patterns.some((p) => !now.patterns.includes(p)) && !saidPatterns.size && !/\bpatterns?\b/i.test(said)) {
+      return `it would change the dosing pattern of ${name}, which your command did not ask for`;
+    }
+    if (before.form && before.form !== now.form && !FORM_PART.test(said) && !(now.form && formSaid(now.form))) return `it would change the form of ${name}, which your command did not ask for`;
+    if (before.generic.length && before.generic.join('') !== now.generic.join('') && !GENERIC_PART.test(said) && !nameSaid(before.generic)) {
+      return `it would change the bracket of ${name}, which your command did not ask for`;
+    }
+    return '';
+  }
+
+  for (const [index, e] of edits.entries()) {
+    if (!WORDS_ONLY.has(e.operation)) continue; // bold / capitals / lists change no words
+    const at = parseInt(String(e.block_id).replace(/\D/g, ''), 10);
+    const b = blocks[at];
+    if (!b || cellAt(doc, b.pos)) continue; // table cells: checkTableEdits
+    const section = sectionOf(sections, at);
+    if (!section || !MED_SECTION.test(section.title)) continue;
+    const title = nice2(section.title.replace(/\s*:\s*$/, ''));
+
+    const isMed = (l) => isMedicineEntry(l, true) || new RegExp(DOSING_IN_LINE.source).test(l);
+    // a NEW line (insert_after): details nobody said are removed from its medicine lines first
+    if (e.operation === 'insert_after' && typeof e.new_value === 'string') {
+      const cleaned = e.new_value.split('\n').map((l) => {
+        if (!isMed(l.trim())) return l;
+        const c = trimUnsaid(l.trim());
+        wasMedicine.add(c); // still checked as a medicine line ("Tab. NEW MEDICINE" -> "NEW MEDICINE": a placeholder)
+        return c;
+      }).join('\n');
+      if (cleaned !== e.new_value) out[index] = { ...e, new_value: cleaned };
+    }
+
+    // the lines of this block before and after the edit
+    const old = blockLines(b.node);
+    const value = String(out[index].new_value ?? '');
+    let next;
+    if (e.operation === 'insert_after') next = [...old, ...linesOfValue(value)];
+    else if (e.operation === 'append') next = linesOfValue(old.join('\n') + value);
+    else if (e.operation === 'set') next = linesOfValue(value);
+    else if (e.operation === 'clear') next = [];
+    else {
+      const text = old.join('\n');
+      const find = String(e.find_text || '');
+      let i = find ? text.indexOf(find) : -1;
+      if (i === -1 && find) i = text.toLowerCase().indexOf(find.toLowerCase());
+      if (i === -1) continue; // not found: the edit itself fails later (nothing changes)
+      next = linesOfValue(text.slice(0, i) + value + text.slice(i + find.length));
+    }
+    // lines that stay exactly the same are not checked
+    const removed = [...old];
+    const added = [];
+    for (const l of next) {
+      const k = removed.indexOf(l);
+      if (k !== -1) removed.splice(k, 1);
+      else added.push(l);
+    }
+
+    // a changed line (as many lines out as in): compared with the line it replaces
+    if (removed.length && removed.length === added.length) {
+      for (let k = 0; k < added.length; k++) {
+        const was = removed[k];
+        const now = added[k];
+        const medNow = isMed(now);
+        const medWas = isMed(was);
+        if (medNow || medWas) medicine = true;
+        const p0 = partsOf(was);
+        const p1 = partsOf(now);
+        const why = checkAdded(now, p1, medWas ? p0 : null, medNow) || (medWas ? checkRemoved(p1, p0) : '');
+        if (why) return refuse(title, why);
+      }
+      continue;
+    }
+    for (const was of removed) {
+      if (!isMed(was)) continue;
+      medicine = true;
+      const name = partsOf(was).name;
+      if (!nameSaid(name)) return refuse(title, `it would remove ${NAME(name.join(' ') || was)}, which your command did not name`);
+    }
+    if (!added.length) continue;
+    // existing medicine entries of this section (for the duplicate check)
+    const existing = sectionEntries(doc, section).map((x) => x.text.trim()).filter((t) => isMedicineEntry(t, true)).map(partsOf);
+    for (const line of added) {
+      const med = isMed(line) || wasMedicine.has(line);
+      const p = partsOf(line);
+      const why = checkAdded(line, p, null, med);
+      if (why) return refuse(title, why);
+      if (!med) continue;
+      medicine = true;
+      // the same medicine already in this section (its name or its generic name): an ADD (insert_after / append) always
+      // adds a NEW line and never changes the existing one (the existing lines stay exactly as they are - see above);
+      // any other operation still asks, unless the words explicitly ask for another entry
+      const keys = [p.name.join(''), p.generic.join('')].filter(Boolean);
+      const same = existing.find((x) => [x.name.join(''), x.generic.join('')].filter(Boolean).some((k) => keys.includes(k)));
+      if (same && !ADD_OPS.has(e.operation) && !ANOTHER_ENTRY.test(said)) {
+        const n = NAME(same.name.join(' '));
+        return {
+          medicine: true,
+          reject: `${n} is already in ${title}. Do you want to change the existing entry, or add another ${n} entry? Nothing was changed. `
+            + `To add a second one, say "add ${n} … as a new entry"`,
+        };
+      }
+      if (same) newEntries.add(index);
+    }
+  }
+  return { medicine, newEntries: [...newEntries], edits: out };
+}
+
+// duplicate_ok follows the PERSON'S words, never the AI's flag: the AI's own duplicate_ok is removed from every edit,
+// and set only on the edits checkMedicineEdits found to be an explicitly asked-for second entry ("as a new entry").
+// Every other edit that adds a medicine already in its section is then asked about by the apply step (voiceEdit.js).
+export function withDuplicateChoice(edits, newEntries = []) {
+  return edits.map((e, i) => {
+    const { duplicate_ok: _fromAi, ...rest } = e;
+    return newEntries.includes(i) ? { ...rest, duplicate_ok: true } : rest;
+  });
+}
+
+// The section title of a block ("ADVICE")
+export function sectionTitleOf(doc, blockId) {
+  const at = parseInt(String(blockId).replace(/\D/g, ''), 10);
+  const s = sectionOf(getSections(doc), at);
+  return s?.title ? nice2(s.title.replace(/\s*:\s*$/, '')) : '';
 }

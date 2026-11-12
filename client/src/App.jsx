@@ -27,7 +27,7 @@ import { applyRemovals, textAfter, removalSummary } from './lib/medicineText';
 import { classifyCommand } from './lib/commandIntent';
 import { understoodFrom, malayalamStop, checkInterpretation, needsPreview, interpretForPreview, englishChecksCannotRead, summaryToShow } from './lib/interpretation';
 import { asOneUndoStep } from './lib/undoStep';
-import { checkNamedSection, checkTableEdits } from './lib/verify';
+import { checkNamedSection, checkTableEdits, checkMedicineEdits, withDuplicateChoice } from './lib/verify';
 import ConfirmChanges from './components/ConfirmChanges';
 import ConfirmClear from './components/ConfirmClear';
 import UploadPreview from './components/UploadPreview';
@@ -35,6 +35,7 @@ import { startLive } from './lib/liveClient';
 import { startCapture } from './lib/audio';
 import { createSegmenter } from './lib/vad';
 import { pcmChunksToWav } from './lib/wav';
+import { voiceTimingLine } from './lib/timing';
 import { exportDocx } from './lib/exportDocx';
 import { todayString } from './lib/tools';
 import { extractEdits, checkFile, FILE_ACCEPT } from './lib/fileExtract';
@@ -115,7 +116,8 @@ export default function App() {
   const live = useRef(null);
   const stopMic = useRef(null);
   const segmenter = useRef(null); // cuts the microphone stream into commands (audio mode)
-  const queue = useRef([]); // finished commands waiting to be sent
+  const queue = useRef([]); // finished commands waiting to be sent: { clip, endedAt }
+  const voiceTiming = useRef(null); // times of the voice command being processed (console line only)
   const working = useRef(false);
   const lastActivity = useRef(0);
   const fileInput = useRef(null);
@@ -687,7 +689,15 @@ export default function App() {
       setNote(`🔒 ${check.reject}`);
       return;
     }
-    const tableCheck = checkTableEdits(doc, command, check.edits);
+    // medicines: names, forms, numbers and units only from the person's words; the AI's restatement counts only for
+    // route / frequency / food / as-needed words (this window is checked by the person before Apply)
+    const med = checkMedicineEdits(doc, { said: original, extra: u, edits: check.edits });
+    if (med.reject) {
+      setNote(`🔒 ${med.reject}`);
+      return;
+    }
+    // the checked edits (details nobody said removed from new medicine lines); duplicate_ok set by the check, never the AI
+    const tableCheck = checkTableEdits(doc, command, withDuplicateChoice(med.edits, med.newEntries));
     const ordered = bottomUp(tableCheck.edits);
     const allowGender = genderChangeAllowed({ instruction: u, heard: original, hasFile: false });
     const lost = medicinesLostByEdits(doc, ordered, allowGender);
@@ -698,6 +708,11 @@ export default function App() {
     }
     const opts = { allowGender, fromFile: false };
     const preview = previewEdits(doc, ordered, opts);
+    // medicine commands are all or nothing
+    if (med.medicine && (tableCheck.blocked.length || preview.blocked.length)) {
+      setNote(`🔒 Nothing was changed: ${[...tableCheck.blocked, ...preview.blocked.map((b) => `${b.field}: ${b.reason}`)].join('; ')}.`);
+      return;
+    }
     if (!preview.items.length && !preview.blocked.length) {
       setNote(`${tableCheck.blocked.length ? `🔒 ${tableCheck.blocked.join('; ')}. ` : ''}No change can be made from this command. Nothing was changed.`);
       return;
@@ -766,6 +781,8 @@ export default function App() {
       // Typed command (no file, no voice): commands done by code are recognised BEFORE calling the AI
       if (!file && !audio && runCodeCommand(text, 'typed')) return true;
 
+      const timing = voice ? voiceTiming.current : null; // voice commands only: numbers for the console line
+      if (timing) timing.requestFrom = performance.now();
       const answer = await extractEdits({
         file,
         instruction: text,
@@ -776,6 +793,7 @@ export default function App() {
         // commands only (never files): where the cursor is, and the commands applied earlier in THIS document
         ...(file ? {} : { cursorBlock: cursorBlockId(), recent: recentCommands.current }),
       });
+      if (timing) timing.answerAt = performance.now();
       const { edits: aiEdits, summary: aiSummary } = answer;
       // heard is the transcript of a VOICE command; for typed text the AI may echo the text, which is not used
       const heard = audio ? answer.heard || '' : '';
@@ -839,9 +857,23 @@ export default function App() {
         setNote(`🔒 ${check.reject}`);
         return true;
       }
+      // H. Medicines (typed and spoken commands, not files): a new or changed medicine line may contain ONLY what the
+      //    person said - name (exactly), form, numbers with their units, route, frequency, food timing, duration,
+      //    phrases; a medicine already there is never added twice unless another entry is explicitly asked for; an
+      //    existing medicine changes only in the part the command names. One failing check refuses the whole command.
+      const words = [text, heard].filter(Boolean).join(' ');
+      const med = file ? { medicine: false } : checkMedicineEdits(editor.state.doc, { said: words, edits: check.edits });
+      if (med.reject) {
+        setNote(`🔒 ${med.reject}`);
+        return true;
+      }
+      //    The edits used from here are the CHECKED ones (med.edits): details nobody said are removed from new medicine
+      //    lines. An ADD of a medicine already there is a new line (duplicate_ok is set by the check, never by the AI's
+      //    own flag; files keep theirs: a file is compared with the list instead).
+      const checked = file ? check.edits : withDuplicateChoice(med.edits, med.newEntries);
       // D. Lab tables: a changed row must be named in the command, and its new number must have been said
       //    (stops a value landing in the wrong row, or a misheard number). Not for files: the file is the source.
-      const tableCheck = file ? { edits: check.edits, blocked: [] } : checkTableEdits(editor.state.doc, [text, heard].filter(Boolean).join(' '), check.edits);
+      const tableCheck = file ? { edits: checked, blocked: [] } : checkTableEdits(editor.state.doc, [text, heard].filter(Boolean).join(' '), checked);
       const edits = tableCheck.edits;
       // when text was moved to the right section, the AI's own summary ("added malaria to the diagnosis") is wrong
       // (commands: the "Understood: ..." sentence is used for the checks only, never shown - Option A)
@@ -869,8 +901,24 @@ export default function App() {
           'the confirmation window: say "remove all medicines from Advice", or name the medicines to remove.');
         return true;
       }
+      // H. (continued) Medicine commands are all or nothing: a change refused by the number check, or by the same
+      //    dry run as Apply (e.g. a medicine already in the section), refuses the whole command. Typed and spoken
+      //    medicine commands that pass every check are applied directly (yellow highlight, History, Undo).
+      if (med.medicine) {
+        if (tableCheck.blocked.length) {
+          setNote(`🔒 Nothing was changed: ${tableCheck.blocked.join('; ')}.`);
+          return true;
+        }
+        const dry = previewEdits(editor.state.doc, ordered, { allowGender, fromFile: false });
+        if (dry.blocked.length) {
+          setNote(`🔒 Nothing was changed: ${dry.blocked.map((b) => `${b.field}: ${b.reason}`).join('; ')}.`);
+          return true;
+        }
+      }
+      const applyFrom = performance.now();
       applyAiEdits({ ordered, allowGender, label, text, heard, file, summary, voice, blockedFirst: tableCheck.blocked, aiEditCount: check.edits.length,
         keptFacts: check.skipped || [] });
+      if (timing) timing.applyMs = performance.now() - applyFrom;
       return true;
     } catch (err) {
       console.error(err);
@@ -918,10 +966,21 @@ export default function App() {
     setProcessing(true);
     try {
       while (queue.current.length) {
-        const clip = queue.current.shift();
+        const { clip, endedAt } = queue.current.shift();
+        const startedAt = performance.now();
         const { base64, seconds } = pcmChunksToWav(clip);
         if (seconds < 0.5) continue;
-        await runAndReport({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
+        const timing = {};
+        voiceTiming.current = timing;
+        const outcome = await runAndReport({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
+        voiceTiming.current = null;
+        // numbers and a fixed outcome word only (lib/timing.js); total = end of speaking (the pause) -> document updated
+        const done = performance.now();
+        console.info(voiceTimingLine({
+          clip_s: seconds, queue_wait_ms: startedAt - endedAt,
+          request_ms: timing.answerAt - timing.requestFrom, browser_ms: done - timing.answerAt, apply_ms: timing.applyMs,
+          total_ms: done - endedAt, outcome,
+        }));
       }
     } finally {
       working.current = false;
@@ -934,7 +993,7 @@ export default function App() {
       showToast('Too many commands waiting. Please wait a moment.');
       return;
     }
-    queue.current.push(clip);
+    queue.current.push({ clip, endedAt: performance.now() }); // endedAt: when the pause ended the command (for the timing line)
     processQueue();
   }
 
