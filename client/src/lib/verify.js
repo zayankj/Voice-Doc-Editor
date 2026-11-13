@@ -517,7 +517,9 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
   const refuse = (section, why) => ({ medicine: true, reject: `${section}: ${why}. Nothing was changed. Please say it again with only the details you want` });
   let medicine = false;
   const newEntries = new Set(); // edits adding a new line of a medicine that is already in that section
-  const out = [...edits]; // the edits, with the details nobody said removed from NEW medicine lines
+  // the edits, with the details nobody said removed from NEW medicine lines (an at_start from the AI is never used)
+  const out = edits.map(({ at_start: _fromAi, before_entry: _aiBefore, ...e }) => e);
+  const addsMedicine = new Map(); // edits that ADD a medicine line -> their section (for "at the top" / "before X")
   const wasMedicine = new Set(); // cleaned lines that were medicine lines before cleaning
 
   // A NEW medicine line: the optional details the AI added that were NOT said are REMOVED (not the whole command
@@ -654,7 +656,7 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
         wasMedicine.add(c); // still checked as a medicine line ("Tab. NEW MEDICINE" -> "NEW MEDICINE": a placeholder)
         return c;
       }).join('\n');
-      if (cleaned !== e.new_value) out[index] = { ...e, new_value: cleaned };
+      if (cleaned !== e.new_value) out[index] = { ...out[index], new_value: cleaned };
     }
 
     // the lines of this block before and after the edit
@@ -713,6 +715,7 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
       if (why) return refuse(title, why);
       if (!med) continue;
       medicine = true;
+      if (ADD_OPS.has(e.operation)) addsMedicine.set(index, { section, title });
       // the same medicine already in this section (its name or its generic name): an ADD (insert_after / append) always
       // adds a NEW line and never changes the existing one (the existing lines stay exactly as they are - see above);
       // any other operation still asks, unless the words explicitly ask for another entry
@@ -729,8 +732,98 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
       if (same) newEntries.add(index);
     }
   }
+  // "add ... at the top / as the first medicine": the new medicine goes before the first one (voiceEdit.js). Set from
+  // the PERSON'S words only (and the AI's plain-English restatement for languages the app cannot read word by word);
+  // it changes only WHERE an added line goes, never what is written.
+  if (addsMedicine.size && (AT_START.test(said) || AT_START.test(extra))) {
+    for (const index of addsMedicine.keys()) out[index] = { ...out[index], at_start: true };
+  }
+  // "add ... before X": X is found in the PERSON'S words (typed or heard), never from where the AI aimed the new line.
+  // Exactly one medicine entry of that section must match; none or several -> ask (nothing is changed, never guessed).
+  for (const [index, { section, title }] of addsMedicine) {
+    const asks = beforeRequests(said, String(out[index].new_value ?? ''));
+    if (!asks.length) continue;
+    const meds = sectionEntries(doc, section).filter((x) => !x.midLine && isMedicineEntry(x.text.trim(), true)).map((x) => x.text.trim());
+    const picks = [...new Set(asks.map((a) => {
+      if (a.first) return meds[0] ?? '';
+      if (a.last) return meds[meds.length - 1] ?? '';
+      return pickEntry(meds, a);
+    }))];
+    if (picks.length > 1) {
+      return { medicine: true, reject: `${title}: your command names more than one place ("before ..."). Nothing was changed. Please say ONE medicine it should go before` };
+    }
+    const [pick] = picks;
+    if (pick && typeof pick === 'string') {
+      const { at_start: _top, ...rest } = out[index];
+      out[index] = { ...rest, before_entry: pick };
+      continue;
+    }
+    const said1 = asks.find((a) => a.text)?.text || '';
+    if (pick?.several) {
+      return { medicine: true, reject: `${title}: more than one medicine matches "${said1}" (${pick.several.join('; ')}). Nothing was changed. Please say which one it should go before, e.g. with its strength` };
+    }
+    return { medicine: true, reject: `${title}: I could not find the medicine "${said1 || 'that you named'}" to put the new medicine before. Nothing was changed. Please say the medicine name as it is written in the list` };
+  }
   return { medicine, newEntries: [...newEntries], edits: out };
 }
+
+// ---------- "before X" ----------
+// "before food / breakfast / bed / starting ..." is a timing (or other wording), never a place in the list
+const BEFORE_RE = /\bbefore\s+((?:(?!\bbefore\b)[^.,;!?\n])+)/gi;
+const BEFORE_TIMING = /^(?:the\s+|a\s+|his\s+|her\s+)?(?:food|foods|meals?|breakfast|lunch|dinner|supper|tea|snacks?|bed|bedtime|sleep|sleeping|going|eating|taking|starting|start|night|morning|evening|noon|surgery|procedure|discharge|exercise|travel|\d)/i;
+const BEFORE_FIRST = /^(?:the\s+)?(?:very\s+)?(?:first|1st)\b|^(?:all|every)\b/i;
+const BEFORE_LAST = /^(?:the\s+)?(?:very\s+)?last\b/i;
+// where the target name ends: "before Dolo in the advice section", "before Pantocid please"
+const BEFORE_STOP = /\s+(?:in|into|under|on|at|of|to|from|inside|within)\s+(?:the\s+)?(?:advice|section|list|discharge|medicines?|medications?|prescription)\b.*$|\s+(?:please|now)\b.*$/i;
+const BEFORE_FILLER = new Set(['the', 'line', 'entry', 'item', 'one', 'medicine', 'medication', 'drug', 'list', 'that', 'this', 'existing']);
+
+// The "before ..." requests of a command: [{ first } | { last } | { text, words, numbers }]. A "before ..." that the
+// new medicine line itself contains (the AI kept it as wording, e.g. "— before starting dialysis") is not a place.
+function beforeRequests(said, addedText) {
+  const out = [];
+  const inLine = plain(addedText);
+  for (const m of String(said || '').matchAll(BEFORE_RE)) {
+    const t = m[1].replace(BEFORE_STOP, '').trim();
+    if (!t || BEFORE_TIMING.test(t)) continue;
+    if (inLine.includes(plain(`before ${t}`))) continue;
+    if (BEFORE_FIRST.test(t)) { out.push({ first: true }); continue; }
+    if (BEFORE_LAST.test(t)) { out.push({ last: true }); continue; }
+    const words = plain(t).trim().split(' ').filter((w) => w && !BEFORE_FILLER.has(w));
+    out.push({ text: t, words, numbers: numbersOf(splitUnits(t.toLowerCase())) });
+  }
+  return out;
+}
+
+// The ONE entry the words name: its brand name (or the generic name in brackets) - every word of it in the words said,
+// or the same letters run together ("pan d" = "PAN-D"). Several match: the numbers said ("Dolo 650") decide.
+// Returns the entry text, { several: [...] } or null.
+function pickEntry(meds, ask) {
+  const set = new Set(ask.words);
+  const joined = ask.words.join('');
+  const named = (w) => w.length > 0 && (w.every((x) => set.has(x)) || w.join('') === joined);
+  let hits = meds.filter((m) => {
+    const name = nameWordsOf(brandOf(m));
+    const br = findGenericBracket(m, { allowWithoutForm: true });
+    return named(name) || (br ? named(nameWordsOf(br.text)) : false);
+  });
+  if (hits.length > 1 && ask.numbers.length) {
+    const byNumber = hits.filter((m) => ask.numbers.every((n) => numbersIn(m).some((x) => Math.abs(x - n) < 1e-9)));
+    if (byNumber.length) hits = byNumber;
+  }
+  if (hits.length === 1) return hits[0];
+  return hits.length ? { several: hits } : null;
+}
+
+// The person asked for the new medicine at the TOP: "at the top", "at the beginning / start", "as the first medicine",
+// "first entry", "position 1". Not "first 3 days" (a duration). ("before X" is found separately: beforeRequests.)
+const AT_START = new RegExp([
+  '\\b(?:at|on|to|in)\\s+(?:the\\s+)?(?:very\\s+)?(?:top|beginning)\\b',
+  '\\bat\\s+the\\s+(?:very\\s+)?start\\b', // not "to start from tomorrow" (an instruction)
+  '\\btop\\s+of\\s+(?:the\\s+)?(?:list|section|medicines?|medications?|advice)\\b',
+  '\\bas\\s+(?:the\\s+)?(?:very\\s+)?(?:first|1st)\\b',
+  '\\b(?:first|1st)\\s+(?:medicine|medication|drug|entry|item|line|position|place|tablet|in\\s+the\\s+list)\\b',
+  '\\b(?:position|item)\\s+(?:1|one)\\b',
+].join('|'), 'i');
 
 // duplicate_ok follows the PERSON'S words, never the AI's flag: the AI's own duplicate_ok is removed from every edit,
 // and set only on the edits checkMedicineEdits found to be an explicitly asked-for second entry ("as a new entry").

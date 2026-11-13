@@ -592,6 +592,17 @@ export function detectMedicineCommand(doc, command) {
 }
 
 // ---------- applying ----------
+// A paragraph that is the ONLY content of a list item (a numbered or bulleted medicine): removing its text must remove
+// the whole ITEM, so no empty numbered entry is left (the numbers of the other items follow by themselves; a list
+// without numbers never gets any). Returns { from, to, listPos, list } for the item, or null when the paragraph is not
+// alone in a list item. `list` is the list node (for "was this its only item?").
+export function listItemOf(doc, paraPos) {
+  const $p = doc.resolve(paraPos);
+  if ($p.depth < 2 || $p.parent.type.name !== 'listItem' || $p.parent.childCount !== 1) return null;
+  const from = $p.before($p.depth);
+  return { from, to: from + $p.parent.nodeSize, listPos: $p.before($p.depth - 1), list: $p.node($p.depth - 1), listParent: $p.node($p.depth - 2) };
+}
+
 // Deletes the selected removals (plus the tidy-up) in ONE step (one Undo). Only characters are deleted;
 // nothing is typed. If any entry changed after the preview was made, NOTHING is applied.
 // Returns { ok, lines } or { ok: false, error }
@@ -620,6 +631,7 @@ export function applyRemovals(editor, plan) {
   }
   // whole medicine entries, worked out per paragraph so the remaining medicines keep exactly one line break
   const goneParagraphs = new Set();
+  const goneItems = new Map(); // list position -> { list, listParent, ranges } (list items that go completely)
   for (const blockIndex of new Set(todo.filter(wholeEntry).map((c) => c.block))) {
     const block = blocks[blockIndex];
     const all = entryCache.get(blockIndex);
@@ -628,7 +640,15 @@ export function applyRemovals(editor, plan) {
     const end = (e) => e.map[e.map.length - 1] + 1;
     const kept = all.filter((e) => !removed.has(e.entry));
     if (!kept.length) {
-      // every medicine of this paragraph goes: remove the paragraph (a table cell keeps one, emptied)
+      // every medicine of this paragraph goes: remove the paragraph (a table cell keeps one, emptied).
+      // The only paragraph of a list item: the whole item goes (no empty numbered entry is left)
+      const item = listItemOf(editor.state.doc, block.pos);
+      if (item) {
+        if (!goneItems.has(item.listPos)) goneItems.set(item.listPos, { ...item, ranges: [] });
+        goneItems.get(item.listPos).ranges.push([item.from, item.to]);
+        goneParagraphs.add(blockIndex);
+        continue;
+      }
       const parent = editor.state.doc.resolve(block.pos).parent;
       if (parent.childCount > 1) {
         deletes.push([block.pos, block.pos + block.node.nodeSize]);
@@ -651,9 +671,19 @@ export function applyRemovals(editor, plan) {
     }
     if (last.entry < all.length - 1) deletes.push([end(last), contentEnd]); // removed lines after the last kept one
   }
+  // list items that go completely; every item of a list goes -> the list goes (inside a table cell or a list item
+  // where it is the only content, an empty paragraph stays in its place)
+  for (const [listPos, g] of goneItems) {
+    if (g.ranges.length < g.list.childCount) deletes.push(...g.ranges);
+    else if (g.listParent.childCount > 1) deletes.push([listPos, listPos + g.list.nodeSize]);
+    else deletes.push([listPos, listPos + g.list.nodeSize, 'paragraph']);
+  }
   deletes.sort((x, y) => y[0] - x[0]);
   let tr = editor.state.tr;
-  for (const [from, to] of deletes) if (to > from) tr = tr.delete(from, to);
+  for (const [from, to, keep] of deletes) {
+    if (keep) tr = tr.replaceWith(from, to, editor.state.schema.nodes.paragraph.create());
+    else if (to > from) tr = tr.delete(from, to);
+  }
 
   const changedBlocks = [...new Set(todo.map((c) => c.block))]
     .filter((i) => !goneParagraphs.has(i))

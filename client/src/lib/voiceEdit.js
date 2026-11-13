@@ -128,6 +128,15 @@ function addMedicineLines(editor, target, newLines, afterLine = null) {
   return addNewLines(editor, target, newLines, afterLine);
 }
 
+// A paragraph that is the ONLY content of a list item: { from, to } of that item, its list and the list's parent, or
+// null. (Same as listItemOf in medicineText.js; kept here so this file needs no other module.)
+function listItemOf(doc, paraPos) {
+  const $p = doc.resolve(paraPos);
+  if ($p.depth < 2 || $p.parent.type.name !== 'listItem' || $p.parent.childCount !== 1) return null;
+  const from = $p.before($p.depth);
+  return { from, to: from + $p.parent.nodeSize, listPos: $p.before($p.depth - 1), list: $p.node($p.depth - 1), listParent: $p.node($p.depth - 2) };
+}
+
 // The position where the list holding this block starts (its outermost list), or null
 function listStartOf(doc, b) {
   const $p = doc.resolve(b.pos);
@@ -141,13 +150,46 @@ function listStartOf(doc, b) {
 // NEW medicines go right after the LAST MEDICINE ENTRY of the section - the next item of a numbered list, never after
 // a "Review after 1 week …" line, a general instruction or the heading. When the place the AI chose IS a medicine
 // entry ("after HYDROXYZINE"), that place is kept.
-function placeNewMedicines(editor, blocks, index, medLines, afterLine = null) {
+// atStart (set by the check in verify.js from the PERSON'S words "at the top" / "as the first medicine", never by the
+// AI): a medicine aimed at the heading (or another non-medicine line) goes BEFORE the FIRST medicine entry instead -
+// the first item of a numbered list (the others renumber by themselves).
+// beforeEntry (set by the check in verify.js from the PERSON'S words "before X", never by the AI): the exact text of
+// the medicine entry X; the new medicine goes directly BEFORE it, whatever place the AI aimed at. X not found (the
+// document changed): nothing is changed.
+function placeNewMedicines(editor, blocks, index, medLines, afterLine = null, atStart = false, beforeEntry = null) {
   const doc = editor.state.doc;
   const target = blocks[index];
+  if (typeof beforeEntry === 'string' && beforeEntry.trim()) {
+    const want = squash(beforeEntry);
+    const area = isHeadingBlock(doc, target) ? bodyUnder(doc, blocks, index) : sectionBlocks(doc, blocks, index);
+    const spots = [];
+    for (const b of area) {
+      if (inTable(doc, b)) continue;
+      linesOf(b.node, b.pos + 1).forEach((l, k) => { if (squash(l.text) === want) spots.push([b, k]); });
+    }
+    if (!spots.length) { // the entry may sit after a label on its line ("Advice : Tab. DOLO ...")
+      for (const b of area) {
+        if (inTable(doc, b)) continue;
+        linesOf(b.node, b.pos + 1).forEach((l, k) => { if (squash(l.text).includes(want)) spots.push([b, k]); });
+      }
+    }
+    if (spots.length !== 1) {
+      return { ok: false, blocked: true, error: `the medicine "${beforeEntry.trim()}" to add before was ${spots.length ? 'found more than once' : 'not found'} in this section. Nothing was changed` };
+    }
+    return addLinesBefore(editor, spots[0][0], medLines, spots[0][1]);
+  }
   const lines = linesOf(target.node, target.pos + 1);
   const spot = afterLine != null ? lines[afterLine]?.text : lines[lines.length - 1]?.text;
   if (!isHeadingBlock(doc, target) && isMedicineLine(spot || '')) return addMedicineLines(editor, target, medLines, afterLine);
   const section = isHeadingBlock(doc, target) ? bodyUnder(doc, blocks, index) : sectionBlocks(doc, blocks, index);
+  if (atStart) {
+    for (const b of section) {
+      if (inTable(doc, b)) continue;
+      const ls = linesOf(b.node, b.pos + 1);
+      const k = ls.findIndex((l) => isMedicineLine(l.text));
+      if (k !== -1) return addLinesBefore(editor, b, medLines, k);
+    }
+  }
   for (let i = section.length - 1; i >= 0; i--) {
     const b = section[i];
     if (inTable(doc, b)) continue;
@@ -276,6 +318,36 @@ function addNewLines(editor, target, newLines, afterLine = null) {
   editor.view.dispatch(tr);
   scheduleClear(editor);
   // before = '' : nothing existing changes, lines are only ADDED
+  return { ok: true, before: '', after: newLines.join('\n'), pos };
+}
+
+// The same, but BEFORE line `beforeLine` of target (a medicine added "at the top"), in the layout of the place:
+//   - a paragraph with line breaks: line + line break, before that line
+//   - a list item: new list items before it (the numbers follow by themselves)
+//   - otherwise: new paragraphs before the block
+function addLinesBefore(editor, target, newLines, beforeLine = 0) {
+  const { pos, node } = target;
+  const schema = editor.schema;
+  const doc = editor.state.doc;
+  const lines = linesOf(node, pos + 1);
+  let tr = editor.state.tr;
+  if (lines.length > 1) {
+    const at = lines[beforeLine].map[0];
+    tr = tr.insert(at, newLines.flatMap((l) => [schema.text(l), schema.nodes.hardBreak.create()]));
+    tr.setMeta(flashKey, { add: { from: pos, to: pos + tr.doc.nodeAt(pos).nodeSize } });
+  } else if (inListItem(doc, target)) {
+    const $p = doc.resolve(pos);
+    const at = $p.before($p.depth); // before the list item
+    const items = newLines.map((l) => schema.nodes.listItem.create(null, schema.nodes.paragraph.create(null, schema.text(l))));
+    tr = tr.insert(at, items);
+    tr.setMeta(flashKey, { add: { from: at, to: at + items.reduce((n, x) => n + x.nodeSize, 0) } });
+  } else {
+    const paragraphs = newLines.map((l) => schema.nodes.paragraph.create(null, schema.text(l)));
+    tr = tr.insert(pos, paragraphs);
+    tr.setMeta(flashKey, { add: { from: pos, to: pos + paragraphs.reduce((n, x) => n + x.nodeSize, 0) } });
+  }
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
   return { ok: true, before: '', after: newLines.join('\n'), pos };
 }
 
@@ -894,8 +966,17 @@ export function applyVoiceEdit(editor, args, opts = {}) {
       if (medLines.length) {
         const dup = isDuplicate(medLines);
         if (dup) return { ok: false, blocked: true, error: dup };
-        return placeNewMedicines(editor, blocks, index, medLines, afterLine);
+        return placeNewMedicines(editor, blocks, index, medLines, afterLine, args.at_start === true, args.before_entry);
       }
+    }
+    // a place asked for by the person ("before X" / "at the top", set by the check in verify.js) is never ignored, also
+    // for a medicine line written without a form ("CETIRIZINE 10 mg": a form nobody said was removed)
+    if ((typeof args.before_entry === 'string' || args.at_start === true) && !fromFile && node.textContent.trim()) {
+      const asked = String(new_value).split(/\r?\n/).map((l) => l.replace(/^[\s,;]+/, '').trim()).filter(Boolean);
+      const dup = isDuplicate(asked);
+      if (dup) return { ok: false, blocked: true, error: dup };
+      if (typeof args.before_entry === 'string') return placeNewMedicines(editor, blocks, index, asked, null, false, args.before_entry);
+      if (isHeadingBlock(editor.state.doc, target)) return placeNewMedicines(editor, blocks, index, asked, null, true);
     }
     // a new line never starts or ends with stray spaces (or a stray comma); several lines -> several new lines
     const newLines = String(new_value).split(/\r?\n/).map((l) => l.replace(/^[\s,;]+/, '').trim()).filter(Boolean);
@@ -920,7 +1001,7 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     if (inMedicineSection(editor.state.doc, blocks, index)) {
       const dup = isDuplicate(newLines);
       if (dup) return { ok: false, blocked: true, error: dup };
-      if (newLines.every(isMedicineLine)) return placeNewMedicines(editor, blocks, index, newLines);
+      if (newLines.every(isMedicineLine)) return placeNewMedicines(editor, blocks, index, newLines, null, args.at_start === true, args.before_entry);
     }
     return addNewLines(editor, target, newLines);
   }
@@ -1052,7 +1133,7 @@ export function applyVoiceEdit(editor, args, opts = {}) {
           const dup = isDuplicate(newMeds);
           if (dup) return { ok: false, blocked: true, error: dup };
           return operation === 'append'
-            ? placeNewMedicines(editor, blocks, index, newMeds, lines.length > 1 ? k : null)
+            ? placeNewMedicines(editor, blocks, index, newMeds, lines.length > 1 ? k : null, args.at_start === true, args.before_entry)
             : addMedicineLines(editor, target, newMeds, lines.length > 1 ? k : null);
         }
       }
@@ -1063,7 +1144,7 @@ export function applyVoiceEdit(editor, args, opts = {}) {
       if (medLines.length) {
         const dup = isDuplicate(medLines);
         if (dup) return { ok: false, blocked: true, error: dup };
-        return placeNewMedicines(editor, blocks, index, medLines);
+        return placeNewMedicines(editor, blocks, index, medLines, null, args.at_start === true, args.before_entry);
       }
       // a new instruction ("Take only if ...", "Avoid oily food.") after a medicine line is a NEW line, never glued
       // onto that medicine: text that starts like a sentence (a capital letter, two or more words), or a whole
@@ -1137,14 +1218,31 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     }
   }
 
-  // Clearing a paragraph of its own (not a table cell, not a list item) when its section has other text: the empty
-  // paragraph goes too (a removed instruction leaves no blank line). A section's only paragraph stays, empty.
-  if (operation === 'clear' && !fromFile && text.trim() && editor.state.doc.resolve(pos).depth === 0 &&
-      sectionBlocks(editor.state.doc, blocks, index).some((b) => b !== target && b.node.textContent.trim())) {
-    const tr = editor.state.tr.delete(pos, pos + node.nodeSize);
-    editor.view.dispatch(tr);
-    scheduleClear(editor);
-    return { ok: true, before, after: '', pos: Math.min(pos, tr.doc.content.size) };
+  // Emptying a block (clear, or set / replace_text that leaves no text) - never for an uploaded file:
+  //   - the only paragraph of a LIST ITEM: the whole item goes, so no empty numbered entry is left (the numbers of the
+  //     other items follow by themselves; a list without numbers never gets any). The list's only item: the list
+  //     goes, or, when nothing else is in the section, an empty paragraph stays in its place.
+  //   - a paragraph of its own (not a table cell) when its section has other text: the empty paragraph goes too (a
+  //     removed instruction leaves no blank line). A section's only paragraph stays, empty.
+  const empties = !fromFile && text.trim() && !after.trim() && (operation === 'clear' || operation === 'set' || operation === 'replace_text');
+  const otherText = () => sectionBlocks(editor.state.doc, blocks, index).some((b) => b !== target && b.node.textContent.trim());
+  if (empties) {
+    const item = listItemOf(editor.state.doc, pos);
+    if (item) {
+      let tr = editor.state.tr;
+      if (item.list.childCount > 1) tr = tr.delete(item.from, item.to);
+      else if (item.listParent.childCount > 1 && otherText()) tr = tr.delete(item.listPos, item.listPos + item.list.nodeSize);
+      else tr = tr.replaceWith(item.listPos, item.listPos + item.list.nodeSize, editor.schema.nodes.paragraph.create());
+      editor.view.dispatch(tr);
+      scheduleClear(editor);
+      return { ok: true, before, after: '', pos: Math.min(item.from, tr.doc.content.size) };
+    }
+    if (editor.state.doc.resolve(pos).depth === 0 && otherText()) {
+      const tr = editor.state.tr.delete(pos, pos + node.nodeSize);
+      editor.view.dispatch(tr);
+      scheduleClear(editor);
+      return { ok: true, before, after: '', pos: Math.min(pos, tr.doc.content.size) };
+    }
   }
 
   const tr = editor.state.tr.insertText(insert, from, to);

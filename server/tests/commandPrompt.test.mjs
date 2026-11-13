@@ -169,3 +169,20 @@ test('adding a medicine (Option A): missing parts are not a reason to ask; name 
     assert.doesNotMatch(p, NEW, k); // uploads: the base prompt alone, which never contains the new rule
   }
 });
+
+test('medicine position and wording rules: in every command prompt, never in the upload prompt', () => {
+  const POS = /A position said: "at the top" \/ "as the first medicine" -> block_id = the section heading \(the app puts it\s+before the first medicine\); "after X" -> block_id = X; "before X" -> block_id = the medicine just before X \(the\s+section heading when X is the first medicine\)\. Adding never replaces an existing entry\./;
+  const WORDS = /Keep every other word said\s+about the medicine \(e\.g\. "TO CONTINUE", "till next review"\) exactly, in the order said; never drop it\./;
+  for (const a of [commandAddon(), commandAddon({ cursorBlock: 'B7', recent: ['add tab test 5 mg to advice'] })]) {
+    assert.match(a, POS);
+    assert.match(a, WORDS);
+    // the default stays: no position said -> after the last medicine; "at the bottom / at the end" -> the same
+    assert.match(a, /No position said: it goes right after the LAST\s+MEDICINE entry of the section/);
+    assert.match(a, /"At the bottom \/ at the end": the\s+same\./);
+  }
+  const build = loadBuildExtractPrompt();
+  for (const [k, args] of Object.entries(CASES)) {
+    assert.doesNotMatch(build(...args), POS, k);
+    assert.doesNotMatch(build(...args), WORDS, k);
+  }
+});

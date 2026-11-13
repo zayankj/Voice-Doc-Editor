@@ -152,7 +152,8 @@ ${earlier}
   goes after; when that block has several lines (line breaks), find_text = the exact line it goes after. No position
   said: after the last line of the section. append only continues the SAME line (e.g. ", TYPHOID" after a diagnosis).
 - Adding a medicine: one new line, in the style of the existing lines, with ONLY what was said (name, and any strength,
-  route, frequency, timing or duration that was said); never add one that was not said. Write the medicine name
+  route, frequency, timing or duration that was said); never add one that was not said. Keep every other word said
+  about the medicine (e.g. "TO CONTINUE", "till next review") exactly, in the order said; never drop it. Write the medicine name
   exactly as said, a form (Tab. / Cap. / Syp. ...) only when it was said, and a unit (mg, mcg, g, ml ...) only when
   it was said with that number ("Dolo 650" -> "DOLO 650", never "DOLO 650 mg").
   A missing strength, route, frequency, food timing or duration is NOT a reason to ask (for these parts this replaces
@@ -166,7 +167,10 @@ ${earlier}
   means: add it.
   No position said: it goes right after the LAST
   MEDICINE entry of the section (block_id = that entry; when the medicines are a numbered or bullet list, its last
-  item), never after a review / follow-up line or other advice below the medicines.
+  item), never after a review / follow-up line or other advice below the medicines. "At the bottom / at the end": the
+  same. A position said: "at the top" / "as the first medicine" -> block_id = the section heading (the app puts it
+  before the first medicine); "after X" -> block_id = X; "before X" -> block_id = the medicine just before X (the
+  section heading when X is the first medicine). Adding never replaces an existing entry.
 - The same medicine already there: a command that ADDS a medicine always adds a NEW line, also when the same
   medicine is already in that section; set duplicate_ok = true and do not ask. Never change, replace or remove the
   existing entry in order to add the new one.
