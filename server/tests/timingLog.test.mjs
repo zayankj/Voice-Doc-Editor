@@ -108,5 +108,9 @@ test('index.js: the Live call, the fallback call and the answers are the same li
   assert.match(index, /console\.warn\(`Voice: Live not used \(\$\{e\?\.message \|\| 'error'\}\) after \$\{Date\.now\(\) - t0\} ms -> existing path`\);\r?\n/);
   assert.match(index, /const answer = await generateWithRetry\(\{\r?\n\s+contents: \[\{ role: 'user', parts \}\],/);
   assert.match(index, /res\.json\(isCommand \? finishCommand\(data, \{ outline, said: \[typed\] \}\) : out\);/);
-  assert.match(index, /console\.log\(`AI: answered by \$\{model\} in \$\{Date\.now\(\) - tryFrom\} ms`\);/); // model name (from .env) and a number
+  // the model log line moved word for word into the model chain (log = console.log): still only the model name
+  // (from .env) and a number
+  const chainSrc = fs.readFileSync(new URL('../modelChain.js', import.meta.url), 'utf8');
+  assert.match(chainSrc, /log\(`AI: answered by \$\{model\} in \$\{Date\.now\(\) - tryFrom\} ms`\);/);
+  assert.match(chainSrc, /log = console\.log/);
 });

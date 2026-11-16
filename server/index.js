@@ -7,6 +7,7 @@ import { liveEnabled, liveDescription, liveExtract } from './liveVoice.js'; // t
 import { timingLine } from './timingLog.js'; // performance lines for the terminal: numbers and fixed labels only
 import { commandAddon, commandSchema, cleanCursorBlock, cleanRecent } from './commandPrompt.js'; // commands only, never uploads
 import { finishCommand } from './scopeGuard.js'; // commands only: scope check + English interpretation in summary
+import { createModelChain, clientGoneSignal, isRetryable, TOTAL_BUDGET_MS } from './modelChain.js'; // model order, time limits, retries
 
 const apiKey = process.env.GEMINI_API_KEY;
 const useVertex = String(process.env.GOOGLE_GENAI_USE_VERTEXAI).toLowerCase() === 'true';
@@ -64,159 +65,13 @@ const MODELS = [
 console.log('Models:', MODELS.join(' -> '));
 console.log(liveDescription());
 
-const PER_TRY_TIMEOUT_MS = 120000; // one try may take up to 2 minutes
-const TOTAL_BUDGET_MS = 240000; // stop trying after 4 minutes in total
-const TRIES_PER_MODEL = 2; // try 1 = streaming, try 2 = normal single request (only after a 503 / broken stream)
-const MAX_CALLS = 6; // most requests sent to Google for ONE command
-
-const noThinking = new Set(); // models that rejected the "low thinking" setting
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const isTimeout = (e) =>
-  e?.name === 'AbortError' ||
-  e?.name === 'TimeoutError' ||
-  e?.cause?.code === 'UND_ERR_HEADERS_TIMEOUT' ||
-  /timeout|timed out|aborted/i.test(String(e?.message));
-
-// Busy, server errors, timeouts, and connections that break halfway are all worth retrying
-const isRetryable = (e) =>
-  [429, 500, 502, 503, 504].includes(e?.status) ||
-  isTimeout(e) ||
-  /fetch failed|Incomplete JSON|ECONNRESET|socket|terminated|Empty answer/i.test(String(e?.message));
-
-// ---------- quota (429) handling ----------
-// model -> time (ms) before which that model is not asked again, because its quota is used up
-const pausedUntil = new Map();
-let sawFreeTier = false;
-
-// Reads the details of a 429 error. Google's message can contain JSON inside JSON,
-// so this searches the plain text instead of parsing it.
-function quotaInfo(e) {
-  const raw = String(e?.message || '');
-  const retry = raw.match(/retryDelay[^\d]{0,16}(\d+(?:\.\d+)?)s/i);
-  const retrySeconds = retry ? parseFloat(retry[1]) : null;
-  return {
-    retrySeconds,
-    daily: /PerDay|per day/i.test(raw) || (retrySeconds ?? 0) > 3600,
-    free: /free[_ ]?tier/i.test(raw),
-  };
-}
-
-// How long to leave a model alone after it answered 429
-function pauseMs(q) {
-  if (q.retrySeconds) return Math.min(q.retrySeconds, 86400) * 1000 + 1000;
-  return (q.daily ? 3600 : 60) * 1000; // no details from Google: 1 hour if daily, otherwise 1 minute
-}
-
-const isPaused = (model) => (pausedUntil.get(model) || 0) > Date.now();
-const allPaused = () => MODELS.every(isPaused);
-
-// Text for the page, based on when the first used-up model is available again
-function quotaMessage() {
-  const times = MODELS.map((m) => pausedUntil.get(m) || 0).filter((t) => t > Date.now());
-  const soonest = times.length ? Math.min(...times) : Date.now() + 30000;
-  const waitMs = Math.max(0, soonest - Date.now());
-  const hint = [
-    sawFreeTier ? 'This API key is on the free tier, which allows only a small number of requests per day.' : '',
-    !useVertex ? 'The company Vertex AI project (Mumbai) avoids this limit.' : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-
-  if (waitMs > 30 * 60 * 1000) {
-    const hours = Math.round(waitMs / 3600000);
-    const clock = new Date(soonest).toLocaleTimeString('en-IN', {
-      hour: 'numeric',
-      minute: '2-digit',
-      timeZone: 'Asia/Kolkata',
-    });
-    return `The request limit is used up for the configured models. It resets in about ${hours} hours (around ${clock} India time). ${hint}`.trim();
-  }
-  const secs = Math.max(15, Math.ceil(waitMs / 1000));
-  return `Rate limit reached. Try again in about ${secs} seconds. ${hint}`.trim();
-}
-
-// The error thrown when every attempt has failed
-function finalError(lastErr, quotaSeen) {
-  if (quotaSeen) return Object.assign(new Error('Quota or rate limit reached'), { status: 429 });
-  return lastErr || Object.assign(new Error('Timed out'), { name: 'TimeoutError' });
-}
-
-// One request. stream=true gets the answer in pieces, stream=false gets it in one go.
-async function tryOnce(model, request, timeoutMs, stream) {
-  const config = { ...request.config, abortSignal: AbortSignal.timeout(timeoutMs) };
-  if (!noThinking.has(model)) config.thinkingConfig = { thinkingLevel: 'LOW' }; // less thinking = faster
-
-  let text = '';
-  if (stream) {
-    const s = await ai.models.generateContentStream({ ...request, model, config });
-    for await (const chunk of s) text += chunk.text || '';
-  } else {
-    const r = await ai.models.generateContent({ ...request, model, config });
-    text = r.text || '';
-  }
-  if (!text.trim()) throw Object.assign(new Error('Empty answer from model'), { status: 503 });
-  return text;
-}
-
-// Tries each model in order, within a time budget and a request budget. Returns the text of the answer.
-async function generateWithRetry(request) {
-  const deadline = Date.now() + TOTAL_BUDGET_MS;
-  let lastErr;
-  let quotaSeen = false;
-  let calls = 0;
-
-  for (const model of MODELS) {
-    if (isPaused(model)) {
-      quotaSeen = true; // its quota is used up: do not ask again yet
-      continue;
-    }
-    for (let attempt = 1; attempt <= TRIES_PER_MODEL; attempt++) {
-      const remaining = deadline - Date.now();
-      if (remaining < 5000 || calls >= MAX_CALLS) throw finalError(lastErr, quotaSeen);
-      calls++;
-      const tryFrom = Date.now();
-      try {
-        const text = await tryOnce(model, request, Math.min(PER_TRY_TIMEOUT_MS, remaining), attempt === 1);
-        console.log(`AI: answered by ${model} in ${Date.now() - tryFrom} ms`); // which model answered and how fast; never content
-        return text;
-      } catch (e) {
-        lastErr = e;
-        if (e?.status === 400 && !noThinking.has(model) && /thinking/i.test(String(e?.message))) {
-          noThinking.add(model); // this model does not accept the thinking setting
-          console.warn(`${model}: thinking setting not accepted, retrying without it`);
-          attempt--;
-          continue;
-        }
-        if (e?.status === 404) {
-          console.warn(`${model} not found -> next model`);
-          break;
-        }
-        if (e?.status === 429) {
-          const q = quotaInfo(e);
-          sawFreeTier = sawFreeTier || q.free;
-          pausedUntil.set(model, Date.now() + pauseMs(q));
-          quotaSeen = true;
-          console.warn(
-            `${model}: ${q.daily ? 'daily' : 'per-minute'} limit reached${q.free ? ' (free tier)' : ''} -> paused for about ${Math.round(pauseMs(q) / 60000)} min, trying next model`
-          );
-          break;
-        }
-        if (isTimeout(e)) {
-          console.warn(`${model} was too slow (no answer in time) -> next model`);
-          break;
-        }
-        if (!isRetryable(e)) throw e; // a real error, do not retry
-        console.warn(
-          `${model} failed (${e?.status || String(e?.message).slice(0, 50)}) - attempt ${attempt}/${TRIES_PER_MODEL}`
-        );
-        if (attempt < TRIES_PER_MODEL) await sleep(3000);
-      }
-    }
-  }
-  throw finalError(lastErr, quotaSeen);
-}
+// The model chain (server/modelChain.js): time limits per try and for the whole request, quota pauses, which
+// errors are retried. One chain for the whole server, so a model found to be paused / missing / without the thinking
+// setting is known to every request.
+const chain = createModelChain({ models: MODELS, ai, useVertex });
+const allPaused = () => chain.allPaused();
+const quotaMessage = () => chain.quotaMessage();
+const generateWithRetry = (request, opts) => chain.generate(request, opts);
 
 // ---------- department templates ----------
 // Only the name, department and AI notes of each template. The browser sends just the template id;
@@ -414,6 +269,10 @@ app.post('/api/extract-edits', async (req, res) => {
     // the same request. Logs only the path, the time and a fixed reason; never audio, transcripts or document text.
     // Timing lines (server/timingLog.js): numbers and fixed labels only; printed here, never sent to the browser
     const requestFrom = Date.now();
+    // aborted ONLY when the gateway / browser really gave up before the answer was sent: then no further model is
+    // asked and nothing is answered. The time budget covers the whole request (Live attempt included).
+    const clientGone = clientGoneSignal(req, res);
+    const deadline = requestFrom + TOTAL_BUDGET_MS;
     let liveTried = false;
     if (hasAudio && !hasFile && !typed && liveEnabled() && (!audioMimeType || audioMimeType === 'audio/wav')) {
       const t0 = Date.now();
@@ -434,6 +293,11 @@ app.post('/api/extract-edits', async (req, res) => {
       }
     }
 
+    if (clientGone.aborted) {
+      console.warn('Request cancelled by the client -> no further model asked');
+      return;
+    }
+
     // Every model's quota is used up: answer straight away instead of sending requests that will fail
     if (allPaused()) {
       return res.status(429).json({ error: quotaMessage() });
@@ -449,7 +313,7 @@ app.post('/api/extract-edits', async (req, res) => {
     const answer = await generateWithRetry({
       contents: [{ role: 'user', parts }],
       config: { responseMimeType: 'application/json', responseSchema: isCommand ? commandSchema(editsSchema) : editsSchema, temperature: 0 },
-    });
+    }, { deadline, signal: clientGone });
     // voice clips only: how long the existing (backup) path took, and the whole request on the server
     if (hasAudio && !hasFile) {
       console.log(timingLine('Backup timing', { backup: 'done', live_tried: liveTried, backup_ms: Date.now() - backupFrom, total_ms: Date.now() - requestFrom }));
@@ -465,6 +329,11 @@ app.post('/api/extract-edits', async (req, res) => {
     // commands (typed, or the backup voice path): scope check + English interpretation in summary. Uploads: as before.
     res.json(isCommand ? finishCommand(data, { outline, said: [typed] }) : out);
   } catch (e) {
+    // the client has gone: there is nobody to answer (never an edit sent later)
+    if (e?.cancelled) {
+      console.warn('Request cancelled by the client -> stopped, no answer sent');
+      return;
+    }
     console.error(e);
     const msg = String(e?.message || '');
 
@@ -483,6 +352,9 @@ app.post('/api/extract-edits', async (req, res) => {
     }
     if (e?.status === 404) {
       return res.status(500).json({ error: 'No listed model was found. Check GEMINI_EXTRACT_MODEL in server/.env.' });
+    }
+    if (e?.name === 'TimeoutError') {
+      return res.status(503).json({ error: 'The AI did not answer in time. Your document has not been changed. Please try again.' });
     }
     if (isRetryable(e)) {
       return res.status(503).json({ error: 'The model is busy or not responding right now. Try again in a minute.' });

@@ -1,4 +1,5 @@
 import { docxToText } from './docxImport.js';
+import { withTimeout, REQUEST_TIMEOUT_MS } from './requestGuard.js';
 
 const MAX_MB = 15;
 
@@ -50,7 +51,10 @@ async function toPayload(file) {
 // so the server uses exactly the same discharge summary prompt as before.
 // cursorBlock / recent: COMMANDS only (never sent with a file): the block the cursor is in ("B12") and up to 3
 // commands applied earlier in the same document. Returns also understood and language for commands.
-export async function extractEdits({ file, instruction = '', audio = null, outline, today, templateId = '', cursorBlock = '', recent = [] }) {
+// signal: cancels the request (e.g. another document was opened). The browser stops waiting after timeoutMs; a
+// time-out or cancel throws a RequestError (lib/requestGuard.js) and the answer is never used.
+export async function extractEdits({ file, instruction = '', audio = null, outline, today, templateId = '', cursorBlock = '', recent = [],
+  signal = null, timeoutMs = REQUEST_TIMEOUT_MS }) {
   const payload = file ? await toPayload(file) : {};
 
   const body = { outline, today, instruction: instruction.trim(), fileName: file?.name, ...payload };
@@ -64,12 +68,16 @@ export async function extractEdits({ file, instruction = '', audio = null, outli
     body.audioMimeType = audio.mimeType;
   }
 
-  const res = await fetch('/api/extract-edits', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
+  // the answer is read inside the time limit too: a stop while it is still arriving also counts
+  const { res, data } = await withTimeout(async (stop) => {
+    const r = await fetch('/api/extract-edits', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: stop,
+    });
+    return { res: r, data: await r.json().catch(() => ({})) };
+  }, { signal, timeoutMs });
   if (!res.ok) throw new Error(data.error || 'Could not apply the edit');
   return data;
 }

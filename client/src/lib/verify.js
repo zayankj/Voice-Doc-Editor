@@ -1,5 +1,5 @@
 import { getBlocks } from './outline.js';
-import { getSections, sectionOf, findSectionsInCommand, nameWords } from './sections.js';
+import { getSections, sectionOf, findSectionsInCommand, nameWords, rawWords, scoreTitle } from './sections.js';
 import { cellAt, dataCellRole, rowName, rowNames } from './tables.js';
 import {
   FORMS, FORM_AT_START, formKeyOf, CATEGORIES, categoryRegex, categoryOfTerm, isMedicineEntry, brandOf, findGenericBracket,
@@ -16,6 +16,8 @@ import {
 //   - table cells (header fields such as Age / Sex) are always allowed (patient facts kept consistent)
 //   - section name unclear while text is being added -> refused with a question
 //   - no section named -> the edits are returned unchanged
+//   - SEVERAL sections, each clearly named in its own part of the command -> every edit must be in a named section
+//     and match that section's part; nothing is moved; anything unclear is asked (checkSeveralSections below)
 //
 // Returns { edits, moved } (edits possibly adjusted; moved = [{ section }] for each moved text)
 //      or { reject: 'message for the Smart Edit panel' }
@@ -52,6 +54,13 @@ function contentFromCommand(command, sectionTitle) {
 export function checkNamedSection(doc, command, edits) {
   if (!command || !edits.length) return { edits, moved: [] };
   const sections = getSections(doc);
+  // A command in clear parts, each naming ONE section ("In diagnosis add X and in follow up change Y"): every edit
+  // must be in a named section and come from that section's part. Anything less clear uses the checks below.
+  const multi = namedParts(sections, command);
+  if (multi?.unclear && edits.some((e) => ADDING.has(e.operation))) {
+    return { reject: `Which section did you mean: ${multi.unclear.map((s) => nice(s.title)).join(' or ')}? Nothing was changed.` };
+  }
+  if (multi?.parts) return checkSeveralSections(doc, sections, multi.parts, edits);
   const found = findSectionsInCommand(sections, command);
   const adding = edits.some((e) => ADDING.has(e.operation));
 
@@ -120,6 +129,125 @@ export function checkNamedSection(doc, command, edits) {
     };
   }
   return { edits: out, moved, skipped };
+}
+
+// ---------- a command that names SEVERAL sections ----------
+// "In diagnosis add ACUTE GASTRITIS and in presenting complaints add vomiting for 2 days."
+// "Add fever to diagnosis and add vomiting to presenting complaints."
+// "In advice add: Take rest for one week. In follow up change 1 week to 10 days."
+// The command is cut into parts (at a sentence end, or at "and" / a comma before "in ..." or a command word). A part
+// names a section only when the WHOLE title is said as a phrase, right after "in / inside / into / to / under" or at
+// the start of the part followed by ":" or a command word. A part without a section belongs to the part before it.
+const COMMAND_WORDS = 'add|append|insert|write|put|include|mention|note|change|update|set|make|correct|replace|remove|delete|clear';
+const PART_SPLIT = new RegExp(`(?:[.;!?]+\\s+|\\n+|,?\\s+and\\s+(?:then\\s+|also\\s+)?(?=(?:in|inside|into|under|${COMMAND_WORDS})\\b)|,\\s*(?:then\\s+|also\\s+)?(?=(?:in|inside|into|under|${COMMAND_WORDS})\\b))`, 'i');
+
+// "presenting complaints add ..." / "Follow up: ..." at the very start of a part
+function titleStartsPart(part, title) {
+  const words = nameWords(title);
+  if (!words.length) return false;
+  const re = new RegExp(`^\\W*(?:the\\s+)?${words.map((w) => `${w}\\w*`).join('\\W+(?:\\w+\\W+)?')}\\s*(?::|\\s+(?:${COMMAND_WORDS})\\b)`, 'i');
+  return re.test(part);
+}
+
+// -> { parts: [{ text, section }] } when the command has 2+ different sections, each clearly named in its own part
+//    { unclear: [sections] } when a part starts with "in the <part of a title>" that fits more than one section, or
+//                            fits a section whose title was not said in full (so it must be asked)
+//    null otherwise (no section, one section, two sections inside one part, a title written twice in the document,
+//                    or moving text "from <section>": the existing checks handle those)
+function namedParts(sections, command) {
+  const named = sections.filter((s) => s.headingIndex !== -1 && nameWords(s.title).length);
+  const pieces = String(command || '').split(PART_SPLIT).map((s) => s.trim()).filter(Boolean);
+  if (pieces.length < 2) return null;
+  const parts = [];
+  let before = ''; // words before the first part that names a section
+  let unclear = null;
+  for (const piece of pieces) {
+    const raw = rawWords(piece);
+    let hits = named.filter((s) => {
+      const sc = scoreTitle(s.title, raw);
+      return sc.score === 2 && (sc.place || titleStartsPart(piece, s.title));
+    });
+    // a title fully inside a longer matching title loses ("diagnosis" inside "final diagnosis")
+    hits = hits.filter((h) => !hits.some((o) => o !== h && nameWords(o.title).length > nameWords(h.title).length
+      && nameWords(h.title).every((w) => nameWords(o.title).includes(w))));
+    if (hits.length > 1) return null; // two sections in one part: which words belong where cannot be told
+    if (!hits.length) {
+      // "... and in the examination add pallor": part of a title, said as a place -> must be asked
+      const place = /^(?:in|inside|into|under)\s+(?:the\s+)?([a-z]+)/i.exec(piece)?.[1];
+      if (place) {
+        const w = place.toLowerCase().replace(/s$/, '');
+        const fits = named.filter((s) => s.title.toLowerCase().split(/[^a-z]+/).some((x) => x && x.replace(/s$/, '') === w));
+        if (fits.length) unclear = fits;
+      }
+      if (parts.length) parts[parts.length - 1].text += ` ${piece}`;
+      else before += ` ${piece}`;
+      continue;
+    }
+    parts.push({ text: `${before} ${piece}`.trim(), section: hits[0] });
+    before = '';
+  }
+  const distinct = [...new Set(parts.map((p) => p.section))];
+  if (unclear && distinct.length) return { unclear };
+  if (distinct.length < 2) return null;
+  for (const s of distinct) {
+    // the same title twice in the document: cannot tell which one is meant
+    const key = nameWords(s.title).sort().join(' ');
+    if (named.filter((n) => nameWords(n.title).sort().join(' ') === key).length > 1) return null;
+    // moving text "from <section> to <section>": the existing check allows the removal in the source section
+    if (new RegExp(`\\bfrom\\s+(?:the\\s+)?${nameWords(s.title).map((w) => `${w}\\w*`).join('\\W+(?:\\w+\\W+)?')}`, 'i').test(command)) return null;
+  }
+  return { parts };
+}
+
+// Every edit must be in one of the named sections, and its new words must come from the part of the command that
+// names THAT section (so "vomiting" asked for Presenting Complaints never lands in Diagnosis). Nothing is moved: an
+// edit in the wrong place is asked about. Table cells (Patient Details, lab rows) and the AI's age / gender
+// consistency edits are treated exactly as for one named section; every other check (medicines, tables, gender,
+// all-or-nothing) still runs afterwards on the edits returned here.
+function checkSeveralSections(doc, sections, parts, edits) {
+  const blocks = getBlocks(doc);
+  const textOf = new Map();
+  for (const p of parts) textOf.set(p.section, `${textOf.get(p.section) || ''} ${p.text}`);
+  const wordsOf = new Map([...textOf].map(([s, t]) => [s, new Set(nameWords(t))]));
+  const names = [...textOf.keys()].map((s) => nice(s.title));
+  const list = `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const intoNamed = edits.filter((e) => { const k = parseInt(String(e.block_id).replace(/\D/g, ''), 10); return blocks[k] && textOf.has(sectionOf(sections, k)); })
+    .map((e) => String(e.new_value || '')).join('\n');
+  const out = [];
+  const skipped = [];
+  for (const e of edits) {
+    const i = parseInt(String(e.block_id).replace(/\D/g, ''), 10);
+    const b = blocks[i];
+    if (!b) { out.push(e); continue; } // unknown block: applyVoiceEdit reports it
+    const sec = sectionOf(sections, i);
+    if (!textOf.has(sec)) {
+      if (inTableCell(doc, b)) {
+        if (copiesFactFromText(doc, b, e, intoNamed)) { skipped.push(placeLabel(doc, b, sections, i)); continue; }
+        out.push(e);
+        continue;
+      }
+      if (onlyPatientFacts(b.node.textContent, e)) { skipped.push(placeLabel(doc, b, sections, i)); continue; }
+      return { reject: `You named ${list}, but a change was for ${sec?.title ? nice(sec.title) : 'another part of the document'}. Nothing was changed. Please name every section you want to change.` };
+    }
+    // the edit's own words: the text it looks for, and the NEW words it writes (words already in the block do not count)
+    const old = new Set(nameWords(b.node.textContent));
+    const added = nameWords([e.new_value, ...(Array.isArray(e.lines) ? e.lines : [])].filter(Boolean).join(' ')).filter((w) => !old.has(w));
+    const own = [...new Set([...nameWords(e.find_text || ''), ...added])];
+    if (!own.length) { out.push(e); continue; } // no words of its own (bold, lowercase, a list ...): its section was named
+    const score = (s) => own.filter((w) => wordsOf.get(s).has(w)).length;
+    const mine = score(sec);
+    const better = [...textOf.keys()].filter((s) => s !== sec && score(s) > mine);
+    if (better.length || mine === 0) {
+      const other = better[0];
+      return {
+        reject: other
+          ? `Which section should this change go to: ${nice(sec.title)} or ${nice(other.title)}? Nothing was changed.`
+          : `A change for ${nice(sec.title)} does not match what you asked for ${nice(sec.title)}. Nothing was changed. Please say it again.`,
+      };
+    }
+    out.push(e);
+  }
+  return { edits: out, moved: [], skipped, sections: names };
 }
 
 // ---------- age / gender: Patient Details are the source ----------

@@ -36,9 +36,11 @@ import { startCapture } from './lib/audio';
 import { createSegmenter } from './lib/vad';
 import { pcmChunksToWav } from './lib/wav';
 import { voiceTimingLine } from './lib/timing';
+import { reasonCode, notAppliedNote, editFailureLine } from './lib/editFailure';
 import { exportDocx } from './lib/exportDocx';
 import { todayString } from './lib/tools';
 import { extractEdits, checkFile, FILE_ACCEPT } from './lib/fileExtract';
+import { createRequestTracker, startProgress, isCancelled, isTimeout, NOT_CHANGED } from './lib/requestGuard';
 import { previewEdits, medicinesLostByEdits } from './lib/previewEdits';
 import { readDocument, stopReading, ttsSupported, watchVoices } from './lib/tts';
 import TopBar from './components/TopBar';
@@ -97,6 +99,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [reading, setReading] = useState(false);
   const [applying, setApplying] = useState(false); // Apply Edit button only (files / typed instructions)
+  const [progress, setProgress] = useState(''); // what the AI request is doing now ("AI is processing your request…")
   const [note, setNote] = useState('');
   const [voices, setVoices] = useState([]);
   const [saved, setSaved] = useState(true);
@@ -119,6 +122,9 @@ export default function App() {
   const queue = useRef([]); // finished commands waiting to be sent: { clip, endedAt }
   const voiceTiming = useRef(null); // times of the voice command being processed (console line only)
   const working = useRef(false);
+  const submitting = useRef(false); // Apply Edit is running (blocks a double click before the button re-renders)
+  const requests = useRef(null); // the AI requests still waiting for an answer (lib/requestGuard.js)
+  if (!requests.current) requests.current = createRequestTracker();
   const lastActivity = useRef(0);
   const fileInput = useRef(null);
   const attachInput = useRef(null);
@@ -517,7 +523,7 @@ export default function App() {
   function applyAiEdits({ ordered, allowGender, fromFile = false, consistency = true, label, text = '', heard = '', file = null,
     summary = '', voice = false, blockedFirst = [], aiEditCount = ordered.length, keptFacts = [] }) {
     let applied = 0;
-    let skipped = 0;
+    const failed = []; // edits the editor could not make: { code, label } (the reason is shown, not only a count)
     let noEffect = 0; // edits that "succeeded" but did not change the document
     const blockedWhy = [...blockedFirst]; // edits refused by the checks (table row / locked label / unasked gender change)
     const entries = []; // History entries of this instruction: added as ONE entry below
@@ -540,7 +546,7 @@ export default function App() {
         if (r.ok && !changed) noEffect++;
         else if (r.ok) applied++;
         else if (r.blocked) blockedWhy.push(`${ed.field_label || ed.block_id}: ${r.error}`);
-        else skipped++;
+        else failed.push({ code: reasonCode(r), label: ed.field_label || '' });
       }
 
       // Age / gender follow PATIENT DETAILS (the header), which change only when asked:
@@ -602,7 +608,10 @@ export default function App() {
     // When it returned edits but none could be applied, its "done" summary would be wrong: leave it out.
     const aiNote = applied ? summary : aiEditCount === 0 && summary ? `AI: ${summary}` : '';
     const noEffectNote = noEffect ? `${noEffect} edit${noEffect > 1 ? 's' : ''} from the AI did not change anything.` : '';
-    setNote([head, fixedNote, factsNote, blockedNote, skipped ? `${skipped} could not be applied.` : '', noEffectNote, aiNote].filter(Boolean).join(' '));
+    setNote([head, fixedNote, factsNote, blockedNote, notAppliedNote(failed), noEffectNote, aiNote].filter(Boolean).join(' '));
+    // console (F12): fixed reason codes and a count only, never document text (lib/editFailure.js)
+    const codes = [...failed.map((f) => f.code), ...blockedWhy.map(() => 'rejected_by_check')];
+    if (codes.length) console.info(editFailureLine(codes));
   }
 
   // ---------- upload preview ----------
@@ -771,6 +780,7 @@ export default function App() {
   // ---------- send a file / text / voice clip to the server and apply the edits it returns ----------
   // voice = true: a spoken command. It does not touch the Apply Edit button.
   async function runEdits({ file = null, text = '', audio = null, label, voice = false }) {
+    const docAtStart = editor.state.doc;
     stopReadingNow();
     setError('');
     setNote('');
@@ -783,16 +793,29 @@ export default function App() {
 
       const timing = voice ? voiceTiming.current : null; // voice commands only: numbers for the console line
       if (timing) timing.requestFrom = performance.now();
-      const answer = await extractEdits({
-        file,
-        instruction: text,
-        audio,
-        outline: buildOutline(editor.state.doc), // fresh snapshot of the document at this moment
-        today: todayString(),
-        templateId: openTemplateId(), // '' for discharge summaries
-        // commands only (never files): where the cursor is, and the commands applied earlier in THIS document
-        ...(file ? {} : { cursorBlock: cursorBlockId(), recent: recentCommands.current }),
-      });
+      // The request may be cancelled (another document opened) and stops after the time limit; the progress text
+      // tells the person what is happening while waiting. Nothing in the document changes until the answer is here.
+      const ticket = requests.current.start(currentId.current);
+      const stopProgress = startProgress(file ? 'file' : voice ? 'voice' : 'typed', setProgress);
+      let answer;
+      try {
+        answer = await extractEdits({
+          signal: ticket.signal,
+          file,
+          instruction: text,
+          audio,
+          outline: buildOutline(editor.state.doc), // fresh snapshot of the document at this moment
+          today: todayString(),
+          templateId: openTemplateId(), // '' for discharge summaries
+          // commands only (never files): where the cursor is, and the commands applied earlier in THIS document
+          ...(file ? {} : { cursorBlock: cursorBlockId(), recent: recentCommands.current }),
+        });
+      } finally {
+        stopProgress();
+        ticket.done();
+      }
+      // the document this answer was made for is no longer open (or the request was cancelled): never applied
+      if (ticket.isStale(currentId.current)) return 'stale';
       if (timing) timing.answerAt = performance.now();
       const { edits: aiEdits, summary: aiSummary } = answer;
       // heard is the transcript of a VOICE command; for typed text the AI may echo the text, which is not used
@@ -921,8 +944,12 @@ export default function App() {
       if (timing) timing.applyMs = performance.now() - applyFrom;
       return true;
     } catch (err) {
-      console.error(err);
-      setError(err.message || 'Could not apply the edit');
+      if (isCancelled(err)) return 'stale'; // another document was opened: nothing to show here
+      if (!isTimeout(err)) console.error(err);
+      // say clearly that nothing changed (the request failed before any edit; checked, not assumed)
+      const msg = err.message || 'Unable to process this instruction. Please try again.';
+      const unchanged = editor.state.doc.eq(docAtStart) && !msg.includes(NOT_CHANGED);
+      setError(unchanged ? `${msg} ${NOT_CHANGED}` : msg);
       return false;
     } finally {
       if (!voice) setApplying(false);
@@ -937,6 +964,7 @@ export default function App() {
     const windowsBefore = openedWindows.current;
     const ok = await runEdits(args);
     if (!ok) return 'error';
+    if (ok === 'stale') return 'none'; // its document was closed while waiting: nothing applied, nothing remembered
     if (openedWindows.current !== windowsBefore) return 'window';
     if (editor.state.doc.eq(docBefore)) return 'none';
     if (!args.file) remember(currentCommand.current);
@@ -949,13 +977,19 @@ export default function App() {
   // opens, they are cleared only if Apply in that window changes the document (Cancel keeps them).
   async function handleApply() {
     if (!attached && !instruction.trim()) return;
-    const outcome = await runAndReport({
-      file: attached,
-      text: instruction,
-      label: attached ? `"${attached.name}"` : 'your instruction',
-    });
-    if (outcome === 'applied') clearInputs();
-    else if (outcome === 'window') inputsWaitForWindow.current = true;
+    if (submitting.current) return; // already running: a second click never sends the instruction twice
+    submitting.current = true;
+    try {
+      const outcome = await runAndReport({
+        file: attached,
+        text: instruction,
+        label: attached ? `"${attached.name}"` : 'your instruction',
+      });
+      if (outcome === 'applied') clearInputs();
+      else if (outcome === 'window') inputsWaitForWindow.current = true;
+    } finally {
+      submitting.current = false;
+    }
   }
 
   // ---------- microphone, audio mode: always listening, one command per pause ----------
@@ -1110,6 +1144,7 @@ export default function App() {
   useEffect(() => {
     if (!editor) return;
     if (currentId.current === openKey) return;
+    requests.current.cancelAll(); // an answer for the previous document must never land in this one
     flushSave();
     currentId.current = openKey;
     if (openSummary) {
@@ -1268,6 +1303,7 @@ export default function App() {
           instruction={instruction}
           onInstruction={setInstruction}
           onApply={handleApply}
+          progress={progress}
           history={history}
           onUndo={undo}
         />

@@ -16,7 +16,7 @@ const ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
   .map((s) => s.trim())
   .filter(Boolean);
 const LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MINUTE) || 20;
-const AI_TIMEOUT_MS = 270000; // a little longer than the AI service's own 4-minute budget
+const AI_TIMEOUT_MS = 100000; // a little longer than the AI service's own 90-second budget (the browser waits 105 s)
 
 // ---------- access keys ("name:key,name2:key2") ----------
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
@@ -167,12 +167,13 @@ function validate(body = {}) {
 }
 
 // ---------- forward to the AI service ----------
-async function callAi(pathname, body, id) {
+// cancel: aborted when the app's connection really closed before the answer was sent (see below)
+async function callAi(pathname, body, id, cancel) {
   const r = await fetch(`${AI_URL}${pathname}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-internal-key': INTERNAL_KEY, 'x-request-id': id },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+    signal: AbortSignal.any([AbortSignal.timeout(AI_TIMEOUT_MS), cancel]),
   });
   const data = await r.json().catch(() => ({}));
   return { status: r.status, data };
@@ -204,14 +205,22 @@ app.post('/api/extract-edits', express.json({ limit: '25mb' }), extractLimiter, 
     approxKB: Math.round((clean.base64.length + clean.audioBase64.length + clean.text.length) / 1024),
   };
 
+  // The app gave up (browser time-out, page closed): the AI service is told at once, so it stops asking models.
+  // res 'close' also fires after a normal answer, so only a connection closed BEFORE the answer was finished counts.
+  const cancel = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) cancel.abort();
+  });
+
   try {
-    const { status, data } = await callAi('/api/extract-edits', clean, req.id);
+    const { status, data } = await callAi('/api/extract-edits', clean, req.id, cancel.signal);
     if (status >= 200 && status < 300) {
       return res.json({ edits: data.edits || [], summary: data.summary || '', heard: data.heard || '' });
     }
     const passThrough = [400, 429, 503].includes(status) ? status : 502;
     return res.status(passThrough).json({ error: data.error || 'The AI service returned an error' });
   } catch (e) {
+    if (cancel.signal.aborted) return; // the app has gone: nobody to answer
     if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
       return res.status(504).json({ error: 'The AI service took too long to answer. Please try again.' });
     }

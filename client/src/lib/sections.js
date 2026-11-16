@@ -76,7 +76,7 @@ const PLACE_WORDS = new Set(['in', 'inside', 'into', 'to', 'under', 'within']); 
 const SKIP_BEFORE = new Set(['the', 'a', 'an', 'section', 'part']);
 
 const stem = (w) => (w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w);
-const rawWords = (text) => String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+export const rawWords = (text) => String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
 
 // "COURSE IN THE HOSPITAL :" -> ["course", "hospital"] ; "complaints" -> "complaint"
 export function nameWords(text) {
@@ -86,7 +86,7 @@ export function nameWords(text) {
 // How well does a section title appear in the command?
 //   0 = not all words present; 1 = all words present but scattered; 2 = present as a phrase (in order)
 //   place = true when the phrase comes right after "in / inside / into / to / under" ("inside the presenting complaints")
-function scoreTitle(title, raw) {
+export function scoreTitle(title, raw) {
   const words = nameWords(title);
   if (!words.length) return { score: 0, place: false };
   // command words without filler, remembering where each came from in the raw command

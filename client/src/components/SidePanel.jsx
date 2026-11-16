@@ -27,7 +27,7 @@ export default function SidePanel({
   status, micDetail, onMic, reading, onRead, applying,
   transcript, reply, note, error,
   attached, onPickFile, onDropFile, onClearFile,
-  instruction, onInstruction, onApply,
+  instruction, onInstruction, onApply, progress = '',
   history, onUndo,
 }) {
   const [tab, setTab] = useState('smart');
@@ -112,6 +112,8 @@ export default function SidePanel({
           <button className="btn primary" onClick={onApply} disabled={!canApply}>
             {applying ? 'Applying…' : '💡 Apply Edit'}
           </button>
+          {/* what the AI request is doing while you wait (typed, voice and files) */}
+          {progress && <p className="hint" role="status" aria-live="polite">{progress}</p>}
 
           {transcript && <p className="bubble you">You: {transcript}</p>}
           {reply && <p className="bubble ai">AI: {reply}</p>}
