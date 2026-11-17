@@ -393,6 +393,13 @@ function numbersOf(text) {
 }
 
 const numbersIn = (t) => (String(t || '').replace(/(\d),(?=\d)/g, '$1').match(/\d+(?:\.\d+)?/g) || []).map(parseFloat);
+// A NAME word made of letters then digits ("B12", "D3", "CoQ10", "B-12"): its digits are part of the medicine name, not a
+// quantity - but ONLY when the person said that same word; otherwise its digits are checked like any other number.
+// Every other number (strength, dose, duration, quantity) is checked exactly as before.
+const NAME_CODE = () => /(?<![a-z0-9])[a-z]+-?\d+[a-z0-9]*(?![a-z0-9])/gi;
+const codeKey = (w) => w.toLowerCase().replace(/-/g, '');
+const codesSaid = (text) => new Set([...String(text || '').matchAll(NAME_CODE())].map((m) => codeKey(m[0])));
+const withoutSaidCodes = (line, codes) => String(line).replace(NAME_CODE(), (m) => (codes.has(codeKey(m)) ? ' ' : m));
 const nice2 = (t) => t.trim().toUpperCase();
 
 // A NEW medicine line added by a typed / spoken command (Advice, Medications, Treatment ...): every number in it
@@ -413,6 +420,45 @@ export function patternsSaid(command) {
   for (const m of s.matchAll(/(?<![\d.])[0-3](?:[\s,\-–/]*[0-3]){2,3}(?!\.?\d)/g)) out.add(m[0].replace(/\D/g, ''));
   return out;
 }
+
+// ---------- a time of day said for a NEW medicine line (approved mapping; nothing else is ever inferred) ----------
+//   morning (1-0-0) · afternoon (0-1-0) · night / daily night / at bedtime / HS (0-0-1) · morning and night (1-0-1)
+//   morning and afternoon (1-1-0) · afternoon and night (0-1-1) · morning, afternoon and night (1-1-1)
+//   "three times daily" (1-1-1, only for a line that itself says three times daily). Evening: kept as said, NO pattern.
+//   Once / twice daily: never a time, never a pattern.
+const TIME_WORD = '(?:(?:in\\s+the|every|daily|at)\\s+)?(?:morning|afternoon|night|evening)|(?:at\\s+)?bed\\s?time|q?h\\.s\\.|q?hs';
+const TIME_JOIN = '(?:\\s*,\\s*(?:and\\s+)?|\\s+and\\s+|\\s*&\\s*)';
+const TIME_PHRASE = () => new RegExp(`(?<![a-z])(?:${TIME_WORD})(?:${TIME_JOIN}(?:${TIME_WORD}))*(?![a-z])`, 'gi');
+// a time word the AI wrote although no time was said: removed like any other unsaid detail ("every morning",
+// "at bedtime" and "HS" are frequency words of medicineText.js and keep their own rule)
+const PLAIN_TIME_WORD = '(?:(?:in\\s+the|daily|at)\\s+)?(?:morning|afternoon|night|evening)';
+const PLAIN_TIME = () => new RegExp(`(?<![a-z])(?<!every\\s+)(?:${PLAIN_TIME_WORD})(?:${TIME_JOIN}(?:${PLAIN_TIME_WORD}))*(?![a-z])`, 'gi');
+function timeKey(text) {
+  const t = String(text).toLowerCase();
+  const m = /morning/.test(t); const a = /afternoon/.test(t); const e = /evening/.test(t);
+  const n = /night|bed\s?time|(?<![a-z])q?h\.?s\.?(?![a-z])/.test(t);
+  return { key: `${m ? 'M' : ''}${a ? 'A' : ''}${n ? 'N' : ''}${e ? 'E' : ''}`, pattern: !e && (m || a || n) ? `${+m}${+a}${+n}` : '' };
+}
+// the time of day in what was said: { key, pattern ('' = none), words (the person's own words) } or null
+export function timingSaid(text) {
+  const found = [...String(text || '').matchAll(TIME_PHRASE())].map((x) => x[0].trim().replace(/\s+/g, ' '));
+  if (!found.length) return null;
+  const { key, pattern } = timeKey(found.join(' '));
+  const words = found.length === 1 ? found[0] : `${found.slice(0, -1).join(', ')} and ${found[found.length - 1]}`;
+  return { key, pattern, words };
+}
+// the patterns that follow from the words said: a time of day, "three times daily"
+export function patternsImplied(command) {
+  const out = new Set();
+  const t = timingSaid(command);
+  if (t?.pattern) out.add(t.pattern);
+  if (saidForms(command).some((f) => termsIn(f).has('frequency:x3'))) out.add('111');
+  return out;
+}
+const patternText = (p) => `(${p.split('').join('-')})`;
+// "at night" -> "At Night", "in the morning" -> "In the Morning", "hs" -> "HS"
+const timeWords = (s) => s.toLowerCase().split(/(\s+|,)/)
+  .map((w, i) => (/^q?h\.?s\.?$/.test(w) ? w.toUpperCase() : i && /^(?:the|and)$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1))).join('');
 
 export function checkTableEdits(doc, command, edits) {
   if (!command || !edits.length) return { edits, blocked: [] };
@@ -437,12 +483,16 @@ export function checkTableEdits(doc, command, edits) {
       // a dosing pattern ("(0-0-1)") is checked as ONE pattern against the patterns said ("001", "0-0-1", "0 0 1",
       // "zero zero one"); every other number (strength, dose, duration) must have been said, as before
       const patterns = patternsSaid(command);
+      // the pattern of a time of day said ("at night" -> 0-0-1) or of "three times daily" (1-1-1): the medicine check
+      // (checkMedicineEdits, which runs first) already tied it to the line that says that time
+      for (const p of patternsImplied(command)) patterns.add(p);
       const badPatterns = [];
       const rest = newMeds.map((l) => l.replace(DOSING_IN_LINE, (m) => {
         if (!patterns.has(m.replace(/\D/g, ''))) badPatterns.push(m.replace(/\s+/g, ''));
         return ' ';
       }));
-      const unsaid = [...new Set([...badPatterns, ...rest.flatMap(numbersIn).filter((n) => !said.some((s) => Math.abs(s - n) < 1e-9))])];
+      const codes = codesSaid(command);
+      const unsaid = [...new Set([...badPatterns, ...rest.flatMap((l) => numbersIn(withoutSaidCodes(l, codes))).filter((n) => !said.some((s) => Math.abs(s - n) < 1e-9))])];
       if (unsaid.length) {
         blocked.push(`${nice2(e.field_label || 'Advice')}: the new medicine line contains ${unsaid.join(', ')}, which was not in your command, so it was not added. Please say the medicine again with only the details you want`);
         continue;
@@ -652,8 +702,11 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
 
   // A NEW medicine line: the optional details the AI added that were NOT said are REMOVED (not the whole command
   // refused): a form at the start (Tab. / Cap. ...), a generic / description bracket, route, frequency, food timing,
-  // as needed (SOS) and phrases such as "as directed". Numbers, units and dosing patterns are never removed: an
-  // invented one still refuses the command (checked below). The line is only ever shortened, never added to.
+  // as needed (SOS), phrases such as "as directed", and a dosing pattern ("(1-0-1)") when the person said NO dosing
+  // pattern at all. Numbers and units are never removed: an invented one still refuses the command (checked below);
+  // a pattern DIFFERENT from the one said stays and refuses the command too. The line is only ever shortened, never
+  // added to. A line that loses its only frequency that way (the AI wrote "(1-0-1)" instead of the "twice daily" that
+  // was said) is refused below, so the frequency the person asked for is never silently lost.
   const FILLER_LEFT = /^(?:\s|\b(?:route|routes|by|the|for|with|at|in|and|of|on|a|an|to)\b|[.;:])*$/i;
   const tidy = (t) => t.replace(/\(\s*\)/g, ' ')
     .replace(/\s*([—–,])(?:\s*[—–,])+/g, ' $1') // a run of separators -> the first
@@ -671,7 +724,63 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
     // only AFTER the medicine's name (a name such as "Inj. IV PARACETAMOL" is never cut)
     const brand = brandOf(l);
     const cut = brand ? l.indexOf(brand) + brand.length : 0;
-    const parts = l.slice(cut).split(/([—–,])/).map((seg, i) => {
+    let rest = l.slice(cut);
+    let droppedPattern = '';
+    let problem = ''; // why this line is refused (time of day / pattern), checked in checkAdded
+    let allowed = ''; // the pattern this line keeps (or gets): from the time of day said, or "three times daily"
+    let preChanged = false; // text was taken out before the parts below are looked at
+    const PATTERN_RE = () => new RegExp(`\\(\\s*(?:${DOSING_IN_LINE.source})\\s*\\)|${DOSING_IN_LINE.source}`, 'g');
+    if (spokenTime) {
+      // a time of day WAS said: the line must say the SAME time; it is written in the person's own words
+      const found = [...rest.matchAll(TIME_PHRASE())].map((x) => x[0].trim());
+      if (!found.length) problem = `is missing the time of day you said ("${spokenTime.words}")`;
+      else if (timeKey(found.join(' ')).key !== spokenTime.key) problem = `says "${found.join(', ')}", but you said "${spokenTime.words}"`;
+      else {
+        let first = true;
+        rest = rest.replace(TIME_PHRASE(), () => { const r = first ? '\u0001' : ' '; first = false; return r; });
+        allowed = spokenTime.pattern;
+        changed = true;
+        preChanged = true;
+      }
+    } else {
+      // no time of day said: a time word the AI added is an unsaid detail -> removed
+      rest = rest.replace(PLAIN_TIME(), () => { changed = true; preChanged = true; return ' '; });
+    }
+    // "three times daily" said AND written in this very line: its pattern is (1-1-1)
+    if (!allowed && !spokenTime && saidTerms.has('frequency:x3') && termsIn(rest).has('frequency:x3')) allowed = '111';
+    const linePatterns = [...rest.matchAll(PATTERN_RE())].map((x) => x[0].replace(/[^0-3]/g, ''));
+    if (allowed && !problem) {
+      // the AI's pattern must be exactly that one (a different one is refused); missing -> the approved one is added
+      const wrong = linePatterns.find((x) => x !== allowed);
+      if (wrong) problem = `contains the dosing pattern ${wrong.split('').join('-')}, but "${spokenTime ? spokenTime.words : 'three times daily'}" is ${patternText(allowed)}`;
+      else {
+        rest = rest.replace(PATTERN_RE(), ' ');
+        if (!spokenTime) {
+          let done = false;
+          rest = rest.replace(categoryRegex('frequency'), (m) => {
+            if (done || canonTerm('frequency', m) !== 'x3') return m;
+            done = true;
+            return `${m} ${patternText(allowed)}`;
+          });
+        }
+        changed = true;
+      }
+    } else if (!allowed && !saidPatterns.size) {
+      // Fix A: a dosing pattern nobody said ("(1-0-1)" copied from the other lines): removed, with its brackets, ONLY
+      // when the person said no pattern at all
+      rest = rest.replace(PATTERN_RE(), (m) => {
+        if (!droppedPattern) droppedPattern = m.replace(/[^0-3]/g, '').split('').join('-');
+        changed = true;
+        return ' ';
+      });
+    }
+    if (rest.includes('\u0001')) {
+      // the time in the person's own words, written in the style of the line (capitals when the line is in capitals)
+      const letters = l.replace(/[^A-Za-z]/g, '');
+      const words = letters && letters === letters.toUpperCase() ? spokenTime.words.toUpperCase() : timeWords(spokenTime.words);
+      rest = rest.replace('\u0001', allowed && !problem ? `${words} ${patternText(allowed)}` : words);
+    }
+    const parts = rest.split(/([—–,])/).map((seg, i) => {
       if (i % 2) return seg; // a separator
       if ([...phrasesIn(seg)].some((p) => !saidPhrases.has(p))) { changed = true; return ''; } // "as directed by ..." -> the part
       let s = seg;
@@ -681,10 +790,21 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
         const saidKind = [...saidTerms].some((k) => k.startsWith(`${key}:`));
         s = s.replace(categoryRegex(key), (m) => (saidKind || saidTerms.has(`${key}:${canonTerm(key, m)}`) ? m : ((changed = true), '')));
       }
-      return s !== seg && FILLER_LEFT.test(s.replace(/\(\s*\)/g, '')) ? '' : s;
+      return (s !== seg || preChanged) && FILLER_LEFT.test(s.replace(/\(\s*\)/g, '')) ? '' : s;
     });
-    return changed ? tidy(l.slice(0, cut) + parts.join('')) : line;
+    const result = changed ? tidy(l.slice(0, cut) + parts.join('')) : line;
+    // the pattern was the line's only frequency, but a frequency WAS said: refused below (never added back)
+    const frequencySaid = [...saidTerms].some((k) => k.startsWith('frequency:'));
+    if (droppedPattern && frequencySaid && ![...termsIn(result).keys()].some((k) => k.startsWith('frequency:'))) patternInsteadOfFrequency.set(result, droppedPattern);
+    if (problem) timingProblem.set(result, problem);
+    else if (allowed) keptPattern.set(result, allowed);
+    return result;
   };
+  const patternInsteadOfFrequency = new Map(); // cleaned line -> the pattern the AI wrote instead of the frequency said
+  const spokenTime = timingSaid(said); // the time of day the person said (only the person's words, never `extra`)
+  const saidCodes = codesSaid(said); // name words such as "B12" said by the person (never `extra`)
+  const timingProblem = new Map(); // cleaned line -> why its time of day / pattern is refused
+  const keptPattern = new Map(); // cleaned line -> the one pattern it may contain (from the time of day / three times daily said)
 
   // the parts of one line
   const partsOf = (line) => {
@@ -696,7 +816,7 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
       form: formMatch ? formKeyOf(formMatch[1]) : null,
       formWord: formMatch ? formMatch[1].trim() : '',
       patterns: (line.match(DOSING_IN_LINE) || []).map((m) => m.replace(/\D/g, '')),
-      numbers: numbersIn(line.replace(DOSING_IN_LINE, ' ')),
+      numbers: numbersIn(withoutSaidCodes(line.replace(DOSING_IN_LINE, ' '), saidCodes)),
       pairs: pairsIn(line),
       terms: termsIn(line),
       phrases: phrasesIn(line),
@@ -706,6 +826,10 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
   // the checks for what a line ADDS (everything of a new line; of a changed line only what is new in it)
   function checkAdded(line, now, before, isMed) {
     const quoted = `"${line}"`;
+    if (!before && patternInsteadOfFrequency.has(line)) {
+      return `${quoted} is missing the frequency you said: the AI wrote the dosing pattern ${patternInsteadOfFrequency.get(line)} instead, which was not in your command`;
+    }
+    if (!before && timingProblem.has(line)) return `${quoted} ${timingProblem.get(line)}`;
     for (const [k, words] of now.terms) {
       if (before?.terms.has(k)) continue;
       if (!saidTerms.has(k)) return `${quoted} contains the ${CATEGORY_NAME[k.split(':')[0]]} "${words}", which was not in your command`;
@@ -732,7 +856,7 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
       return `${quoted} starts with a medicine form (${now.formWord}) that was not in your command`;
     }
     for (const p of now.patterns) {
-      if (!before?.patterns.includes(p) && !saidPatterns.has(p)) return `${quoted} contains the dosing pattern ${p.split('').join('-')}, which was not in your command`;
+      if (!before?.patterns.includes(p) && !saidPatterns.has(p) && !(!before && keptPattern.get(line) === p)) return `${quoted} contains the dosing pattern ${p.split('').join('-')}, which was not in your command`;
     }
     for (const n of now.numbers) {
       if (!before?.numbers.includes(n) && !saidNumbers.some((s) => Math.abs(s - n) < 1e-9)) return `${quoted} contains ${n}, which was not in your command`;
@@ -766,6 +890,24 @@ export function checkMedicineEdits(doc, { said = '', extra = '', edits = [] } = 
     return '';
   }
 
+  // a time of day said in a command that adds SEVERAL new medicine lines: which medicine it belongs to cannot be told
+  // from the words (the details are matched against the whole command) -> refused first, with that reason
+  if (spokenTime) {
+    let count = 0;
+    let where = '';
+    for (const e of edits) {
+      if (e.operation !== 'insert_after' || typeof e.new_value !== 'string') continue;
+      const at = parseInt(String(e.block_id).replace(/\D/g, ''), 10);
+      const section = blocks[at] && !cellAt(doc, blocks[at].pos) ? sectionOf(sections, at) : null;
+      if (!section || !MED_SECTION.test(section.title)) continue;
+      const n = e.new_value.split('\n').filter((l) => isMedicineEntry(l.trim(), true) || new RegExp(DOSING_IN_LINE.source).test(l)).length;
+      if (n && !where) where = nice2(section.title.replace(/\s*:\s*$/, ''));
+      count += n;
+    }
+    if (count > 1) {
+      return refuse(where, `your command says a time of day ("${spokenTime.words}") and adds ${count} medicines, so it is not clear which medicine the time is for. Please add a medicine that has a time of day on its own`);
+    }
+  }
   for (const [index, e] of edits.entries()) {
     if (!WORDS_ONLY.has(e.operation)) continue; // bold / capitals / lists change no words
     const at = parseInt(String(e.block_id).replace(/\D/g, ''), 10);

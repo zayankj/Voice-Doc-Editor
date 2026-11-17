@@ -156,6 +156,12 @@ ${earlier}
   about the medicine (e.g. "TO CONTINUE", "till next review") exactly, in the order said; never drop it. Write the medicine name
   exactly as said, a form (Tab. / Cap. / Syp. ...) only when it was said, and a unit (mg, mcg, g, ml ...) only when
   it was said with that number ("Dolo 650" -> "DOLO 650", never "DOLO 650 mg").
+  A time of day said ("in the morning", "every morning", "afternoon", "at night", "every night", "at bedtime", "HS",
+  "morning and night" ...) is written in the person's own words and is never replaced by a frequency: "every morning"
+  is never "Once Daily", "morning and night" is never "Twice Daily". When a frequency AND a time of day are said,
+  write both: the frequency, then the time of day ("once daily for 5 days in the morning" -> "ONCE DAILY — IN THE
+  MORNING — 5 DAYS"). Never add a time of day that was not said, and no dosing pattern unless one was said (the app
+  adds the approved pattern for a time of day said).
   A missing strength, route, frequency, food timing or duration is NOT a reason to ask (for these parts this replaces
   "a new value is missing" in the rules above): add the line with only what was said, and write words such as
   "as prescribed" or "as directed" as said. Still ask when the medicine name is missing or unclear. This rule never

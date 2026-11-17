@@ -114,12 +114,14 @@ for (const L of ['A', 'B']) {
     assert.deepEqual(numbered(ed.state.doc).map((r) => r.match(/^OL(\d+)/)[1]), ['1', '2', '3', '4', '5', '6', '7', '8']);
   });
 
-  test(`all medicines WITHOUT the supplement named: the powder stays as it is, numbering continues (layout ${L})`, () => {
+  // (approved change: "all medicines" now also takes a medicine entry written WITHOUT a form at its start - the powder
+  // supplement - recognised by the medicine checks' own rule; before, it stayed outside the list)
+  test(`all medicines WITHOUT the supplement named: the powder entry is recognised and joins the list, numbered in order (layout ${L})`, () => {
     const ed = makeEditor(layout[L]());
     assert.equal(toList(ed, { select: ['all_medicines'] }).ok, true);
-    assert.deepEqual(numbered(ed.state.doc).map((r) => r.replace(/^OL\d+ /, '')), LINES.filter((l) => l !== POWDER));
-    assert.deepEqual(numbered(ed.state.doc).map((r) => Number(r.match(/^OL(\d+)/)[1])), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
-    assert.ok(adviceRows(ed.state.doc).some((r) => r.startsWith('P ') && r.includes(POWDER)));
+    assert.deepEqual(numbered(ed.state.doc).map((r) => r.replace(/^OL\d+ /, '')), LINES);
+    assert.deepEqual(numbered(ed.state.doc).map((r) => Number(r.match(/^OL(\d+)/)[1])), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.ok(!adviceRows(ed.state.doc).some((r) => r.startsWith('P ') && r.includes(POWDER)));
   });
 
   test(`THE REPORTED FAILURE (layout ${L}): a line holding two entries ("…sleep,Tab. DOLO …") is refused with a clear message; nothing changes`, () => {

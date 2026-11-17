@@ -23,7 +23,7 @@ import { checkMedicineEdits, withDuplicateChoice } from '../src/lib/verify.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = path.join(here, '.build-medlist');
 fs.mkdirSync(tmp, { recursive: true });
-for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tables']) {
+for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tables', 'medicineText', 'sections']) {
   const src = fs.readFileSync(path.join(here, '../src/lib', `${f}.js`), 'utf8').replace(/from '\.\/([A-Za-z]+)'/g, "from './$1.js'");
   fs.writeFileSync(path.join(tmp, `${f}.js`), src);
 }

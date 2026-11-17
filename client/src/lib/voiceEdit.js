@@ -3,6 +3,7 @@ import { flashKey } from './flash';
 import { getPatientFacts, syncPatientFacts, setHeaderGender } from './consistency';
 import { lockReason, changesGender, isLockedLabel, isLabelText, labelPrefix } from './guards';
 import { cellAt, isDataTable, hasTitleRow, rowNames, valueCellAfter, keepValueFormat } from './tables.js';
+import { isMedicineEntry } from './medicineText.js';
 
 export { getPatientFacts };
 
@@ -214,8 +215,17 @@ const squash = (t) => String(t).replace(/\s+/g, ' ').trim().toLowerCase();
 const medicineKey = (t) => squash(t).replace(/[.()]/g, ' ').split(/\s+/).filter(Boolean).slice(0, 2).join(' ');
 // "Tab. DOLO (Paracetamol) 650 mg" -> "dolo": the name only (the form may be written differently: Tab / Tablet)
 // ("Ointment for Ringworm …" -> "ringworm": small linking words after the form are skipped)
-const medicineName = (t) => squash(t).replace(/[.()]/g, ' ').split(/\s+/).filter(Boolean).slice(1)
-  .find((w) => !/^(?:for|of|to|the|a|an|on|in)$/.test(w)) || '';
+// A shared word such as VITAMIN (or a form word) is not a name on its own: the next name word belongs to it
+// ("Tab. VITAMIN D 1000 IU" -> "vitamin d", "Cap. VITAMIN C 500 mg" -> "vitamin c"); a number never does.
+const SHARED_NAME_WORD = /^(?:vitamins?|vit|tabs?|tablets?|caps?|capsules?|syps?|syrups?|inj|injections?)$/;
+const medicineName = (t) => {
+  const w = squash(t).replace(/[.()]/g, ' ').split(/\s+/).filter(Boolean).slice(1)
+    .filter((x) => !/^(?:for|of|to|the|a|an|on|in)$/.test(x));
+  if (!w.length) return '';
+  const next = w[1] || '';
+  const ownsNext = /^[a-z][a-z0-9]{0,3}$/.test(next) && !/^(?:mg|mcg|g|gm|ml|iu|unit|od|bd|bid|tds|tid|qid|hs|sos|prn|po|iv|im|sc|stat)$/.test(next);
+  return SHARED_NAME_WORD.test(w[0]) && ownsNext ? `${w[0]} ${next}` : w[0];
+};
 // ", Tab. DOLO …" -> "Tab. DOLO …": a separator the AI put in front of a new entry is not part of it
 const stripLead = (v) => String(v).replace(/^[\s,;:—–-]+/u, '');
 
@@ -512,6 +522,16 @@ function kindsOfLine(text) {
   const k = kindAtStart(text);
   return k ? [k] : [];
 }
+// For a list of "all the medicines": also a medicine entry that does NOT start with a form ("AZIPROTEIN POWDER (Protein
+// Supplement) 2 scoops — …"), recognised by the SAME rule as the medicine checks (isMedicineEntry, medicineText.js:
+// a strength / dose with its unit, or a generic bracket). Its kind is the first form word in it ("powder" -> sachet),
+// otherwise 'med' (picked only by all_medicines). Advice sentences, review lines and signatures are not medicines.
+const kindInside = (t) => Object.keys(FORM_LINES).find((k) => new RegExp(`(?<![a-z])(?:${FORM_LINES[k]})(?![a-z])`, 'i').test(t)) || 'med';
+function entryKindsOf(text) {
+  const ks = kindsOfLine(text);
+  if (ks.length) return ks;
+  return isMedicineEntry(String(text).trim(), true) ? [kindInside(text)] : [];
+}
 // For comparing lines: dashes, spaces (also non-breaking), capitals and a trailing comma / full stop do not matter.
 // (Used only to FIND a line; the document's own text and positions are what change.)
 const normLine = (t) => String(t).normalize('NFC').toLowerCase().replace(/[\s ]+/g, ' ').replace(/\s*[—–-]\s*/g, ' - ')
@@ -520,6 +540,24 @@ const normLine = (t) => String(t).normalize('NFC').toLowerCase().replace(/[\s ]
 const LIST_TYPES = { ordered: 'orderedList', bullet: 'bulletList' };
 const isList = (n) => n.type.name === 'orderedList' || n.type.name === 'bulletList';
 // is this text block inside a list?
+// A simple list: every item is ONE paragraph (no second paragraph, no list inside it)
+const simpleList = (node) => {
+  let ok = node.childCount > 0;
+  node.forEach((li) => { if (li.childCount !== 1 || li.firstChild.type.name !== 'paragraph') ok = false; });
+  return ok;
+};
+// The items of a simple list as lines: { nodes, text, attrs, pick }
+const listLines = (node) => {
+  const out = [];
+  node.forEach((li) => {
+    const para = li.firstChild;
+    const nodes = [];
+    para.forEach((c) => nodes.push(c));
+    out.push({ nodes, text: para.textContent, attrs: para.attrs, pick: false });
+  });
+  return out;
+};
+
 function blocksInList(doc, b) {
   const $p = doc.resolve(b.pos);
   for (let d = 1; d <= $p.depth; d++) if (isList($p.node(d))) return true;
@@ -538,14 +576,16 @@ function applyToList(editor, blocks, index, args) {
   const doc = editor.state.doc;
   const own = doc.resolve(blocks[index].pos).index(0); // the top-level node of the AI's block
 
-  // already a list: change its kind (bullet <-> numbered) when exactly its items were asked for
+  // already a list that is NOT a simple list (an item with several paragraphs or a list inside it): change its kind
+  // (bullet <-> numbered) only when exactly its items were asked for. Simple lists are handled below, together with
+  // the rest of the section.
   const top = doc.child(own);
-  if (isList(top)) {
+  if (isList(top) && !simpleList(top)) {
     const items = [];
     top.forEach((li) => items.push(normLine(li.textContent)));
     const asked = wanted.length ? wanted.map(normLine) : [];
     const byKind = [];
-    top.forEach((li) => { if (kinds.length && kindsOfLine(li.textContent).some((k) => kindWanted(kinds, k))) byKind.push(normLine(li.textContent)); });
+    top.forEach((li) => { if (kinds.length && entryKindsOf(li.textContent).some((k) => kindWanted(kinds, k))) byKind.push(normLine(li.textContent)); });
     const named = [...new Set([...asked, ...byKind])];
     if (named.length !== items.length || !named.every((w) => items.includes(w))) {
       return fail('only part of an existing list was named; to change a list, name all of its lines. Nothing was changed');
@@ -576,32 +616,45 @@ function applyToList(editor, blocks, index, args) {
   }
   const end = doc.resolve(blocks[endBlock].pos).index(0);
 
-  // every line of every top-level paragraph in the region
-  const rows = []; // { child, lines: [{ nodes, text, pick }] } or { child } for anything that is not a paragraph
+  // every line of every top-level paragraph in the region, and every item of a simple list (one paragraph per item)
+  //   { child, lines: [{ nodes, text, pick }] }             a paragraph
+  //   { child, list: true, lines: [{ nodes, text, attrs, pick }] }  a simple list (one line per item)
+  //   { child }                                              anything else (a table, a list with nested content ...)
+  const rows = [];
   for (let i = start; i <= end; i++) {
     const child = doc.child(i);
-    rows.push(child.type.name === 'paragraph' ? { child, lines: paragraphLines(child).map((l) => ({ ...l, pick: false })) } : { child });
+    if (child.type.name === 'paragraph') rows.push({ child, lines: paragraphLines(child).map((l) => ({ ...l, pick: false })) });
+    else if (isList(child) && simpleList(child)) rows.push({ child, list: true, lines: listLines(child) });
+    else rows.push({ child });
   }
   const all = rows.flatMap((r) => r.lines || []);
   const joinedMsg = (l) => `two entries appear to be joined on one line: "${l.text.trim()}". Please put each entry on its own line and try again. Nothing was changed`;
 
   // 1. the kinds asked for ("all medicines", "tablets", "syrups" ...): picked by the browser from the document itself
-  //    (a line counts when it STARTS with that medicine form, the same rule as the medicine checks)
+  //    (a line counts when it STARTS with that medicine form, or when the medicine checks recognise it as a medicine
+  //    entry: "AZIPROTEIN POWDER (Protein Supplement) 2 scoops — …")
   for (const l of all) {
     if (!kinds.length || !l.text.trim()) continue;
-    const pieces = kindsOfLine(l.text);
+    const pieces = entryKindsOf(l.text);
     if (pieces.length > 1 && pieces.some((k) => kindWanted(kinds, k))) return fail(joinedMsg(l)); // e.g. "…sleep,Tab. DOLO …"
     if (pieces.length === 1 && kindWanted(kinds, pieces[0])) l.pick = true;
   }
   // 2. the lines the AI named (e.g. a supplement written without "Tab." / "Syp."): each must be exactly ONE whole line
   //    of the section, compared without differences in dashes, spaces, capitals or a trailing comma / full stop
+  //    The same line twice in the section (two entries of the same medicine): both are taken when the AI named it as
+  //    often as it appears, or when both were already picked by their kind; otherwise it is not clear which is meant.
+  const namedTimes = new Map();
+  for (const w of wanted) namedTimes.set(normLine(w), (namedTimes.get(normLine(w)) || 0) + 1);
   for (const w of wanted) {
     const f = normLine(w);
     const hits = all.filter((l) => normLine(l.text) === f);
-    if (hits.length > 1) return fail(`the line "${w}" appears more than once in that section; it is not clear which one is meant. Nothing was changed`);
-    if (hits.length === 1) {
-      if (kindsOfLine(hits[0].text).length > 1) return fail(joinedMsg(hits[0]));
-      hits[0].pick = true;
+    if (hits.length > 1 && namedTimes.get(f) < hits.length && !hits.every((l) => l.pick)) {
+      return fail(`the line "${w}" appears more than once in that section; it is not clear which one is meant. Nothing was changed`);
+    }
+    if (hits.length) {
+      const joined = hits.find((l) => kindsOfLine(l.text).length > 1);
+      if (joined) return fail(joinedMsg(joined));
+      for (const l of hits) l.pick = true;
       continue;
     }
     // part of a line that holds two entries ("Tab. DOLO …" inside "…sleep,Tab. DOLO …")
@@ -612,9 +665,30 @@ function applyToList(editor, blocks, index, args) {
   if (!all.some((l) => l.pick)) {
     // those lines are already in a list (e.g. a second edit of the same command): nothing more to do
     const listed = rows.some((r) => !r.lines && isList(r.child) && kinds.length &&
-      (() => { let hit = false; r.child.forEach((li) => { if (kindsOfLine(li.textContent).some((k) => kindWanted(kinds, k))) hit = true; }); return hit; })());
+      (() => { let hit = false; r.child.forEach((li) => { if (entryKindsOf(li.textContent).some((k) => kindWanted(kinds, k))) hit = true; }); return hit; })());
     if (listed && !wanted.length) return { ok: true, before: '', after: '', pos: blocks[index].pos, unchanged: true };
     return fail(`no ${kinds.join(' / ').replace(/_/g, ' ')} were found in that section. Nothing was changed`);
+  }
+  const pickedRows = rows.filter((r) => r.lines?.some((l) => l.pick));
+  // PARTIAL-LIST PROTECTION: an existing list with only SOME of its items named is never changed or split. (When it is
+  // the only place with named lines and it is already the kind asked for, there is nothing to do.)
+  const partial = pickedRows.find((r) => r.list && r.lines.some((l) => !l.pick));
+  if (partial) {
+    if (pickedRows.length === 1 && partial.child.type.name === listName) return { ok: true, before: '', after: '', pos: blocks[index].pos, unchanged: true };
+    return fail('only part of an existing list was named; to change a list, name all of its lines. Nothing was changed');
+  }
+  // exactly one existing list, every item named: already the kind asked for -> nothing to do; otherwise change its kind
+  if (pickedRows.length === 1 && pickedRows[0].list) {
+    const r = pickedRows[0];
+    if (r.child.type.name === listName) return { ok: true, before: '', after: '', pos: blocks[index].pos, unchanged: true };
+    let at = 0;
+    for (let i = 0; i < start + rows.indexOf(r); i++) at += doc.child(i).nodeSize;
+    const tr = editor.state.tr.setNodeMarkup(at, schema.nodes[listName], listName === 'orderedList' ? { start: 1 } : null);
+    tr.setMeta(flashKey, { add: { from: at, to: at + r.child.nodeSize } });
+    editor.view.dispatch(tr);
+    scheduleClear(editor);
+    const texts = r.lines.map((l) => l.text);
+    return { ok: true, before: texts.join('\n'), after: texts.map((t, i) => (listName === 'orderedList' ? `${i + 1}. ${t}` : `• ${t}`)).join('\n'), pos: at };
   }
   const first = rows.findIndex((r) => r.lines?.some((l) => l.pick));
   const lastRow = rows.length - 1 - [...rows].reverse().findIndex((r) => r.lines?.some((l) => l.pick));
@@ -631,6 +705,14 @@ function applyToList(editor, blocks, index, args) {
     items = [];
   };
   for (const r of span) {
+    if (r.list) {
+      // an existing list inside the span: all of its items named -> they join the new list (same order); none named
+      // -> it stays exactly as it is, where it is (a partly named list was refused above)
+      if (r.lines.every((l) => l.pick)) {
+        for (const l of r.lines) { items.push(schema.nodes.listItem.create(null, schema.nodes.paragraph.create(l.attrs, l.nodes))); count++; }
+      } else { flushList(); out.push(r.child); }
+      continue;
+    }
     if (!r.lines) { flushList(); out.push(r.child); continue; }
     let plain = [];
     const flushPlain = () => {

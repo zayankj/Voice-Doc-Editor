@@ -186,3 +186,15 @@ test('medicine position and wording rules: in every command prompt, never in the
     assert.doesNotMatch(build(...args), WORDS, k);
   }
 });
+
+test('adding a medicine: a time of day said is kept in the person\'s words, never replaced by a frequency (approved change)', () => {
+  for (const a of [commandAddon(), commandAddon({ cursorBlock: 'B7', recent: ['add tab test 5 mg to advice'] })]) {
+    assert.match(a, /A time of day said \("in the morning", "every morning", "afternoon", "at night", "every night", "at bedtime", "HS",\s+"morning and night" \.\.\.\) is written in the person's own words and is never replaced by a frequency: "every morning"\s+is never "Once Daily", "morning and night" is never "Twice Daily"\./);
+    assert.match(a, /When a frequency AND a time of day are said,\s+write both: the frequency, then the time of day \("once daily for 5 days in the morning" -> "ONCE DAILY — IN THE\s+MORNING — 5 DAYS"\)\./);
+    assert.match(a, /Never add a time of day that was not said, and no dosing pattern unless one was said \(the app\s+adds the approved pattern for a time of day said\)\./);
+    // placed inside "Adding a medicine", right after the name / form / unit sentence, before the "missing part" rule
+    const i = a.indexOf('never "DOLO 650 mg").');
+    assert.ok(i > 0 && a.indexOf('A time of day said') > i && a.indexOf('A time of day said') < a.indexOf('A missing strength, route'));
+    assert.equal(a.split('A time of day said').length, 2, 'once only');
+  }
+});

@@ -68,7 +68,8 @@ test('optional details nobody said are REMOVED from a new medicine line (not ref
   const cleaned = (said, v, at) => ok(said, add(v, at)).edits[0].new_value;
   // the example: "Oral" was not said -> removed, the rest is added (DOLO is already there: a new line)
   const r = ok('Add tablet Dolo 500 mg daily night', add('Tab. DOLO 500 mg — Oral — Daily Night'));
-  assert.equal(r.edits[0].new_value, 'Tab. DOLO 500 mg — Daily Night');
+  // ("daily night" said: its approved pattern (0-0-1) is added - client/tests/medicineTiming.test.mjs)
+  assert.equal(r.edits[0].new_value, 'Tab. DOLO 500 mg — Daily Night (0-0-1)');
   assert.deepEqual(r.newEntries, [0]);
   assert.equal(cleaned('add tablet azee 500 mg to advice', 'Tab. AZEE 500 mg — Oral'), 'Tab. AZEE 500 mg');
   assert.equal(cleaned('add tablet azee 500 mg to advice', 'Tab. AZEE 500 mg — As needed (SOS)'), 'Tab. AZEE 500 mg');
@@ -86,11 +87,13 @@ test('optional details nobody said are REMOVED from a new medicine line (not ref
   // a DIFFERENT detail than said is a mistake, not an extra: refused (never silently dropped)
   no('add tablet azee 500 mg once daily', add('Tab. AZEE 500 mg — Twice Daily'), /frequency "Twice Daily"/);
   no('add tablet azee 500 mg orally', add('Tab. AZEE 500 mg — IV'), /route "IV"/);
-  // numbers, units and dosing patterns are never removed: an invented one refuses the whole command
+  // numbers and units are never removed: an invented one refuses the whole command
   no('add tablet azee 500 mg for 5 days', add('Tab. AZEE 500 mg — 5 weeks'), /"5 week"/);
   no('add tablet azee 500 mg', add('Tab. AZEE 500 mg — 5 days'), /contains 5/);
   no('add tablet azee', add('Tab. AZEE 500 mg'), /contains 500/);
-  no('add tablet zincovit', add('Tab. ZINCOVIT — (1-0-1)'), /dosing pattern 1-0-1/);
+  // Fix A: a dosing pattern nobody said (no pattern said at all) is REMOVED from a new line, not refused
+  // (client/tests/medicinePatterns.test.mjs has the full set: a pattern said, a different pattern, pattern instead of frequency)
+  assert.equal(cleaned('add tablet zincovit', 'Tab. ZINCOVIT — (1-0-1)'), 'Tab. ZINCOVIT');
 });
 
 test('strict units: a number needs the same unit as said', () => {
