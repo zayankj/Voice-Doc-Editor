@@ -8,6 +8,7 @@ import { timingLine } from './timingLog.js'; // performance lines for the termin
 import { commandAddon, commandSchema, cleanCursorBlock, cleanRecent } from './commandPrompt.js'; // commands only, never uploads
 import { finishCommand } from './scopeGuard.js'; // commands only: scope check + English interpretation in summary
 import { createModelChain, clientGoneSignal, isRetryable, TOTAL_BUDGET_MS } from './modelChain.js'; // model order, time limits, retries
+import { attachVoiceStream, voiceStreamingEnabled } from './voiceStream.js'; // voice streaming: off unless ENABLE_VOICE_STREAMING=true
 
 const apiKey = process.env.GEMINI_API_KEY;
 const useVertex = String(process.env.GOOGLE_GENAI_USE_VERTEXAI).toLowerCase() === 'true';
@@ -365,4 +366,44 @@ app.post('/api/extract-edits', async (req, res) => {
 
 // Listens on this computer only: the browser cannot reach it, only the gateway can
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, '127.0.0.1', () => console.log(`AI service running on 127.0.0.1:${PORT} (internal, used by the gateway only)`));
+const server = app.listen(PORT, '127.0.0.1', () => console.log(`AI service running on 127.0.0.1:${PORT} (internal, used by the gateway only)`));
+
+// ---------- voice streaming (server/voiceStream.js): OFF unless ENABLE_VOICE_STREAMING=true ----------
+// The same request as a voice clip on /api/extract-edits above - same prompt, same Live attempt and checks, same
+// scope check, same backup - only the audio arrives while it is spoken. The HTTP voice path above is unchanged and
+// stays the fallback. Internal only (127.0.0.1, internal key), like every route of this service.
+if (voiceStreamingEnabled()) {
+  attachVoiceStream(server, {
+    internalKey: INTERNAL_KEY,
+    // the prompt of a voice clip on its own (no file, no typed text), exactly as the handler above builds it
+    makePrompt: ({ outline, today, templateId, cursorBlock, recent }) => {
+      let template = null;
+      if (templateId) {
+        template = Object.hasOwn(TEMPLATES, templateId) ? TEMPLATES[templateId] : null;
+        if (!template) throw Object.assign(new Error('Unknown template'), { status: 400 });
+      }
+      if (!outline) throw Object.assign(new Error('Speak, attach a file or type an instruction'), { status: 400 });
+      return buildExtractPrompt(outline, today, '', false, true, template) +
+        commandAddon({ cursorBlock: cleanCursorBlock(cursorBlock), recent: cleanRecent(recent) });
+    },
+    // the existing (backup) path for a voice clip: the same request as the handler above sends
+    backup: async ({ prompt, wavBase64, deadline, signal }) => {
+      if (allPaused()) throw Object.assign(new Error('Quota or rate limit reached'), { status: 429 });
+      const answer = await generateWithRetry({
+        contents: [{ role: 'user', parts: [{ inlineData: { mimeType: 'audio/wav', data: wavBase64 } }, { text: prompt }] }],
+        config: { responseMimeType: 'application/json', responseSchema: commandSchema(editsSchema), temperature: 0 },
+      }, { deadline, signal });
+      try {
+        return JSON.parse(answer);
+      } catch {
+        throw Object.assign(new Error('unreadable'), { unreadable: true });
+      }
+    },
+    finishCommand,
+    quotaMessage,
+    totalBudgetMs: TOTAL_BUDGET_MS,
+  });
+  console.log('Voice streaming: ON (internal route /internal/voice-stream)');
+} else {
+  console.log('Voice streaming: off (ENABLE_VOICE_STREAMING is not true)');
+}

@@ -305,6 +305,156 @@ export async function liveExtract({ prompt, audioBase64 }) {
   }
 }
 
+// ---------- STREAMING (ENABLE_VOICE_STREAMING=true; server/voiceStream.js) ----------
+// The same Live session as liveExtract (same model, settings, prompt + LIVE_SUFFIX, function, message handling and
+// checks), but opened when the person STARTS speaking: the audio is sent while it is spoken, and activityEnd is sent
+// when the browser's pause detection ends the command (it decides the end exactly as before). The answer is only
+// read after end(), checked all-or-nothing by checkLiveResult - never a partial result. All audio is also kept, so the
+// existing (backup) path can get the same clip as a WAV when Live fails.
+const MAX_STREAM_BYTES = MAX_SECONDS * 16000 * 2; // 16-bit, 16 kHz, mono
+
+export function startLiveStream({ prompt }) {
+  const s = settings();
+  if (!s.model || !process.env.GEMINI_API_KEY) throw new LiveError('live is off');
+  let session = null;
+  let transcript = '';
+  let call = null;
+  let settle;
+  let ended = false;
+  let finished = false;
+  let endTimer = null;
+  let bytes = 0;
+  const kept = []; // every chunk, in order (for the backup path)
+  const waiting = []; // chunks spoken while the session was still opening
+  const done = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+  done.catch(() => {}); // a late rejection must never crash the server (it is still seen by "await done")
+  const timing = {}; // numbers only, for the server log
+  const t0 = Date.now();
+  let endAt = 0;
+  // the whole session can never outlive the longest allowed command + the usual Live time limit
+  const lifeTimer = setTimeout(() => settle.reject(new LiveError('timeout')), MAX_SECONDS * 1000 + s.timeoutMs);
+
+  const sendAudio = (buf) => session.sendRealtimeInput({ audio: { data: buf.toString('base64'), mimeType: 'audio/pcm;rate=16000' } });
+  const sendEnd = () => session.sendRealtimeInput({ activityEnd: {} });
+  const connecting = liveClient().live.connect({
+    model: s.model,
+    config: {
+      responseModalities: [Modality.AUDIO], // this model does not allow TEXT answers; any audio is ignored
+      inputAudioTranscription: {}, // Google's transcript of the speech -> heard
+      realtimeInputConfig: { automaticActivityDetection: { disabled: true } }, // we mark start and end ourselves
+      systemInstruction: prompt + LIVE_SUFFIX,
+      tools: [{ functionDeclarations: [proposeEdits] }],
+    },
+    callbacks: {
+      onmessage: (m) => {
+        const t = m.serverContent?.inputTranscription?.text;
+        if (t) transcript += t;
+        if (m.serverContent?.modelTurn && !call) timing.model_audio = true; // noted for the log
+        const fc = m.toolCall?.functionCalls?.find((f) => f.name === 'propose_edits');
+        if (fc && !call) {
+          call = fc;
+          settle.resolve();
+        }
+        // The model is SPEAKING instead of calling the function: give up now, so the existing path starts at once
+        // instead of after the spoken reply. Checked AFTER the call above: a call always wins, and once there is
+        // a call, audio is ignored. A settled attempt cannot change (a promise settles only once).
+        if (!call && isModelAudio(m)) settle.reject(new LiveError('model spoke instead of calling the function'));
+        if (m.serverContent?.turnComplete && !call) settle.reject(new LiveError('no function call'));
+      },
+      onerror: () => settle.reject(new LiveError('connection error')),
+      onclose: (e) => { if (!call) settle.reject(new LiveError(`closed ${e?.code ?? ''}`.trim())); },
+    },
+  });
+  connecting.then((sess) => {
+    if (finished) { try { sess.close(); } catch { /* ignore */ } return; } // cancelled / failed while opening
+    session = sess;
+    timing.connect_ms = Date.now() - t0;
+    try {
+      session.sendRealtimeInput({ activityStart: {} });
+      for (const buf of waiting.splice(0)) sendAudio(buf);
+      if (ended) sendEnd();
+    } catch { settle.reject(new LiveError('connection error')); }
+  }, () => settle.reject(new LiveError('connection failed')));
+
+  function finish() {
+    if (finished) return;
+    finished = true;
+    clearTimeout(lifeTimer);
+    clearTimeout(endTimer);
+    try {
+      if (call && session) session.sendToolResponse({ functionResponses: [{ id: call.id, name: call.name, response: { ok: true } }] });
+    } catch { /* closing anyway */ }
+    try { session?.close(); } catch { /* already closed */ }
+  }
+
+  return {
+    // one piece of the spoken audio: raw 16-bit, 16 kHz, mono PCM. Anything else ends this attempt (-> backup).
+    push(buf) {
+      if (ended || finished) return;
+      if (!Buffer.isBuffer(buf) || !buf.length || buf.length % 2) { settle.reject(new LiveError('audio chunk is not 16-bit PCM')); return; }
+      bytes += buf.length;
+      if (bytes > MAX_STREAM_BYTES) { settle.reject(new LiveError('WAV is too long')); return; }
+      kept.push(buf);
+      if (!session) { waiting.push(buf); return; }
+      try { sendAudio(buf); } catch { settle.reject(new LiveError('connection error')); }
+    },
+    // the command has ended (the browser's pause detection): the answer, checked all-or-nothing, or an error
+    async end() {
+      if (ended) throw new LiveError('connection error');
+      ended = true;
+      endAt = Date.now();
+      try {
+        if (!bytes) throw new LiveError('WAV has no audio');
+        endTimer = setTimeout(() => settle.reject(new LiveError('timeout')), s.timeoutMs);
+        if (session) {
+          try { sendEnd(); } catch { throw new LiveError('connection error'); }
+        }
+        await done;
+        timing.answer_ms = Date.now() - endAt; // end of speech -> the function call
+        // the transcript may arrive just after the call: wait briefly for it (as liveExtract)
+        const waitFrom = Date.now();
+        for (let i = 0; i < 10 && !transcript.trim(); i++) await new Promise((r) => setTimeout(r, 100));
+        timing.transcript_wait_ms = Date.now() - waitFrom;
+        const checkFrom = Date.now();
+        const result = checkLiveResult(call.args, transcript);
+        timing.check_ms = Date.now() - checkFrom;
+        return withTiming(result, timing);
+      } catch (e) {
+        if (timing.answer_ms === undefined) timing.answer_ms = Date.now() - endAt;
+        throw withTiming(e instanceof LiveError ? e : new LiveError('connection error'), timing);
+      } finally {
+        finish();
+      }
+    },
+    // the person / browser gave up: nothing is answered, the session is closed
+    cancel() {
+      settle.reject(new LiveError('stream cancelled'));
+      finish();
+    },
+    audio: () => Buffer.concat(kept), // everything that was spoken (for the backup path)
+    bytes: () => bytes,
+  };
+}
+
+// raw 16-bit, 16 kHz, mono PCM -> a WAV file (the format of the browser's clips; wavToPcm reads it back)
+export function pcmToWav(pcm) {
+  const head = Buffer.alloc(44);
+  head.write('RIFF', 0, 'ascii');
+  head.writeUInt32LE(36 + pcm.length, 4);
+  head.write('WAVE', 8, 'ascii');
+  head.write('fmt ', 12, 'ascii');
+  head.writeUInt32LE(16, 16);
+  head.writeUInt16LE(1, 20); // PCM
+  head.writeUInt16LE(1, 22); // mono
+  head.writeUInt32LE(16000, 24);
+  head.writeUInt32LE(32000, 28); // bytes per second
+  head.writeUInt16LE(2, 32); // bytes per sample
+  head.writeUInt16LE(16, 34); // bits per sample
+  head.write('data', 36, 'ascii');
+  head.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([head, pcm]);
+}
+
 // for the tests only: the function the model calls, and the Live-only text (both read-only)
 export const liveFunctionDeclaration = () => proposeEdits;
 export const liveSuffix = () => LIVE_SUFFIX;

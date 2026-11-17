@@ -13,6 +13,14 @@ export function createSegmenter({
   minLevel = 0.012, // sounds quieter than this are never speech. Raise it if room noise triggers it, lower it if quiet speech is missed
   onSpeechStart,
   onSegment, // called with the list of audio chunks of one finished command
+  // Optional, for voice streaming (lib/voiceStream.js). They only REPORT what happens here; nothing above or below
+  // depends on them, so the pause, the tail and the cutting into commands are exactly the same with or without them.
+  onSegmentChunk, // (chunk, loud): a chunk was added to the command being spoken (the first ones: see onSpeechStart)
+  onSegmentEnd, // ({ kept, sent }): the command ended; kept = how many of its chunks the clip has, sent = onSegment is called
+  // (chunks): the command has reached the minimum voiced audio (minSpeechMs) - the SAME count that decides `enough`
+  // below, so it is reported exactly for the commands that will be sent (never for a cough or a click). Once per
+  // command; chunks = a copy of all its chunks so far (the pre-roll included).
+  onSpeechConfirmed,
 } = {}) {
   const preRollChunks = Math.ceil(preRollMs / CHUNK_MS);
   const silenceChunks = Math.ceil(silenceMs / CHUNK_MS);
@@ -38,6 +46,7 @@ export function createSegmenter({
     voiced = 0;
     trailingSilent = 0;
     preRoll = [];
+    onSegmentEnd?.({ kept: clip.length, sent: enough });
     if (enough) onSegment?.(clip);
   }
 
@@ -58,14 +67,17 @@ export function createSegmenter({
         preRoll = [];
         voiced = 1;
         trailingSilent = 0;
-        onSpeechStart?.();
+        onSpeechStart?.(seg.slice()); // (the chunks the command starts with: the pre-roll and this one; a copy)
+        if (voiced === minVoiced) onSpeechConfirmed?.(seg.slice()); // (only when the minimum is a single chunk)
         return;
       }
 
       seg.push(chunk);
+      onSegmentChunk?.(chunk, loud);
       if (loud) {
         voiced++;
         trailingSilent = 0;
+        if (voiced === minVoiced) onSpeechConfirmed?.(seg.slice()); // reported once: voiced only ever goes up by 1
       } else {
         trailingSilent++;
       }

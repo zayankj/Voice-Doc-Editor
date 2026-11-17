@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { rateLimit } from 'express-rate-limit';
+import { rateLimit, MemoryStore } from 'express-rate-limit';
+import { attachVoiceStream, voiceStreamingEnabled } from './voiceStream.js'; // voice streaming: off unless ENABLE_VOICE_STREAMING=true
 
 const PORT = process.env.PORT || 4000;
 const AI_URL = (process.env.AI_SERVICE_URL || 'http://127.0.0.1:3001').replace(/\/$/, '');
@@ -93,10 +94,14 @@ app.use((req, res, next) => {
 });
 
 // overall limit per IP (also slows down anyone guessing access keys)
+// (its counter store is named so the voice-stream route counts its connections in the SAME counter)
+const ipStore = new MemoryStore();
+const IP_LIMIT_PER_MIN = 300;
 app.use(
   rateLimit({
     windowMs: 60_000,
-    limit: 300,
+    limit: IP_LIMIT_PER_MIN,
+    store: ipStore,
     standardHeaders: true,
     legacyHeaders: false,
     handler: (_req, res) => res.status(429).json({ error: 'Too many requests. Please slow down.' }),
@@ -180,9 +185,12 @@ async function callAi(pathname, body, id, cancel) {
 }
 
 // model requests cost money and quota: limited per client
+// (its counter store is named so each streamed voice command counts in the SAME per-client counter)
+const clientStore = new MemoryStore();
 const extractLimiter = rateLimit({
   windowMs: 60_000,
   limit: LIMIT_PER_MIN,
+  store: clientStore,
   keyGenerator: (req) => req.client.name,
   standardHeaders: true,
   legacyHeaders: false,
@@ -243,7 +251,21 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ error: 'Something went wrong in the gateway.' });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Gateway running on port ${PORT} -> AI service ${AI_URL}`);
   console.log(`Clients: ${clients.map((c) => c.name).join(', ')} | Allowed origins: ${ORIGINS.join(', ')}`);
 });
+
+// ---------- voice streaming (gateway/voiceStream.js): OFF unless ENABLE_VOICE_STREAMING=true ----------
+// /api/voice-stream (WebSocket): the same access key, allowed origins, per-IP and per-client limits and field checks
+// as the HTTP route above (the same counters), forwarded to the AI service with the internal key. The HTTP route is
+// unchanged and stays the fallback.
+if (voiceStreamingEnabled()) {
+  attachVoiceStream(server, {
+    clients, origins: ORIGINS, aiUrl: AI_URL, internalKey: INTERNAL_KEY, validate,
+    ipStore, ipLimit: IP_LIMIT_PER_MIN, clientStore, clientLimit: LIMIT_PER_MIN, audit,
+  });
+  console.log('Voice streaming: ON (/api/voice-stream)');
+} else {
+  console.log('Voice streaming: off (ENABLE_VOICE_STREAMING is not true)');
+}

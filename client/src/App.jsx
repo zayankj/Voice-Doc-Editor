@@ -35,6 +35,7 @@ import { startLive } from './lib/liveClient';
 import { startCapture } from './lib/audio';
 import { createSegmenter } from './lib/vad';
 import { pcmChunksToWav } from './lib/wav';
+import { createVoiceStream, streamingOn } from './lib/voiceStream'; // voice streaming: off unless built with ENABLE_VOICE_STREAMING=true
 import { voiceTimingLine } from './lib/timing';
 import { reasonCode, notAppliedNote, editFailureLine } from './lib/editFailure';
 import { exportDocx } from './lib/exportDocx';
@@ -119,7 +120,9 @@ export default function App() {
   const live = useRef(null);
   const stopMic = useRef(null);
   const segmenter = useRef(null); // cuts the microphone stream into commands (audio mode)
-  const queue = useRef([]); // finished commands waiting to be sent: { clip, endedAt }
+  const queue = useRef([]); // finished commands waiting to be sent: { clip, endedAt, stream }
+  const speakingStream = useRef(null); // voice streaming: the stream of the command being spoken now (or null)
+  const endedStream = useRef(null); // voice streaming: the stream of the command that just ended (handed to its clip)
   const voiceTiming = useRef(null); // times of the voice command being processed (console line only)
   const working = useRef(false);
   const submitting = useRef(false); // Apply Edit is running (blocks a double click before the button re-renders)
@@ -779,7 +782,9 @@ export default function App() {
 
   // ---------- send a file / text / voice clip to the server and apply the edits it returns ----------
   // voice = true: a spoken command. It does not touch the Apply Edit button.
-  async function runEdits({ file = null, text = '', audio = null, label, voice = false }) {
+  // stream (voice streaming only): the answer of this clip was asked for WHILE it was spoken (lib/voiceStream.js); it
+  // is used exactly like the HTTP answer below. A problem of the stream itself -> the HTTP path with the same clip.
+  async function runEdits({ file = null, text = '', audio = null, label, voice = false, stream = null }) {
     const docAtStart = editor.state.doc;
     stopReadingNow();
     setError('');
@@ -799,7 +804,7 @@ export default function App() {
       const stopProgress = startProgress(file ? 'file' : voice ? 'voice' : 'typed', setProgress);
       let answer;
       try {
-        answer = await extractEdits({
+        const request = {
           signal: ticket.signal,
           file,
           instruction: text,
@@ -809,7 +814,13 @@ export default function App() {
           templateId: openTemplateId(), // '' for discharge summaries
           // commands only (never files): where the cursor is, and the commands applied earlier in THIS document
           ...(file ? {} : { cursorBlock: cursorBlockId(), recent: recentCommands.current }),
-        });
+        };
+        answer = stream
+          ? await stream.result({ signal: ticket.signal }).catch((e) => {
+            if (!e?.fallback) throw e; // the AI's own answer (busy, quota, too slow), a time-out or a cancel: as on HTTP
+            return extractEdits(request); // the stream itself failed: the existing HTTP voice path, same clip
+          })
+          : await extractEdits(request);
       } finally {
         stopProgress();
         ticket.done();
@@ -1000,13 +1011,21 @@ export default function App() {
     setProcessing(true);
     try {
       while (queue.current.length) {
-        const { clip, endedAt } = queue.current.shift();
+        const { clip, endedAt, stream: spoken = null } = queue.current.shift();
         const startedAt = performance.now();
         const { base64, seconds } = pcmChunksToWav(clip);
-        if (seconds < 0.5) continue;
+        if (seconds < 0.5) { spoken?.cancel(); continue; }
+        // voice streaming: its answer belongs to the document AS IT WAS when the person started speaking. If anything
+        // changed since (an edit, another document), the stream is dropped and the HTTP path below sends the clip
+        // with the document as it is now - exactly as without streaming.
+        let stream = spoken;
+        if (stream && (stream.docKey !== currentId.current || !editor.state.doc.eq(stream.docAtStart))) {
+          stream.cancel();
+          stream = null;
+        }
         const timing = {};
         voiceTiming.current = timing;
-        const outcome = await runAndReport({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true });
+        const outcome = await runAndReport({ audio: { base64, mimeType: 'audio/wav' }, label: 'your voice command', voice: true, stream });
         voiceTiming.current = null;
         // numbers and a fixed outcome word only (lib/timing.js); total = end of speaking (the pause) -> document updated
         const done = performance.now();
@@ -1023,12 +1042,41 @@ export default function App() {
   }
 
   function enqueueClip(clip) {
+    const stream = endedStream.current; // voice streaming: the stream of THIS clip (set just before, by vad.js)
+    endedStream.current = null;
     if (queue.current.length >= MAX_QUEUE) {
+      stream?.cancel();
       showToast('Too many commands waiting. Please wait a moment.');
       return;
     }
-    queue.current.push({ clip, endedAt: performance.now() }); // endedAt: when the pause ended the command (for the timing line)
+    queue.current.push({ clip, endedAt: performance.now(), stream }); // endedAt: when the pause ended the command (for the timing line)
     processQueue();
+  }
+
+  // ---------- voice streaming (lib/voiceStream.js; only when built with ENABLE_VOICE_STREAMING=true) ----------
+  // A stream is opened ONLY when no other voice command is waiting or being handled: its answer is made for the
+  // document as it is now, so a command spoken while an earlier one is still being applied uses the HTTP path (its
+  // document is read when its turn comes, as before). The queue still handles one command at a time.
+  function startStream(startChunks) {
+    speakingStream.current?.cancel();
+    speakingStream.current = null;
+    if (!streamingOn() || !editor || working.current || queue.current.length || !currentId.current) return;
+    const stream = createVoiceStream({
+      start: { outline: buildOutline(editor.state.doc), today: todayString(), templateId: openTemplateId() },
+      startChunks,
+    });
+    stream.docAtStart = editor.state.doc;
+    stream.docKey = currentId.current;
+    speakingStream.current = stream;
+  }
+  // the command ended (vad.js): its stream sends the clip's tail and "end" - or is dropped (too short to be a command)
+  function endStream({ kept, sent }) {
+    const stream = speakingStream.current;
+    speakingStream.current = null;
+    if (!stream) return;
+    if (!sent) { stream.cancel(); return; }
+    stream.finish(kept);
+    endedStream.current = stream; // handed to the clip in enqueueClip (called right after this by vad.js)
   }
 
   function stopListening() {
@@ -1045,6 +1093,7 @@ export default function App() {
     try {
       stopReadingNow(); // the speaker must not feed into the mic
       setError(''); setTranscript(''); setReply(''); setNote('');
+      for (const q of queue.current) q.stream?.cancel(); // voice streaming: dropped clips close their streams too
       queue.current = [];
       lastActivity.current = Date.now();
       segmenter.current = createSegmenter({
@@ -1057,6 +1106,11 @@ export default function App() {
           setHearing(false);
           enqueueClip(clip);
         },
+        // voice streaming only (each does nothing when it is off): a stream is opened only once the command has the
+        // minimum voiced audio (500 ms) - a cough or a click never opens one; then what vad.js reports is passed to it
+        onSpeechConfirmed: (chunksSoFar) => startStream(chunksSoFar),
+        onSegmentChunk: (chunk, loud) => speakingStream.current?.push(chunk, loud),
+        onSegmentEnd: endStream,
       });
       stopMic.current = await startCapture((chunk, rms) => {
         segmenter.current?.push(chunk, rms);

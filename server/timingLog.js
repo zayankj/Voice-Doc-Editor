@@ -7,7 +7,7 @@ export const LIVE_REASONS = [
   'live is off', 'timeout', 'no function call', 'model spoke instead of calling the function', 'connection error', 'connection failed', 'closed',
   'audio is not a WAV file', 'WAV format block is broken', 'WAV data is cut off', 'WAV has no format block',
   'WAV is not 16-bit 16 kHz mono PCM', 'WAV has no audio', 'WAV audio length is odd', 'WAV is too long',
-  'empty transcript', 'too many edits',
+  'empty transcript', 'too many edits', 'audio chunk is not 16-bit PCM', 'stream cancelled',
   'invalid function arguments (not an object)', 'invalid function arguments (edits not a list)',
   'invalid function arguments (summary, heard or language not text)', 'invalid function arguments (all_words not text)',
   'invalid function arguments (understood missing)',
