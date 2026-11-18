@@ -2,19 +2,11 @@
 // The copy is changed with exactly the same code as Apply (applyVoiceEdit + the age / gender steps), so the
 // preview shows what Apply will do. The real editor, its Undo history and its highlights are never touched.
 import { EditorState } from '@tiptap/pm/state';
-import { applyVoiceEdit, applyPatientConsistency, ensurePatientConsistency, getPatientFacts } from './voiceEdit.js';
-import { getBlocks } from './outline.js';
+import { applyVoiceEdit } from './voiceEdit.js';
+
 import { changesGender, isLabelText } from './guards.js';
 import { cellAt, dataCellRole, rowName } from './tables.js';
-import { countMedicineLines } from './medicineText.js';
 
-// How many medicine lines a set of AI edits (typed / spoken command) would remove, worked out on a COPY with
-// exactly the same code as Apply. The app refuses edits that remove 2 or more: several medicines are removed
-// only through the confirmation window ("remove all medicines", "remove all syrups", "remove dolo and ciplox").
-export function medicinesLostByEdits(doc, edits, allowGender = true) {
-  const dry = previewEdits(doc, edits, { allowGender, fromFile: false });
-  return countMedicineLines(doc) - countMedicineLines(dry.doc);
-}
 
 // A throw-away editor holding a copy of the document
 function copyEditor(doc) {
@@ -46,14 +38,15 @@ function isPatientDetail(doc, pos, before, after) {
 }
 
 // edits: the AI's edits in the order App.jsx applies them (bottom of the document first)
-// selected: indexes of the edits to include (default: all); consistency: also run the final age / gender step
+// selected: indexes of the edits to include (default: all)
 // Returns {
-//   items:       [{ index, field, before, after, patient, also: [{ before, after }] }]  edits that change something
-//   blocked:     [{ index, field, reason }]                                            edits that will not be applied
+//   items:       [{ index, field, before, after, patient, also: [] }]  edits that change something
+//   blocked:     [{ index, field, reason }]                             edits that will not be applied
 //   unchanged:   number of edits that would change nothing
-//   consistency: [{ before, after }]   extra places the final age / gender step would change
+//   consistency: []   (R3, D5: the app no longer rewrites age / gender after the edits; kept empty for the window)
 // }
-export function previewEdits(doc, edits, { allowGender = true, fromFile = true, selected = null, consistency = true } = {}) {
+// The dry run uses exactly the code Apply uses (applyVoiceEdit), so the window shows what Apply will do.
+export function previewEdits(doc, edits, { fromFile = true, selected = null } = {}) {
   const ed = copyEditor(doc);
   const items = [];
   const blocked = [];
@@ -61,8 +54,7 @@ export function previewEdits(doc, edits, { allowGender = true, fromFile = true, 
   edits.forEach((e, index) => {
     if (selected && !selected.has(index)) return;
     const before = ed.state.doc;
-    const facts = getPatientFacts(before);
-    const r = applyVoiceEdit(ed, e, { allowGender, fromFile });
+    const r = applyVoiceEdit(ed, e, { fromFile });
     const fallback = e.field_label || e.block_id;
     if (!r.ok) {
       blocked.push({ index, field: fallback, reason: r.error || 'could not be applied' });
@@ -72,29 +64,16 @@ export function previewEdits(doc, edits, { allowGender = true, fromFile = true, 
       unchanged++;
       return;
     }
-    // the header age / gender changed: the matching narrative phrases follow (as handleEdit does in App.jsx)
-    const also = applyPatientConsistency(ed, facts).map((c) => ({ before: c.before, after: c.after }));
     const now = ed.state.doc;
     items.push({
       index,
       field: placeName(now, r.pos, fallback),
       before: r.before || '',
       after: r.after || '',
-      patient: also.length > 0 || isPatientDetail(now, r.pos, r.before || '', r.after || ''),
-      also,
+      patient: isPatientDetail(now, r.pos, r.before || '', r.after || ''),
+      also: [],
     });
   });
-  // the final age / gender step, exactly as App.jsx applyAiEdits does it: Patient Details (the header) are the source;
-  // when they did not change, only the text these edits wrote follows them (no other place, never the header)
-  let extra = [];
-  if (items.length && consistency) {
-    const start = getPatientFacts(doc);
-    const now = getPatientFacts(ed.state.doc);
-    const oldTexts = new Set(getBlocks(doc).map((b) => b.node.textContent));
-    const detailsChanged = now.age !== start.age || now.gender !== start.gender;
-    extra = (detailsChanged ? ensurePatientConsistency(ed) : ensurePatientConsistency(ed, null, (node) => !oldTexts.has(node.textContent)))
-      .map((c) => ({ before: c.before, after: c.after }));
-  }
   ed.isDestroyed = true;
-  return { items, blocked, unchanged, consistency: extra, doc: ed.state.doc };
+  return { items, blocked, unchanged, consistency: [], doc: ed.state.doc };
 }

@@ -19,7 +19,6 @@ import { asOneUndoStep } from '../src/lib/undoStep.js';
 import { getBlocks } from '../src/lib/outline.js';
 import { lockReason } from '../src/lib/guards.js';
 import { keepValueFormat, cellAt, dataCellRole, isDataTable } from '../src/lib/tables.js';
-import { checkTableEdits, numbersSaid } from '../src/lib/verify.js';
 
 // voiceEdit.js imports its neighbours without ".js": a temporary copy with the endings added
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -302,68 +301,10 @@ test('all edits of one upload are ONE undo step, and Undo restores the exact ori
 
 // ---------- the row and number check for typed / spoken commands ----------
 const DOC = makeDoc();
-const kept = (cmd, edits) => checkTableEdits(DOC, cmd, edits);
 
-test('numbersSaid: digits, commas, "lakh / thousand" and spoken words', () => {
-  assert.ok(numbersSaid('change platelet count to 5 lakh 86 thousand').includes(586000));
-  assert.ok(numbersSaid('change platelet count to five lakh eighty six thousand').includes(586000));
-  assert.ok(numbersSaid('platelets 5 lakh 86000').includes(586000));
-  assert.ok(numbersSaid('creatinine two point nine').includes(2.9));
-  assert.ok(numbersSaid('TLC 26,560').includes(26560));
-  // live replay: the transcript ended with a full stop
-  assert.ok(numbersSaid('Change TLC to 26,560 and total bilirubin to 2.2.').includes(2.2));
-  assert.ok(!numbersSaid('change platelet count to 5 lock 86,000').includes(500000));
-});
 
-test('the right row and the said number -> kept', () => {
-  for (const [cmd, e] of [
-    ['Change serum creatinine from 1.9 to 2.9', { block_id: 'B25', operation: 'set', new_value: '2.9 MG/DL' }],
-    ['Change platelet count to 586000', { block_id: 'B23', operation: 'set', new_value: '5,86,000/CUMM' }],
-    ['change platelets to 5 lakh 86 thousand', { block_id: 'B23', operation: 'set', new_value: '5,86,000/CUMM' }],
-    ['change T L C to 26560', { block_id: 'B21', operation: 'set', new_value: '26560' }],
-    ['haemoglobin is 14.2', { block_id: 'B19', operation: 'set', new_value: '14.2 G/DL' }],
-    ['change creatinine to 2.9', { block_id: 'B24', operation: 'set', new_value: '2.9 MG/DL' }], // aimed at the label: moved later
-  ]) {
-    const r = kept(cmd, [e]);
-    assert.deepEqual(r.blocked, [], cmd);
-    assert.equal(r.edits.length, 1, cmd);
-  }
-});
 
-test('"SGPT is 45 and SGOT is 50" -> both rows kept', () => {
-  const r = kept('SGPT is 45 and SGOT is 50', [
-    { block_id: 'B31', operation: 'set', new_value: '50 U/L' },
-    { block_id: 'B29', operation: 'set', new_value: '45 U/L' },
-  ]);
-  assert.equal(r.edits.length, 2);
-});
 
-test('WRONG ROW: "change SGPT to 45" but the AI changed SGOT -> refused with a reason', () => {
-  const r = kept('change SGPT to 45', [{ block_id: 'B31', operation: 'set', new_value: '45 U/L' }]);
-  assert.equal(r.edits.length, 0);
-  assert.match(r.blocked[0], /^SGOT: your command does not name SGOT/);
-});
 
-test('MISHEARD NUMBER (audit): heard "5 lock 86,000", AI wrote 5,00,000 -> refused, asks for the number again', () => {
-  const r = kept('change platelet count to 5 lock 86,000', [{ block_id: 'B23', operation: 'set', new_value: '5,00,000/CUMM' }]);
-  assert.equal(r.edits.length, 0);
-  assert.match(r.blocked[0], /500000 was not in your command/);
-});
 
-test('only part of a name with two possible rows ("bilirubin": TOTAL and DIRECT) -> asks which one', () => {
-  const doc = schema.node('doc', null, [table(tr(th('Investigation'), th('Result')), tr(th('TOTAL BILIRUBIN'), th('1.2 MG/DL')),
-    tr(th('DIRECT BILIRUBIN'), th('0.4 MG/DL')), tr(th('SODIUM'), th('140 MEQ/L')))]);
-  const ids = getBlocks(doc).map((b) => b.node.textContent);
-  const direct = `B${ids.indexOf('0.4 MG/DL')}`;
-  const r = checkTableEdits(doc, 'change the bilirubin to 0.6', [{ block_id: direct, operation: 'set', new_value: '0.6 MG/DL' }]);
-  assert.match(r.blocked[0], /not clear which row/);
-  const ok = checkTableEdits(doc, 'change direct bilirubin to 0.6', [{ block_id: direct, operation: 'set', new_value: '0.6 MG/DL' }]);
-  assert.equal(ok.edits.length, 1);
-});
 
-test('a new row must be named in the command; other edits (header, text) are not checked here', () => {
-  assert.equal(kept('add CRP 48.9', [{ block_id: 'B37', operation: 'insert_after', new_value: 'CRP | 48.9 MG/L' }]).edits.length, 1);
-  assert.equal(kept('add ESR 20', [{ block_id: 'B37', operation: 'insert_after', new_value: 'CRP | 48.9 MG/L' }]).edits.length, 0);
-  const other = [{ block_id: 'B12', operation: 'set', new_value: 'IP00019515' }, { block_id: 'B39', operation: 'append', new_value: 'Stable.' }];
-  assert.deepEqual(kept('update the IP number to IP00019515', other).edits, other);
-});

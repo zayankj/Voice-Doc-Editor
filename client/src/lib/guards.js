@@ -112,7 +112,6 @@ function firstLineHeading(node) {
 
 // ---------- gender ----------
 const GENDER_WORDS = /\b(male|female|man|woman|men|women|boy|girl|gentleman|lady|he|she|him|his|her|hers|himself|herself)\b/gi;
-const ABOUT_GENDER = /\b(male|female|gender|sex|man|woman|boy|girl|gentleman|lady|he|she|him|his|her)\b/i;
 
 const genderWords = (t) => (String(t || '').match(GENDER_WORDS) || []).map((w) => w.toLowerCase());
 
@@ -127,9 +126,4 @@ export function changesGender(before, after) {
     left.splice(k, 1);
   }
   return false;
-}
-
-// May the AI change gender words for this command?
-export function genderChangeAllowed({ instruction = '', heard = '', hasFile = false }) {
-  return hasFile || ABOUT_GENDER.test(`${instruction} ${heard}`);
 }

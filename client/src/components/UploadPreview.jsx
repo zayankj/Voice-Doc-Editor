@@ -65,6 +65,7 @@ export default function UploadPreview({ fileName, summary, preview, recompute, o
         </div>
 
         <div className="modal-body confirm-body">
+          {command?.notice && <p className="confirm-note warn">{command.notice}</p>}
           {summary && <p className="confirm-note">AI: {summary}</p>}
           {command?.notIncluded?.length > 0 && (
             <p className="confirm-note warn">Not included: {command.notIncluded.join('; ')}</p>

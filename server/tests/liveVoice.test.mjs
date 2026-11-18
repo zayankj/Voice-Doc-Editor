@@ -58,18 +58,14 @@ const good = {
   ],
 };
 
-test('valid answer -> { edits, summary, heard, understood, language, all_words, transcript }; heard = the MODEL words; unknown fields dropped', () => {
+test('valid answer -> { edits, summary, heard, understood, transcript }; heard = the MODEL words; unknown fields dropped', () => {
   const r = checkLiveResult(good, '  google transcript  ');
-  assert.deepEqual(Object.keys(r).sort(), ['all_words', 'edits', 'heard', 'language', 'summary', 'transcript', 'understood']);
-  assert.equal(r.transcript, 'google transcript'); // Google's own words, for the scope check in index.js only
-  assert.equal(r.all_words, '');
-  assert.equal(checkLiveResult({ ...good, all_words: ' ella ' }, 'x').all_words, 'ella');
-  // all_words must be short text, otherwise the whole answer is refused (existing path)
-  throwsLive(() => checkLiveResult({ ...good, all_words: 5 }, 'x'), /invalid function arguments/);
-  throwsLive(() => checkLiveResult({ ...good, all_words: 'x'.repeat(201) }, 'x'), /invalid function arguments/);
+  // (R3) language / all_words are no longer part of the answer: anything the model still sends is dropped
+  assert.deepEqual(Object.keys(r).sort(), ['edits', 'heard', 'summary', 'transcript', 'understood']);
+  assert.equal(r.transcript, 'google transcript'); // Google's own words: the proof that speech was heard
+  assert.equal(checkLiveResult({ ...good, all_words: 5, language: [] }, 'x').edits.length, 3, 'old fields are ignored, never refused');
   assert.equal(r.heard, 'Change serum creatinine from 1.9 to 2.9.');
   assert.equal(r.understood, 'change Serum Creatinine to 2.9');
-  assert.equal(r.language, 'English');
   assert.equal(r.summary, 'Updated serum creatinine.');
   assert.deepEqual(r.edits[0], { block_id: 'B2', operation: 'replace_text', field_label: 'Serum Creatinine', new_value: '2.9', find_text: '1.9' });
   assert.equal(r.edits.length, 3);
@@ -82,7 +78,6 @@ test('Malayalam speech: Google writes "remove" in Malayalam script; heard keeps 
   const model = 'എല്ലാ medicines-നും generic name remove ചെയ്യണം';
   const r = checkLiveResult({ ...good, edits: [], heard: model, understood: 'remove the generic names from all medicines in Advice', language: 'Malayalam + English' }, google);
   assert.equal(r.heard, model);
-  assert.equal(r.language, 'Malayalam + English');
   // the model left heard empty -> Google's transcript is used (never an empty heard)
   assert.equal(checkLiveResult({ ...good, heard: '' }, google).heard, google);
   assert.equal(checkLiveResult({ ...good, heard: undefined }, google).heard, google);
@@ -151,7 +146,7 @@ test('spoken commands may use format / change_case / to_list / unlist; their fie
 test('broken arguments -> refused', () => {
   for (const args of [null, undefined, 'text', [], {}, { edits: 'B2' }, { edits: {} }, { edits: [], understood: 'x', summary: 5 },
     { edits: [], summary: '' }, // understood is required
-    { edits: [], understood: 5 }, { edits: [], understood: 'x', heard: 7 }, { edits: [], understood: 'x', language: [] },
+    { edits: [], understood: 5 }, { edits: [], understood: 'x', heard: 7 },
     { edits: [], understood: 'x'.repeat(10001) }]) {
     throwsLive(() => checkLiveResult(args, 'some words'), /invalid function arguments/);
   }
@@ -221,8 +216,7 @@ test('Live-only wording: the function says where each value goes; the answer for
   assert.deepEqual(strip(decl.parameters), {
     type: Type.OBJECT,
     properties: {
-      heard: { type: Type.STRING }, understood: { type: Type.STRING }, language: { type: Type.STRING },
-      all_words: { type: Type.STRING }, summary: { type: Type.STRING },
+      heard: { type: Type.STRING }, understood: { type: Type.STRING }, summary: { type: Type.STRING },
       edits: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: {
         block_id: { type: Type.STRING }, operation: { type: Type.STRING, enum: COMMAND_OPERATIONS },
         new_value: { type: Type.STRING }, find_text: { type: Type.STRING }, field_label: { type: Type.STRING },

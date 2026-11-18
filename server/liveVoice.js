@@ -5,7 +5,7 @@
 //     1. the WAV is checked and turned into raw PCM (16-bit, 16 kHz, mono - what Live expects)
 //     2. one Live session: the existing prompt as system instruction, ONE function "propose_edits"
 //     3. the clip is sent between activityStart / activityEnd (the app already decided where the command ends)
-//     4. the answer: the function's arguments (heard, understood, language, edits, summary). Google's own transcript
+//     4. the answer: the function's arguments (heard, understood, edits, summary). Google's own transcript
 //        is only the PROOF that speech was heard (it writes English words said in Malayalam speech in Malayalam
 //        script, which the browser's checks cannot read; the model writes them in English letters, as on the
 //        existing path)
@@ -85,7 +85,7 @@ export function wavToPcm(buf) {
 }
 
 // ---------- checking the function's output ----------
-// Returns { edits, summary, heard, understood, language, all_words, transcript } or throws LiveError. ALL-OR-NOTHING: one invalid edit
+// Returns { edits, summary, heard, understood, transcript } or throws LiveError. ALL-OR-NOTHING: one invalid edit
 // rejects the whole answer, so an incomplete or invalid edit can never be applied. Unknown fields are dropped.
 // transcript = Google's transcript: only the proof that speech was heard (empty -> refused).
 // heard = the model's own transcript (English words in English letters, as on the existing path); if it is
@@ -95,12 +95,11 @@ export function checkLiveResult(args, transcript) {
   if (!proof) fail('empty transcript');
   // The message says WHICH check failed, as a fixed label (for the timing log; never a value, never sent to the browser)
   if (!args || typeof args !== 'object' || Array.isArray(args)) fail('invalid function arguments (not an object)');
-  const { edits, summary, heard, understood, language, all_words: allWords } = args;
+  const { edits, summary, heard, understood } = args;
   if (!Array.isArray(edits)) fail('invalid function arguments (edits not a list)');
   if (edits.length > MAX_EDITS) fail('too many edits');
   const optionalText = (v) => v === undefined || (typeof v === 'string' && v.length <= MAX_TEXT);
-  if (!optionalText(summary) || !optionalText(heard) || !optionalText(language)) fail('invalid function arguments (summary, heard or language not text)');
-  if (allWords !== undefined && (typeof allWords !== 'string' || allWords.length > 200)) fail('invalid function arguments (all_words not text)');
+  if (!optionalText(summary) || !optionalText(heard)) fail('invalid function arguments (summary or heard not text)');
   if (typeof understood !== 'string' || understood.length > MAX_TEXT) fail('invalid function arguments (understood missing)');
   const text = (v) => typeof v === 'string' && v.length <= MAX_TEXT;
   const clean = edits.map((e) => {
@@ -127,6 +126,7 @@ export function checkLiveResult(args, transcript) {
     for (const k of ['new_value', 'find_text', 'style', 'case', 'list_type', 'lines', 'select', 'last_block_id', 'duplicate_ok']) {
       if (e[k] !== undefined) out[k] = e[k];
     }
+    // only the known fields are passed on (anything else the model sends, e.g. old statement keys, is dropped)
     return out;
   });
   return {
@@ -134,8 +134,6 @@ export function checkLiveResult(args, transcript) {
     summary: typeof summary === 'string' ? summary : '',
     heard: (typeof heard === 'string' && heard.trim()) || proof,
     understood: understood.trim(),
-    language: typeof language === 'string' ? language.trim() : '',
-    all_words: typeof allWords === 'string' ? allWords.trim() : '',
     transcript: proof,
   };
 }
@@ -166,8 +164,6 @@ const proposeEdits = {
     properties: {
       heard: { type: Type.STRING, description: 'The person\'s words, as said.' },
       understood: { type: Type.STRING, description: 'One plain-English sentence: what should be done, or what is unclear.' },
-      language: { type: Type.STRING },
-      all_words: { type: Type.STRING },
       summary: { type: Type.STRING, description: 'One short sentence: what was changed - or, when asking, the one question ("... Nothing was changed.").' },
       edits: {
         type: Type.ARRAY,
@@ -194,7 +190,7 @@ const proposeEdits = {
 const LIVE_SUFFIX = `
 
 LIVE SESSION: the spoken command arrives as audio in this session. Do not speak. When the person has finished,
-call the function propose_edits exactly once, with heard, understood, language, all_words, summary and edits following all the rules above
+call the function propose_edits exactly once, with heard, understood, summary and edits following all the rules above
 (an empty edits list when nothing should change or when you ask a question). Never answer in any other way.
 
 FORMAT OF THE FUNCTION CALL (an answer in any other form cannot be used, and the command has to be processed again):
@@ -218,7 +214,7 @@ export const isModelAudio = (m) => {
     && p.inlineData.mimeType.toLowerCase().startsWith('audio/') && Boolean(p.inlineData.data));
 };
 
-// One voice clip -> { edits, summary, heard, understood, language, all_words, transcript }. Throws LiveError (safe message) on ANY problem.
+// One voice clip -> { edits, summary, heard, understood, transcript }. Throws LiveError (safe message) on ANY problem.
 export async function liveExtract({ prompt, audioBase64 }) {
   const s = settings();
   if (!liveEnabled()) fail('live is off');

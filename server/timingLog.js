@@ -9,7 +9,7 @@ export const LIVE_REASONS = [
   'WAV is not 16-bit 16 kHz mono PCM', 'WAV has no audio', 'WAV audio length is odd', 'WAV is too long',
   'empty transcript', 'too many edits', 'audio chunk is not 16-bit PCM', 'stream cancelled',
   'invalid function arguments (not an object)', 'invalid function arguments (edits not a list)',
-  'invalid function arguments (summary, heard or language not text)', 'invalid function arguments (all_words not text)',
+  'invalid function arguments (summary or heard not text)',
   'invalid function arguments (understood missing)',
   'invalid edit (not an object)', 'invalid edit (block_id not like B12)', 'invalid edit (unknown operation)',
   'invalid edit (field_label missing)', 'invalid edit (new_value or find_text not text)', 'invalid edit (new_value missing)',

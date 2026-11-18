@@ -28,7 +28,8 @@ for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tabl
   const src = fs.readFileSync(path.join(here, '../src/lib', `${f}.js`), 'utf8').replace(/from '\.\/([A-Za-z]+)'/g, "from './$1.js'");
   fs.writeFileSync(path.join(tmp, `${f}.js`), src);
 }
-const { applyVoiceEdit, applyPatientConsistency, getPatientFacts } = await import(pathToFileURL(path.join(tmp, 'voiceEdit.js')).href);
+const { applyVoiceEdit } = await import(pathToFileURL(path.join(tmp, 'voiceEdit.js')).href);
+const { hasDeletion } = await import(pathToFileURL(path.join(here, '../src/lib/deletions.js')).href);
 const { previewEdits } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
 await build({
   entryPoints: [path.join(here, '../src/components/UploadPreview.jsx')],
@@ -84,33 +85,30 @@ const textOf = (ed, i) => {
 const lines = (node) => { const out = ['']; node.forEach((n) => { if (n.isText) out[out.length - 1] += n.text; else out.push(''); }); return out; };
 const FILE = { allowGender: true, fromFile: true };
 
-// ---------- 1. a file never deletes ----------
-test('FILE: clearing or emptying a value is refused ("ALP is not in the new report")', () => {
-  const ed = makeEditor();
-  const before = ed.state.doc;
+// ---------- 1. R4 (D7): a file edit goes through the same technical checks as a typed command ----------
+// Deleting is no longer refused for files; App.jsx asks for confirmation first (lib/deletions.js, tested below).
+test('FILE (D7): clearing or emptying a value is applied by the editor; it counts as a deletion (confirmed in the app)', () => {
   for (const e of [
     { block_id: 'B33', operation: 'clear' },
     { block_id: 'B33', operation: 'set', new_value: '' },
-    { block_id: 'B27', operation: 'set', new_value: '  ' },
     { block_id: 'B39', operation: 'replace_text', find_text: 'Patient is stable.', new_value: '' },
   ]) {
+    const ed = makeEditor();
+    assert.equal(hasDeletion(ed.state.doc, [e]), true, JSON.stringify(e));
     const r = applyVoiceEdit(ed, e, FILE);
-    assert.equal(r.blocked, true, JSON.stringify(e));
-    assert.match(r.error, /cannot delete/);
+    assert.equal(r.ok, true, `${JSON.stringify(e)} ${r.error}`);
+    done(ed);
   }
-  assert.ok(ed.state.doc.eq(before));
-  done(ed);
 });
 
-test('FILE: a paragraph of text cannot be replaced with different text, but text may be added to it', () => {
+test('FILE (D7): a paragraph can be replaced or added to; no deletion confirmation needed for that', () => {
   const ed = makeEditor();
-  const r = applyVoiceEdit(ed, { block_id: 'B39', operation: 'set', new_value: 'Patient was given antibiotics.' }, FILE);
-  assert.match(r.error, /replace the existing text/);
-  assert.equal(textOf(ed, 39).textContent, COURSE);
+  const set = { block_id: 'B39', operation: 'set', new_value: 'Patient was given antibiotics.' };
+  assert.equal(hasDeletion(ed.state.doc, [set]), false);
+  assert.equal(applyVoiceEdit(ed, set, FILE).ok, true);
+  assert.equal(textOf(ed, 39).textContent, 'Patient was given antibiotics.');
   applyVoiceEdit(ed, { block_id: 'B39', operation: 'append', new_value: 'CRP was 48.9.' }, FILE);
-  assert.equal(textOf(ed, 39).textContent, `${COURSE} CRP was 48.9.`);
-  applyVoiceEdit(ed, { block_id: 'B39', operation: 'set', new_value: `${COURSE} CRP was 48.9. Discharged.` }, FILE); // keeps the old text
-  assert.equal(textOf(ed, 39).textContent, `${COURSE} CRP was 48.9. Discharged.`);
+  assert.equal(textOf(ed, 39).textContent, 'Patient was given antibiotics. CRP was 48.9.');
   done(ed);
 });
 
@@ -132,61 +130,6 @@ test('TYPED / SPOKEN commands are not affected: clearing and rewriting still wor
 });
 
 // ---------- 2. prescription uploads (the regression) ----------
-test('PRESCRIPTION (audit, was blocked 2 of 2): the whole list again + Tab. PAN -> PAN added on its OWN line', () => {
-  const ed = makeEditor();
-  const r = applyVoiceEdit(ed, { block_id: 'B41', operation: 'set', new_value: `${DOLO}\n${INSTARAFT}\n${PAN}` }, FILE);
-  assert.equal(r.ok, true);
-  // the preview / History show an ADDITION, not the old list struck out (live replay finding)
-  assert.deepEqual([r.before, r.after], ['', PAN]);
-  assert.deepEqual(lines(textOf(ed, 41)), [DOLO, INSTARAFT, PAN]);
-  let bolds = 0;
-  textOf(ed, 41).forEach((n) => { if (n.marks?.length) bolds++; });
-  assert.equal(bolds, 1); // the bold brand name of the first line is untouched
-  done(ed);
-});
-
-test('the AI glued the lines ("...SOSSyp. INSTARAFT...") -> still recognised, PAN added on its own line', () => {
-  const ed = makeEditor();
-  applyVoiceEdit(ed, { block_id: 'B41', operation: 'set', new_value: `${DOLO}${INSTARAFT} ${PAN}` }, FILE);
-  assert.deepEqual(lines(textOf(ed, 41)), [DOLO, INSTARAFT, PAN]);
-  done(ed);
-});
-
-test('a changed dose in the list -> ONLY that line changes; line break and bold kept', () => {
-  const ed = makeEditor();
-  const r = applyVoiceEdit(ed, { block_id: 'B41', operation: 'set', new_value: `${DOLO.replace('650', '500')}\n${INSTARAFT}` }, FILE);
-  assert.equal(r.ok, true);
-  assert.deepEqual([r.before, r.after], [DOLO, DOLO.replace('650', '500')]); // only that line, old -> new
-  assert.deepEqual(lines(textOf(ed, 41)), [DOLO.replace('650', '500'), INSTARAFT]);
-  const marked = [];
-  textOf(ed, 41).forEach((n) => { if (n.marks?.length) marked.push(n.text); });
-  assert.deepEqual(marked, ['DOLO']);
-  done(ed);
-});
-
-test('a list that LOSES a medicine is refused (removing has its own command and window)', () => {
-  const ed = makeEditor();
-  const before = ed.state.doc;
-  const r = applyVoiceEdit(ed, { block_id: 'B41', operation: 'set', new_value: `${INSTARAFT}\n${PAN}` }, FILE);
-  assert.equal(r.blocked, true);
-  assert.match(r.error, /contains 2 medicines; the proposed list would remove or rewrite medicines/);
-  assert.ok(ed.state.doc.eq(before));
-  done(ed);
-});
-
-test('the same list again -> nothing changes; medicines in separate paragraphs -> the new one is a new paragraph', () => {
-  let ed = makeEditor();
-  const before = ed.state.doc;
-  assert.equal(applyVoiceEdit(ed, { block_id: 'B41', operation: 'set', new_value: `${DOLO}\n${INSTARAFT}` }, FILE).unchanged, true);
-  assert.ok(ed.state.doc.eq(before));
-  done(ed);
-  ed = makeEditor(makeDoc([p(DOLO), p(INSTARAFT)]));
-  applyVoiceEdit(ed, { block_id: 'B42', operation: 'set', new_value: `${INSTARAFT}\n${PAN}` }, FILE);
-  assert.equal(textOf(ed, 42).textContent, INSTARAFT);
-  assert.equal(textOf(ed, 43).textContent, PAN);
-  done(ed);
-});
-
 // ---------- 3. the preview is a TRUE dry run ----------
 // the image upload of the audit: values aimed at the label cells, a new CRP row, "clear ALP"
 const IMAGE_EDITS = [
@@ -217,8 +160,7 @@ test('PREVIEW = APPLY: applying the same edits gives exactly the previewed docum
   const pv = previewEdits(ed.state.doc, IMAGE_EDITS, FILE);
   asOneUndoStep(ed.view, () => {
     for (const e of IMAGE_EDITS) {
-      const facts = getPatientFacts(ed.state.doc);
-      if (applyVoiceEdit(ed, e, FILE).ok) applyPatientConsistency(ed, facts); // as handleEdit in App.jsx
+      applyVoiceEdit(ed, e, FILE); // as handleEdit in App.jsx (R4: no app-side age / gender step)
     }
   });
   assert.ok(ed.state.doc.eq(pv.doc));
@@ -233,7 +175,7 @@ test('PREVIEW: only the ticked edits are included', () => {
   assert.deepEqual(pv.items.map((i) => i.field), ['SERUM CREATININE']);
 });
 
-test('PREVIEW: patient details and gender changes are marked; the age / gender step is listed', () => {
+test('PREVIEW: patient details are marked; no age / gender rewriting step is added by the app (D5)', () => {
   const edits = [
     { block_id: 'B39', operation: 'append', new_value: 'Discharged in stable condition.', field_label: 'Course' },
     { block_id: 'B12', operation: 'set', new_value: 'IP00019515', field_label: 'IP Number' },
@@ -246,9 +188,7 @@ test('PREVIEW: patient details and gender changes are marked; the age / gender s
   assert.equal(byField.SEX.patient, true);
   assert.equal(byField.AGE.patient, true);
   assert.equal(byField.COURSE?.patient ?? pv.items.find((i) => i.after.includes('Discharged')).patient, false);
-  // the narrative "40-year-old male" follows the header: shown, never silent
-  const shown = [...pv.items.flatMap((i) => i.also), ...pv.consistency].map((c) => c.after).join(' | ');
-  assert.match(shown, /41-year-old female/i);
+  assert.deepEqual([...pv.items.flatMap((i) => i.also), ...pv.consistency], []);
 });
 
 // ---------- 4. the window ----------
@@ -264,7 +204,7 @@ test('WINDOW: field, old value struck out, new value, tick box each; "will NOT b
   assert.match(html, /<span>SERUM CREATININE<\/span>.*?<del>1.9 MG\/DL<\/del>.*?→ 2.4 MG\/DL/s);
   assert.equal((html.match(/<input type="checkbox"[^>]*checked=""/g) || []).length, 3); // ordinary changes start ticked
   assert.match(html, /1 change from the file will NOT be applied/);
-  assert.match(html, /ALP: an uploaded file cannot delete information/);
+  assert.match(html, /ALP: &quot;ALP&quot; is a label and is locked/); // a technical refusal
   assert.match(html, /3 of 3 changes selected/);
   assert.match(html, /Nothing is changed until you press Apply/);
 });
@@ -285,7 +225,7 @@ test('WINDOW: patient details start UNTICKED with a warning; with nothing ticked
 });
 
 test('WINDOW: every change from the file refused -> Apply still usable (no stuck window)', () => {
-  const edits = [{ block_id: 'B33', operation: 'clear', field_label: 'CRP' }]; // a file may never clear a value
+  const edits = [{ block_id: 'B999', operation: 'set', new_value: 'x', field_label: 'CRP' }]; // a technical refusal: the block does not exist
   const preview = previewEdits(makeDoc(), edits, FILE);
   assert.equal(preview.items.length, 0);
   assert.equal(preview.blocked.length, 1);

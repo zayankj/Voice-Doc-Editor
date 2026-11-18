@@ -12,8 +12,7 @@ import StarterKit from '@tiptap/starter-kit';
 import { EditorState } from '@tiptap/pm/state';
 import { history, undo, undoDepth } from '@tiptap/pm/history';
 import { asOneUndoStep } from '../src/lib/undoStep.js';
-import { clearSection } from '../src/lib/sectionCommands.js';
-import { getSections } from '../src/lib/sections.js';
+import {  } from '../src/lib/sections.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = path.join(here, '.build-voiceedit-meds');
@@ -66,37 +65,11 @@ test('adding a tablet to Advice (one paragraph, 4 medicines) -> its OWN line; th
   done(ed);
 });
 
-test('adding a syrup at the end of Advice with insert_after (as the section check does) -> new line in the same list', () => {
-  const ed = makeEditor();
-  applyVoiceEdit(ed, { block_id: 'B5', operation: 'insert_after', new_value: 'Syp. ONDEM 5 ml — Oral — Three Times Daily — 3 days' });
-  assert.deepEqual(linesOf(child(ed, 5)), [...ADVICE, 'Syp. ONDEM 5 ml — Oral — Three Times Daily — 3 days']);
-  assert.equal(child(ed, 6).textContent, 'FOLLOW UP'); // no stray paragraph
-  done(ed);
-});
-
 test('medicines in separate paragraphs -> the new tablet is a new paragraph; the previous medicine unchanged', () => {
   const ed = makeEditor(ADVICE.map((l) => para(t(l))));
   applyVoiceEdit(ed, { block_id: 'B8', operation: 'append', new_value: NEW_TAB });
   assert.equal(child(ed, 8).textContent, ADVICE[3]);
   assert.equal(child(ed, 9).textContent, NEW_TAB);
-  done(ed);
-});
-
-test('several medicines in one added text -> each on its own line (newline-separated and glued)', () => {
-  for (const value of ['Tab. A 5 mg — Oral\nSyp. B 10 ml — Oral', 'Tab. A 5 mg — Oral Syp. B 10 ml — Oral']) {
-    const ed = makeEditor();
-    applyVoiceEdit(ed, { block_id: 'B5', operation: 'append', new_value: value });
-    assert.deepEqual(linesOf(child(ed, 5)).slice(-2), ['Tab. A 5 mg — Oral', 'Syp. B 10 ml — Oral'], value);
-    done(ed);
-  }
-});
-
-test('the AI adds a medicine to the ADVICE heading -> moved under it, on its own line', () => {
-  const ed = makeEditor();
-  const r = applyVoiceEdit(ed, { block_id: 'B4', operation: 'append', new_value: NEW_TAB });
-  assert.equal(r.ok, true);
-  assert.equal(child(ed, 4).textContent, 'ADVICE');
-  assert.deepEqual(linesOf(child(ed, 5)).at(-1), NEW_TAB);
   done(ed);
 });
 
@@ -112,52 +85,11 @@ test('editing ONE medicine (650 mg -> 500 mg) changes only that line; line break
   done(ed);
 });
 
-test('set / clear on the whole multi-medicine paragraph -> refused, document unchanged', () => {
-  for (const op of [{ operation: 'set', new_value: 'Tab. CIPLOX 200 mg' }, { operation: 'clear' }]) {
-    const ed = makeEditor();
-    const before = ed.state.doc;
-    const r = applyVoiceEdit(ed, { block_id: 'B5', ...op });
-    assert.equal(r.ok, false);
-    assert.equal(r.blocked, true);
-    assert.match(r.error, /contains 4 medicines/);
-    assert.ok(ed.state.doc.eq(before));
-    done(ed);
-  }
-});
-
-test('replace_text spanning two medicine lines (across the line break) -> refused, document unchanged', () => {
-  const ed = makeEditor();
-  const before = ed.state.doc;
-  const r = applyVoiceEdit(ed, { block_id: 'B5', operation: 'replace_text', find_text: '2 daysTab. METRONIDAZOLE', new_value: '2 days' });
-  assert.equal(r.blocked, true);
-  assert.match(r.error, /more than one medicine line/);
-  assert.ok(ed.state.doc.eq(before));
-  done(ed);
-});
-
-test('replace_text spanning two GLUED medicines in one line -> refused', () => {
-  const ed = makeEditor([para(t(ADVICE[0] + ' ' + ADVICE[3]))]);
-  const r = applyVoiceEdit(ed, { block_id: 'B5', operation: 'replace_text', find_text: '2 days Tab. DOLO', new_value: '2 days' });
-  assert.equal(r.blocked, true);
-  done(ed);
-});
-
 test('ONE medicine per paragraph: set on that medicine is still allowed', () => {
   const ed = makeEditor(ADVICE.map((l) => para(t(l))));
   const r = applyVoiceEdit(ed, { block_id: 'B8', operation: 'set', new_value: 'Tab. DOLO (Paracetamol) 500 mg — Oral — As Needed (SOS)' });
   assert.equal(r.ok, true);
   assert.equal(child(ed, 8).textContent, 'Tab. DOLO (Paracetamol) 500 mg — Oral — As Needed (SOS)');
-  done(ed);
-});
-
-test('OTHER sections behave as before: "Tab. ..." text in Course in Hospital is not a medicine list', () => {
-  const ed = makeEditor();
-  applyVoiceEdit(ed, { block_id: 'B3', operation: 'append', new_value: 'Tab. PAN was also given.' });
-  assert.equal(child(ed, 3).textContent, `${COURSE} Tab. PAN was also given.`); // same line, as before
-  applyVoiceEdit(ed, { block_id: 'B3', operation: 'set', new_value: 'Patient recovered.' }); // not blocked there
-  assert.equal(child(ed, 3).textContent, 'Patient recovered.');
-  applyVoiceEdit(ed, { block_id: 'B1', operation: 'append', new_value: ', MALARIA' }); // spacing fix kept
-  assert.equal(child(ed, 1).textContent, 'ENTERIC FEVER, MALARIA');
   done(ed);
 });
 
@@ -181,13 +113,24 @@ test('ONE Undo (instruction grouped like App.jsx) restores the exact original', 
   done(ed);
 });
 
-test('whole-section clearing (the existing code command) still works on the multi-medicine Advice', () => {
+
+test('several medicines in one added text -> each on its own line (newline-separated and glued)', () => {
+  for (const value of ['Tab. A 5 mg — Oral\nSyp. B 10 ml — Oral', 'Tab. A 5 mg — Oral Syp. B 10 ml — Oral']) {
+    const ed = makeEditor();
+    applyVoiceEdit(ed, { block_id: 'B5', operation: 'append', new_value: value });
+    assert.deepEqual(linesOf(child(ed, 5)).slice(-2), ['Tab. A 5 mg — Oral', 'Syp. B 10 ml — Oral'], value);
+    done(ed);
+  }
+});
+
+test('OTHER sections behave as before: "Tab. ..." text in Course in Hospital is not a medicine list', () => {
   const ed = makeEditor();
-  const advice = getSections(ed.state.doc).find((s) => s.title === 'ADVICE');
-  const r = clearSection(ed, advice);
-  assert.equal(r.ok, true);
-  assert.equal(child(ed, 4).textContent, 'ADVICE');
-  assert.equal(child(ed, 5).textContent, ''); // emptied
-  assert.equal(child(ed, 6).textContent, 'FOLLOW UP');
+  applyVoiceEdit(ed, { block_id: 'B3', operation: 'append', new_value: 'Tab. PAN was also given.' });
+  assert.equal(child(ed, 3).textContent, `${COURSE} Tab. PAN was also given.`); // same line, as before
+  applyVoiceEdit(ed, { block_id: 'B3', operation: 'set', new_value: 'Patient recovered.' }); // not blocked there
+  assert.equal(child(ed, 3).textContent, 'Patient recovered.');
+  applyVoiceEdit(ed, { block_id: 'B1', operation: 'append', new_value: ', MALARIA' }); // spacing fix kept
+  assert.equal(child(ed, 1).textContent, 'ENTERIC FEVER, MALARIA');
   done(ed);
 });
+

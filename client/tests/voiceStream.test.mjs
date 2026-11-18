@@ -256,9 +256,10 @@ test('App.jsx: a streamed answer goes through EXACTLY the same steps as the HTTP
   const run = app.slice(app.indexOf('async function runEdits('), app.indexOf('async function runAndReport('));
   // the answer: from the stream, or (stream problem / no stream) the unchanged HTTP request
   assert.match(run, /answer = stream\r?\n\s+\? await stream\.result\(\{ signal: ticket\.signal \}\)\.catch\(\(e\) => \{\r?\n\s+if \(!e\?\.fallback\) throw e;[^\n]*\r?\n\s+return extractEdits\(request\);[^\n]*\r?\n\s+\}\)\r?\n\s+: await extractEdits\(request\);/);
-  // every check after the answer is still there, in the same order, for both
+  // every step after the answer, in the same order, for both
   const after = run.slice(run.indexOf('answer = stream'));
-  const steps = ['ticket.isStale(currentId.current)', 'runCodeCommand([text, heard]', 'needsPreview(', 'malayalamStop(', 'checkInterpretation(', 'checkNamedSection(', 'checkMedicineEdits(', 'withDuplicateChoice(', 'checkTableEdits(', 'bottomUp(edits)', 'genderChangeAllowed(', 'medicinesLostByEdits(', 'previewEdits(', 'applyAiEdits('];
+  // (R3) Gemini's edits -> the technical dry run of a batch -> apply; the same for the stream and HTTP answers
+  const steps = ['ticket.isStale(currentId.current)', 'bottomUp(aiEdits)', 'previewEdits(', 'applyAiEdits('];
   let at = 0;
   for (const s of steps) { const i = after.indexOf(s, at); assert.ok(i > at, `${s} after the answer, in order`); at = i; }
   // the queue: one at a time; a stream is used only for the document it was made for

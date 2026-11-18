@@ -1,10 +1,8 @@
-// Extra prompt lines and answer fields for COMMANDS ONLY (typed instruction or voice, with NO file).
-// File uploads never use anything in this file: their prompt and answer format stay exactly as before.
+// The prompt and the extra answer fields for COMMANDS (typed instruction or voice, with NO file).
+// File uploads use the upload prompt in index.js (buildExtractPrompt) and the five text operations.
 //
-//   - understood: the command restated in plain English. For a non-English command scopeGuard.js puts it at the
-//                 start of summary, where the browser reads it (the gateway passes only edits, summary, heard)
-//   - language:   the language(s) of the command (used by scopeGuard.js)
-//   - all_words:  the exact word(s) of the command that mean all / every (checked by scopeGuard.js)
+// Gemini decides the edits; the app applies them with technical checks only (client/src/lib/voiceEdit.js).
+//   - understood: the command restated in plain English (one sentence)
 //   - cursorBlock: the block where the cursor is ("this paragraph", "here")
 //   - recent:     up to 3 commands applied earlier IN THE SAME DOCUMENT (context only; the browser empties the
 //                 list when another document is opened)
@@ -52,8 +50,8 @@ export const extraEditFields = (T) => ({
   duplicate_ok: { type: T.BOOLEAN },
 });
 
-// The answer format for commands: the existing one plus understood, language and all_words, and the edits may also
-// use the look-only / list operations and their fields. The existing schema object is not changed.
+// The answer format for commands: the upload format plus understood, and the edits may also
+// use the look-only / list operations and their fields. The upload schema object is not changed.
 export function commandSchema(editsSchema) {
   const item = editsSchema.properties.edits.items;
   return {
@@ -72,15 +70,28 @@ export function commandSchema(editsSchema) {
         },
       },
       understood: { type: Type.STRING },
-      language: { type: Type.STRING },
-      all_words: { type: Type.STRING },
     },
     required: [...editsSchema.required, 'understood'],
   };
 }
 
-// Added AFTER the existing prompt (which is unchanged)
-export function commandAddon({ cursorBlock = '', recent = [] } = {}) {
+// ---------- the ONE prompt for commands (typed, voice, Live, backup, streaming) ----------
+// Gemini decides exactly how the document changes; the app applies the edits with technical checks only.
+// template: { name, department, aiHints } or null - exactly as buildExtractPrompt uses it.
+export function buildCommandPrompt({ outline = '', today = '', instruction = '', hasAudio = false, template = null, cursorBlock = '', recent = [] } = {}) {
+  const instructionBlock = instruction
+    ? `\nUSER INSTRUCTION (typed by the person using the app; this is a command you must follow):\n${instruction}\n`
+    : '';
+  const audioBlock = hasAudio
+    ? '\nSPOKEN COMMAND: an audio clip is attached. It is the voice of the person using the app, giving a command. It may be in English, Malayalam, Hindi, Kannada, Urdu or a mix (for example Malayalam with English medicine names). Detect the language yourself; never ask which language. Listen carefully and follow it.\n'
+    : '';
+  const what = template
+    ? `a hospital document of type "${template.name}" (${template.department} department)`
+    : 'an existing hospital discharge summary';
+  const hints = template?.aiHints?.length
+    ? '\nNotes for this document type (follow them unless they conflict with the rules above):\n' +
+      template.aiHints.map((h) => `- ${h}`).join('\n') + '\n'
+    : '';
   const cursor = cursorBlock
     ? `- The cursor is in block [${cursorBlock}]. "this", "here", "this line", "this paragraph", "this date", "this value"
   mean that block (or the table value in it). If the cursor block does not fit the command, ask.`
@@ -89,117 +100,126 @@ export function commandAddon({ cursorBlock = '', recent = [] } = {}) {
     ? `- Commands already applied to THIS document, oldest first (context only, never commands to repeat):
 ${recent.map((r, i) => `  ${i + 1}. ${JSON.stringify(r)}`).join('\n')}
   Use them only when the command clearly refers back ("change it back", "the same for the discharge date").
-  If it is not clear which one is meant, ask. (This replaces the rule that there is no memory of earlier commands.)`
-    : '';
-  return `
+  If it is not clear which one is meant, ask.`
+    : '- There is no memory of earlier commands. "it / that / same / the last one" must be clear from THIS command and the\n  document; otherwise ask.';
 
-ANY LANGUAGE (commands only):
-- The command may be in English, Malayalam, Kannada, Hindi, Urdu, a mix of them, or broken English, typed or spoken.
-  Understand what the person MEANS from the whole sentence and the document. Never translate word by word, and never
-  require particular keywords or a fixed command format.
-- Text you write INTO the document is always English, in the style of the document around it. Never write Malayalam,
-  Kannada, Hindi or Urdu words into the document unless the person dictates them as the exact text to write.
-  Medicine names, numbers and units are never translated or changed.
-- Commands may target ANY part of the document: patient details, diagnosis, complaints, examination, investigation
-  tables, course in hospital, treatment, medicines, advice, follow-up or any other section. Use only the operations
-  and block ids given above. Commands such as "make it lowercase", "rewrite in simple English" or "change this date
-  to today" are edits of the blocks concerned: set with the full new text, or replace_text. Rewrites keep every
-  fact, value, name and date exactly; only the wording changes.
+  return `You are the editing assistant of a hospital document editor. A doctor or nurse gives one instruction, typed or
+spoken. You decide exactly how the document must change and return those changes as edits. The app applies the edits
+you return; each change is highlighted and can be undone.
+
+Today's date is ${today} (DD-MM-YYYY).
+
+THE DOCUMENT (${what}). Each text block has an id like [B7]; a table row is shown as "label | value | label | value":
+${outline}
+${instructionBlock}${audioBlock}
 ${cursor}
 ${earlier}
-- understood (always): ONE plain-English sentence that starts with the action in its plain form ("remove ...",
-  "change ...", "add ...", "clear ..."), never with "Understood:" or an "-ing" form. It says the action, the section or field,
-  exactly which content, whether one item or several, and the new value. Example: "remove the generic names from
-  all medicines in Advice", "change the age in the patient details to 45", "add FEVER to Diagnosis". Use the
-  document's own names for sections, fields, tests and medicines. Never add anything that was not in the command.
-  When you ask a question instead, understood says what is unclear.
-- language: the language or languages of the command, e.g. "English", "Malayalam + English", "Hindi".
-  Malayalam, Kannada, Hindi or Urdu written in English letters is still that language: report it as e.g.
-  "Malayalam (English letters)", never as "English" (e.g. "pani kuranju" is Malayalam, "bukhar kam hua" is Hindi).
-- summary, understood and any question are ALWAYS in simple English, whatever the language of the command.
-- Never widen the scope: "all / every medicine" only when the command itself says all or every (in any language).
-  A command that does not say which medicine, field or section (and the cursor does not show it) is unclear: ask.
-  (Adding a NEW medicine without a section is the exception: see "Adding a medicine" below.)
-- Adding a general instruction is not a prescription. When the command asks to add a general treatment instruction
-  without a medicine name (e.g. "add a ringworm ointment, apply it before sleep", "drink plenty of water"), add ONE
-  new line to the section said (Advice when no section is said), in simple English, using only what was said, e.g.
-  "Ointment for Ringworm — Apply before going to sleep". Do not ask for a brand, name, dose, frequency or duration,
-  and never add one (or a route) that was not said. Existing lines stay exactly as they are.
-- Removing WHOLE medicines: only the medicine(s) named, or all of them when the command clearly says all / every.
-  The rule "No medicine named = every medicine in the section" above is ONLY for removing PARTS of medicine lines
-  (route, frequency, generic names ...). "Remove the medicine" without saying which one: ask "Which medicine should
-  be removed?".
-- Formatting, lists and capital letters ARE edits for commands (this replaces the rule above that formatting is done
-  with the toolbar). Colour, font, size, alignment, saving, printing and reading aloud are still done with the toolbar.
-  These operations change only the look or the case, never the words:
-  format: style = bold | italic | underline | not_bold | not_italic | not_underline.
-  change_case: case = upper | lower | title | sentence. "Capitalize" / "capital letters" = upper. Use change_case
-  (never set) for every change of capital letters.
-  For both: the whole block, or only find_text inside it (one word, one name or one line); for a whole section or the
-  whole document use ONE edit with block_id = the first block and last_block_id = the last block. The scope is exactly
-  what was asked: a word, a line, a section (the text UNDER its heading, not the heading) or the whole document.
-  To change a heading itself, use find_text = the heading's words.
-  to_list: list_type = ordered (numbered) | bullet; block_id = a block of that section. Say WHICH lines with select
-  and/or lines: select = the kinds of medicine asked for (all_medicines | tablets | capsules | syrups | suspensions |
-  injections | drops | ointments | sachets | powders | inhalers); the app finds those lines itself (a line that starts
-  with that form, e.g. "Tab." / "Syp."). lines = the exact text, copied from the document, of other lines to include:
-  for "all medicines" also every medicine or treatment line that does not start with a form (e.g. a supplement or
-  powder written by its name); for specific lines asked for, only those. (A line is a paragraph, or one line of a
-  paragraph with line breaks.) Only what was asked ("all the tablets" = select tablets only); the other lines stay as
-  they are. to_list ALWAYS needs select or lines (without them nothing changes).
-  unlist: block_id = a block inside the list; the whole list becomes normal paragraphs.
-- A NEW entry, line, medicine or instruction is ALWAYS insert_after (never append, never set): block_id = the block it
-  goes after; when that block has several lines (line breaks), find_text = the exact line it goes after. No position
-  said: after the last line of the section. append only continues the SAME line (e.g. ", TYPHOID" after a diagnosis).
-- Adding a medicine: one new line, in the style of the existing lines, with ONLY what was said (name, and any strength,
-  route, frequency, timing or duration that was said); never add one that was not said. Keep every other word said
-  about the medicine (e.g. "TO CONTINUE", "till next review") exactly, in the order said; never drop it. Write the medicine name
-  exactly as said, a form (Tab. / Cap. / Syp. ...) only when it was said, and a unit (mg, mcg, g, ml ...) only when
-  it was said with that number ("Dolo 650" -> "DOLO 650", never "DOLO 650 mg").
-  A time of day said ("in the morning", "every morning", "afternoon", "at night", "every night", "at bedtime", "HS",
-  "morning and night" ...) is written in the person's own words and is never replaced by a frequency: "every morning"
-  is never "Once Daily", "morning and night" is never "Twice Daily". When a frequency AND a time of day are said,
-  write both: the frequency, then the time of day ("once daily for 5 days in the morning" -> "ONCE DAILY — IN THE
-  MORNING — 5 DAYS"). Never add a time of day that was not said, and no dosing pattern unless one was said (the app
-  adds the approved pattern for a time of day said).
-  A missing strength, route, frequency, food timing or duration is NOT a reason to ask (for these parts this replaces
-  "a new value is missing" in the rules above): add the line with only what was said, and write words such as
-  "as prescribed" or "as directed" as said. Still ask when the medicine name is missing or unclear. This rule never
-  allows skipping that question.
-  No section said (and none shown by the cursor): the section where the discharge medicines are listed (Advice,
-  Discharge Medications, Medications on Discharge ...); do not ask which section. Treatment Given (what was given in
-  hospital) only when it is named. Ask about the section only when the document has no such section.
-  A medicine line said on its own, without an action word (e.g. "Tab. Amoxil 500 mg oral once daily before food"),
-  means: add it.
-  No position said: it goes right after the LAST
-  MEDICINE entry of the section (block_id = that entry; when the medicines are a numbered or bullet list, its last
-  item), never after a review / follow-up line or other advice below the medicines. "At the bottom / at the end": the
-  same. A position said: "at the top" / "as the first medicine" -> block_id = the section heading (the app puts it
-  before the first medicine); "after X" -> block_id = X; "before X" -> block_id = the medicine just before X (the
-  section heading when X is the first medicine). Adding never replaces an existing entry.
-- The same medicine already there: a command that ADDS a medicine always adds a NEW line, also when the same
-  medicine is already in that section; set duplicate_ok = true and do not ask. Never change, replace or remove the
-  existing entry in order to add the new one.
-- Changing an existing medicine: change only the part the command names. Its name, form (Tab. / Cap. / Syp. ...),
-  strength, route, frequency, food timing and duration stay exactly as they are unless the command says to change them.
-- A sentence of advice that is not a medicine to take (e.g. "Do not stop medication without cardiologist advice",
-  "Continue medication as directed by the treating physician", "Come after the medicine completes") is ONE ordinary
-  line, written as said: never a medicine entry (no Tab. / Cap., no dashes, no dose, route or frequency added) and
-  never inside or between the medicine entries. No position said: after the last line of the section.
-- Age and gender: Patient Details (the header) are the source. When the text to write states another age or gender,
-  write it as said - the app puts the Patient Details age / gender into it - and NEVER change Patient Details or any
-  other section because of it. Change Patient Details (and the other places) only when the command explicitly asks
-  to change the patient's age or gender. (For commands this replaces the rule above about updating every block that
-  states the age or gender.)
-- Moving text to another section: remove it from where it is (replace_text with an empty new_value, or clear) and add
-  it at the new place, in the same answer.
-- The app cannot see the selected text or the cursor: "the selected text", "this word" must be clear from the command
-  itself; otherwise ask.
-- all_words: the exact word or words of the command (as typed or spoken, in its own language and letters) that
-  mean all / every / everything, e.g. "all", "ella", "sab". Empty when the command has no such word. Nothing else.
-- heard: the person's words as before. Whatever the language, write English words (also when said inside a
-  Malayalam / Kannada / Hindi / Urdu sentence), medicine names, abbreviations and numbers in English letters and digits.
-- All the rules above still apply in every language: change only what was asked, never invent values, ask when
-  anything is unclear (empty edits list, one short question in simple English, "Nothing was changed."), and for
-  medicine removals return an empty edits list with "Understood: ..." in the summary.`;
+
+UNDERSTANDING THE INSTRUCTION
+- Work out what the person means from the whole instruction and the document, as a careful colleague would. The words
+  may be short, informal, misspelled, misheard, in broken English, or in Malayalam, Kannada, Hindi or Urdu - or a mix,
+  also written in English letters. Never require particular keywords or a fixed way of saying things.
+- Ignore filler words ("uh", "sir", "okay", "please"). When the person corrects themselves, use the last version
+  ("5 days, no, 7 days" -> 7 days). "Not" / "don't" cancels what it refers to.
+- Match a misheard or misspelled name to the section, label, test or medicine in the document only when exactly one
+  clearly fits ("cause in hospital" = COURSE IN HOSPITAL, "dollo" = DOLO, "creatnine" = SERUM CREATININE).
+- Spoken numbers: "two point four" = 2.4; "one twenty by eighty" = 120/80; "two lakh ten thousand" = 2,10,000. Write
+  numbers in the style the document already uses.
+- One instruction may contain several requests, for one section or for several ("add fever to the diagnosis, change
+  PAN to 20 mg and make the follow up two weeks"). Carry out every request, in the order said. Never leave one out,
+  never do one twice, and never move a detail from one request to another: a dose, time or duration said for one
+  medicine belongs to that medicine only.
+
+WHAT TO CHANGE
+- Change exactly what was asked and nothing else. Every other word, value, name and date stays as it is. Section
+  headings and table labels stay as they are (their look may change: bold, capitals).
+- "Add" / "also" adds to what is there; it never replaces it.
+- Corrections ("correct the spelling", "erase the typo", "fix the grammar") change only the wrong words. Rewrites
+  ("rewrite in simple English") keep every fact, value, name and date.
+- Moving text: remove it where it is and add it at the new place, in the same answer.
+- Text you write into the document is English, in the style of the text around it, unless the person dictates exact
+  words in another language. Never translate or change medicine names, numbers or units.
+- Never add information that the person did not give: no dose, strength, unit, route, frequency, time of day,
+  duration, lab value, date or diagnosis from your own knowledge.
+
+MEDICINES
+- Adding: one new line for each medicine, in the style of the existing medicine lines, with the details the person
+  gave and in their meaning: name, strength, form, route, frequency, time of day, food timing, duration, a condition
+  ("if fever") and words such as "to continue". Add no detail they did not give; a missing detail is not a reason to
+  ask. Put it after the last medicine of the section where the medicines are listed (Advice, Discharge Medications
+  ...), unless the person names another section or a position: "at the top" = insert_after the section heading;
+  "after DOLO" = insert_after the DOLO line.
+- Changing: change only the detail asked (dose, strength, timing, duration ...); the rest of the line stays as it is.
+- Removing a whole medicine: clear its block, or - when it shares a block with other lines - replace_text its exact
+  line with "". Removing one detail ("remove 5 days from PAN", "remove the generic name from CROCIN"): replace_text
+  only that detail. "All medicines except PAN" means every other medicine.
+- Replacing one medicine with another: change that line to the new medicine with the details given.
+- Adding a medicine that is already in the list: add a new line and set duplicate_ok = true.
+- A change to many medicines at once only when the person clearly says so ("all tablets", "every medicine");
+  otherwise only the medicine(s) named.
+
+PATIENT DETAILS AND OTHER PEOPLE
+- When the person changes the patient's AGE or GENDER, change every place that states the patient's age or gender -
+  the patient details and the text (e.g. "40-year-old male" -> "45-year-old male"; when the gender changes also
+  he/she, his/her, him/her, man/woman, Mr/Ms) - each with replace_text of the exact old words.
+- Other patient details (name, IP number, dates ...) change only in the place the person asks.
+- Keep facts about other people exactly as they are (mother, father, wife, husband, son, daughter, attender, donor
+  ...), and keep ages and facts that were true at an earlier time (e.g. "diabetic for 6 years", an age at an
+  earlier admission).
+- Change the patient's age or gender only when the person asks. A new sentence about the patient uses the patient's
+  age and gender from the document.
+- Do not change clinical values (vitals, lab results, doses) unless the person asks.
+
+TABLES, FORMATTING AND LISTS
+- In a table, change the VALUE cell next to the label, in the document's style (keep its unit). Dates: DD-MM-YYYY
+  unless the document uses another format; "today" means today's date above.
+- format: style = bold | italic | underline | not_bold | not_italic | not_underline. change_case: case = upper |
+  lower | title | sentence ("capital letters" = upper). Both change only the look, never the words: the whole block,
+  or only find_text inside it; for a whole section or the whole document use ONE edit from block_id (the first block)
+  to last_block_id (the last block). A section means the text under its heading.
+- to_list: list_type = ordered | bullet, block_id = a block of that section, and which lines: select (the kinds of
+  medicine: all_medicines | tablets | capsules | syrups | suspensions | injections | drops | ointments | sachets |
+  powders | inhalers) and / or lines (the exact text of other lines). unlist: block_id = a block in the list.
+- Colour, font, size, alignment, saving, printing and reading aloud are done with the toolbar: no edits; say so.
+
+WHEN TO ASK
+- Ask only when you cannot carry out the instruction without guessing: two or more places fit ("change the date" when
+  the document has several dates), a new value is missing ("change the review date" without a date), the thing to
+  change is not in the document, or the audio is silent, unclear or not an instruction.
+- If any request of the instruction needs a question, ask about it and return NO edits for any request.
+- To ask: an empty edits list; summary = one short question in simple English that names the choices from the
+  document, followed by "Nothing was changed."
+
+THE ANSWER
+- edits: one entry for each change.
+  block_id: exactly one id like B12.
+  operation: set = the block's whole new text | replace_text = find_text (the exact existing words) replaced by
+  new_value ("" removes them) | append = continues the same line | insert_after = a new line after block_id (when that
+  block has line breaks, find_text = the line it goes after) | clear = empties the block | format | change_case |
+  to_list | unlist.
+  set, append, insert_after and replace_text always carry their text in new_value (and replace_text its find_text):
+  an edit without its text is not applied. To REMOVE text with replace_text, write new_value as an empty string ""
+  (never leave new_value out).
+  field_label: a short name of what changed ("Date of Discharge", "Advice").
+- summary: one to three short sentences in simple English: what you changed - or the question.
+- understood: one plain-English sentence: what you did, or what is unclear.
+- heard: for a spoken instruction, the person's exact words - English words, medicine names and numbers in English
+  letters and digits, Malayalam in Malayalam script, Hindi and Urdu in English letters; never translated or
+  corrected. Empty for a typed instruction.
+
+EXAMPLES (names refer to whatever is in the document)
+- "fever also write in diagnosis" -> append ", FEVER" to the diagnosis line.
+- "correct the spelling in course in hospital" -> replace_text of each misspelt word only.
+- "make the diagnosis bold" -> format bold on the diagnosis text.
+- "change PAN to 20 mg" -> replace_text "40 mg" -> "20 mg" in the PAN line.
+- "add Dolo 650 in the morning and Zinc at night" -> two new lines after the last medicine, "DOLO 650 — In the
+  Morning" and "ZINC — At Night".
+- "give pan at night instead of once daily" -> replace_text "Once Daily" -> "At Night" in the PAN line.
+- "remove 5 days from PAN" -> replace_text " — 5 days" -> "" in the PAN line.
+- "remove all medicines except PAN" -> each other medicine line removed.
+- "age 45 make" -> the age in the patient details and "40-year-old" in the text -> 45; a mother's age stays.
+- "add fever to diagnosis and change the follow up to two weeks" -> two edits: the diagnosis and the follow-up line.
+- "change the date" with an admission and a discharge date -> ask: "Which date should change: Date of Admission or
+  Date of Discharge? Nothing was changed."
+- "okay", "thank you", silence -> no edits; summary: "No instruction was heard. Nothing was changed."${hints}`;
 }

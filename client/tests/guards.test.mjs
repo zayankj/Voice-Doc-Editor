@@ -8,7 +8,7 @@ import Table from '@tiptap/extension-table';
 import TableRow from '@tiptap/extension-table-row';
 import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
-import { changesGender, genderChangeAllowed, lockReason } from '../src/lib/guards.js';
+import { changesGender, lockReason } from '../src/lib/guards.js';
 import { getBlocks } from '../src/lib/outline.js';
 
 // ---------- gender: removing is fine, adding or swapping is not ----------
@@ -37,17 +37,7 @@ test('changing other words while keeping the gender words is fine', () => {
   assert.equal(changesGender('MUHAMMAD ZAYAN', 'Fatima Safa'), false);
 });
 
-test('your ways of changing the gender are allowed', () => {
-  for (const c of ['change female to male', 'the patient is male', 'change the gender to male', 'he is a 20 year old male',
-    'change her to him', 'make it a boy']) {
-    assert.equal(genderChangeAllowed({ heard: c }), true, c);
-  }
-});
 
-test('gender may change only when the command talks about it', () => {
-  assert.equal(genderChangeAllowed({ heard: 'remove all the content from the presenting complaint' }), false);
-  assert.equal(genderChangeAllowed({ instruction: 'change the gender to female' }), true);
-});
 
 // ---------- labels stay locked, values (address) stay editable ----------
 const schema = getSchema([StarterKit, Table.configure({ resizable: false }), TableRow, TableHeader, TableCell]);

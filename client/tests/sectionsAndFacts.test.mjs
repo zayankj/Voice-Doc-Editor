@@ -19,7 +19,6 @@ import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
 import { EditorState } from '@tiptap/pm/state';
 import { history, undo } from '@tiptap/pm/history';
-import { checkNamedSection, checkTableEdits, patternsSaid } from '../src/lib/verify.js';
 import { asOneUndoStep } from '../src/lib/undoStep.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -30,7 +29,7 @@ for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tabl
   fs.writeFileSync(path.join(tmp, `${f}.js`), src);
 }
 const { applyVoiceEdit, ensurePatientConsistency } = await import(pathToFileURL(path.join(tmp, 'voiceEdit.js')).href);
-const { previewEdits, medicinesLostByEdits } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
+const { previewEdits } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
 const { getBlocks } = await import(pathToFileURL(path.join(tmp, 'outline.js')).href);
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -71,93 +70,9 @@ const dischargeAdvice = () => [h('COURSE IN HOSPITAL'), p(t('HEMODYNAMICALLY STA
 const RING = 'Ointment for Ringworm — Apply before sleeping';
 const numbered = (doc) => lines(doc).filter((l) => l.startsWith('OL'));
 
-test('ISSUE 1: the AI aims at the Review line / the heading / appends to Review -> item 8 right after AZIPROPROTEIN', () => {
-  for (const make of [
-    (ed) => ({ block_id: id(ed, 'REVIEW'), operation: 'insert_after', new_value: RING, field_label: 'Advice' }), // what Gemini sent
-    (ed) => ({ block_id: id(ed, 'DISCHARGE ADVICE'), operation: 'insert_after', new_value: RING, field_label: 'Advice' }),
-    (ed) => ({ block_id: id(ed, 'REVIEW'), operation: 'append', new_value: `\n${RING}`, field_label: 'Advice' }),
-    (ed) => ({ block_id: id(ed, 'REVIEW'), operation: 'append', new_value: `, ${RING}`, field_label: 'Advice' }),
-  ]) {
-    const ed = makeEditor(dischargeAdvice());
-    const before = lines(ed.state.doc);
-    const r = applyVoiceEdit(ed, make(ed));
-    assert.equal(r.ok, true, r.error);
-    assert.deepEqual(numbered(ed.state.doc), [...MEDS, RING].map((l, i) => `OL${i + 1} ${l}`));
-    // Review, the other sections and every existing item unchanged
-    assert.deepEqual(lines(ed.state.doc).filter((l) => !l.startsWith('OL')), before.filter((l) => !l.startsWith('OL')));
-  }
-});
-
-test('ISSUE 1: a second medicine after the list was formatted -> item 9; "after TAB.ZINCOVIT" -> right after it; one Undo', () => {
-  const ed = makeEditor(dischargeAdvice());
-  const before = ed.state.doc;
-  asOneUndoStep(ed.view, () => {
-    assert.equal(applyVoiceEdit(ed, { block_id: id(ed, 'REVIEW'), operation: 'insert_after', new_value: RING, field_label: 'Advice' }).ok, true);
-  });
-  assert.equal(applyVoiceEdit(ed, { block_id: id(ed, 'REVIEW'), operation: 'insert_after', new_value: 'TAB.PANTOP 40MG ONCE DAILY', field_label: 'Advice' }).ok, true);
-  assert.deepEqual(numbered(ed.state.doc).slice(-2), [`OL8 ${RING}`, 'OL9 TAB.PANTOP 40MG ONCE DAILY']);
-  // a named position that IS a medicine entry is kept
-  const e2 = makeEditor(dischargeAdvice());
-  assert.equal(applyVoiceEdit(e2, { block_id: id(e2, 'TAB.ZINCOVIT'), operation: 'insert_after', new_value: 'TAB.PANTOP 40MG ONCE DAILY', field_label: 'Advice' }).ok, true);
-  assert.deepEqual(numbered(e2.state.doc).map((l) => l.replace(/^OL\d+ /, '')), [...MEDS.slice(0, 4), 'TAB.PANTOP 40MG ONCE DAILY', ...MEDS.slice(4)]);
-  // undo the second, then the first: the original document
-  undo(ed.state, (tr) => { ed.state = ed.state.apply(tr); });
-  undo(ed.state, (tr) => { ed.state = ed.state.apply(tr); });
-  assert.ok(ed.state.doc.eq(before));
-});
-
-test('ISSUE 1: paragraph layouts - after the last medicine, before the Review line (one paragraph each, and line breaks)', () => {
-  let ed = makeEditor([h('ADVICE'), p(t('Tab. CIPLOX 200 mg — 2 days')), p(t('Syp. BENADRYL — Daily')), p(t('Review after 1 week.')), h('FOLLOW UP'), p(t('OPD'))]);
-  assert.equal(applyVoiceEdit(ed, { block_id: id(ed, 'Review after'), operation: 'insert_after', new_value: 'Tab. DOLO — Daily Night (0-0-1)', field_label: 'Advice' }).ok, true);
-  assert.deepEqual(lines(ed.state.doc).slice(1, 5), ['P Tab. CIPLOX 200 mg — 2 days', 'P Syp. BENADRYL — Daily', 'P Tab. DOLO — Daily Night (0-0-1)', 'P Review after 1 week.']);
-  ed = makeEditor([h('ADVICE'), p(t('Tab. CIPLOX 200 mg — 2 days'), br(), t('Syp. BENADRYL — Daily'), br(), t('Review after 1 week.')), h('FOLLOW UP'), p(t('OPD'))]);
-  assert.equal(applyVoiceEdit(ed, { block_id: id(ed, 'Tab. CIPLOX'), operation: 'insert_after', new_value: 'Tab. DOLO — Daily Night (0-0-1)', field_label: 'Advice' }).ok, true);
-  assert.deepEqual(lines(ed.state.doc)[1], 'P Tab. CIPLOX 200 mg — 2 days↵Syp. BENADRYL — Daily↵Tab. DOLO — Daily Night (0-0-1)↵Review after 1 week.');
-  // a department template (MEDICATIONS) with a numbered list and a note under it
-  ed = makeEditor([h('NURSING NOTES'), p(t('Stable')), h('MEDICATIONS'), ol(['Inj. PANTOP 40 mg IV OD', 'Tab. DOLO 650 mg SOS']), p(t('Continue as advised.')), h('REMARKS'), p(t('None'))]);
-  assert.equal(applyVoiceEdit(ed, { block_id: id(ed, 'Continue'), operation: 'insert_after', new_value: 'Tab. ZINCOVIT Once Daily', field_label: 'Medications' }).ok, true);
-  assert.deepEqual(numbered(ed.state.doc), ['OL1 Inj. PANTOP 40 mg IV OD', 'OL2 Tab. DOLO 650 mg SOS', 'OL3 Tab. ZINCOVIT Once Daily']);
-});
-
-test('ISSUE 1: "TAB.CIPLOX" (no space after the dot) is a medicine line for the new-line and number checks', () => {
-  const ed = makeEditor(dischargeAdvice());
-  const doc = ed.state.doc;
-  const c = checkTableEdits(doc, 'add tab pantop once daily', [{ block_id: id(ed, 'TAB.DOLO'), operation: 'insert_after', new_value: 'TAB.PANTOP 40MG ONCE DAILY', field_label: 'Advice' }]);
-  assert.match(c.blocked[0], /contains 40, which was not in your command/);
-  assert.equal(medicinesLostByEdits(doc, [{ block_id: id(ed, 'TAB.DOLO'), operation: 'insert_after', new_value: 'TAB.PANTOP ONCE DAILY', field_label: 'Advice' }]), 0);
-});
 
 // ======================= ISSUE 2 =======================
-test('ISSUE 2: "001", "0-0-1", "0 0 1", "zero zero one" are the pattern (0-0-1); "500" is never a pattern', () => {
-  for (const c of ['daily night 001', 'daily night 001.', 'daily night 0-0-1', 'daily night 0 0 1', 'daily night zero zero one']) assert.deepEqual([...patternsSaid(c)], ['001'], c);
-  assert.deepEqual([...patternsSaid('dolo 500 mg')], []);
-  assert.deepEqual([...patternsSaid('1-0-0-1 for 5 days')], ['1001']);
-});
 
-for (const layout of ['list', 'paragraphs']) {
-  test(`ISSUE 2 (${layout}): the reported command adds DOLO (0-0-1); an invented strength is still blocked; an unsaid pattern is blocked`, () => {
-    const kids = layout === 'list'
-      ? [h('ADVICE'), ol(['Tab. CIPLOX 200 mg — (1-0-1) — 2 days', 'Ointment for Ringworm — Apply before going to sleep']), p(t('Signed By: Dr. DUMMY', B()))]
-      : [h('ADVICE'), p(t('Tab. CIPLOX 200 mg — (1-0-1) — 2 days')), p(t('Ointment for Ringworm — Apply before going to sleep')), p(t('Signed By: Dr. DUMMY', B()))];
-    const ed = makeEditor(kids);
-    const doc = ed.state.doc;
-    const cmd = 'Now inside the advice add a tablet Dolo paracetamol daily night 001.';
-    const add = (value) => [{ block_id: id(ed, 'Ointment'), operation: 'insert_after', new_value: value, field_label: 'Advice' }];
-    assert.equal(checkTableEdits(doc, cmd, add('Tab. DOLO (Paracetamol) — Daily Night (0-0-1)')).edits.length, 1);
-    for (const said of ['add dolo daily night 0-0-1', 'add dolo daily night 0 0 1', 'add dolo daily night zero zero one']) {
-      assert.equal(checkTableEdits(doc, said, add('Tab. DOLO — Daily Night (0-0-1)')).edits.length, 1, said);
-    }
-    let c = checkTableEdits(doc, cmd, add('Tab. DOLO (Paracetamol) 500 mg — Daily Night (0-0-1)'));
-    assert.match(c.blocked[0], /contains 500, which was not in your command/); // the invented strength only
-    c = checkTableEdits(doc, cmd, add('Tab. DOLO 650 mg — Daily Night (0-0-1) — 5 days'));
-    assert.match(c.blocked[0], /contains 650, 5,/);
-    // a pattern that was not said is refused as a pattern, even when its digits appear elsewhere ("1 tablet")
-    c = checkTableEdits(doc, 'add dolo 1 tablet at night', add('Tab. DOLO — (1-0-1)'));
-    assert.match(c.blocked[0], /contains 1-0-1, which was not in your command/);
-    // strength and pattern both said -> allowed
-    assert.equal(checkTableEdits(doc, 'add dolo 650 mg 1-0-1', add('Tab. DOLO 650 mg — (1-0-1)')).edits.length, 1);
-  });
-}
 
 // ======================= ISSUE 3 + Patient Details =======================
 const caseDoc = () => [h('DISCHARGE SUMMARY'), header(), h('PRESENTING COMPLAINT'), p(t('49-year-old male presented with loose stools, vomiting and giddiness.')),
@@ -165,82 +80,47 @@ const caseDoc = () => [h('DISCHARGE SUMMARY'), header(), h('PRESENTING COMPLAINT
 const CMD3 = 'Clear the course in the hospital section and add only this much: a 22-year-old male presented with loose stools, vomiting, giddiness and fever.';
 const DICTATED = 'A 22-year-old male presented with loose stools, vomiting, giddiness and fever.';
 
-test('ISSUE 3: the AI also "fixes" Presenting Complaint and the header Age -> those are skipped (not applied), the command is NOT rejected', () => {
-  const ed = makeEditor(caseDoc());
-  const doc = ed.state.doc;
-  const edits = [
-    { block_id: id(ed, 'Empirical'), operation: 'set', new_value: DICTATED, field_label: 'Course in Hospital' },
-    { block_id: id(ed, '49-year-old'), operation: 'replace_text', find_text: '49-year-old', new_value: '22-year-old', field_label: 'Presenting Complaint' },
-    { block_id: id(ed, '49 Years'), operation: 'set', new_value: '22 Years', field_label: 'Age' },
-  ];
-  const c = checkNamedSection(doc, CMD3, edits);
-  assert.ok(!c.reject, c.reject);
-  assert.deepEqual(c.edits, [edits[0]]);
-  assert.deepEqual(c.skipped, ['Presenting Complaint', 'Age']);
-  // any OTHER change in another section is still refused, as before
-  assert.ok(checkNamedSection(doc, CMD3, [edits[0], { block_id: id(ed, 'Normal study'), operation: 'set', new_value: 'Polyp seen.', field_label: 'x' }]).reject);
-  // an explicit age change together with another section keeps working ("change the age to 45 and add vomiting to PC")
-  const m01 = checkNamedSection(doc, 'change the age to 45 and add vomiting to the presenting complaint', [
-    { block_id: id(ed, '49 Years'), operation: 'set', new_value: '45 Years', field_label: 'Age' },
-    { block_id: id(ed, '49-year-old'), operation: 'append', new_value: ' Vomiting.', field_label: 'PC' }]);
-  assert.equal(m01.edits.length, 2);
-  assert.deepEqual(m01.skipped, []);
-});
 
+// R4 (D5): Gemini handles the patient age / gender. The app writes exactly the text Gemini returned - no hardcoded
+// age or gender rewriting in JavaScript (preview and Apply alike); the header and other sections are untouched.
 for (const [section, anchor] of [['COURSE IN HOSPITAL', 'Empirical'], ['PRESENTING COMPLAINT', '49-year-old'], ['ADVICE', 'Review in OPD']]) {
-  test(`PATIENT DETAILS (${section}): the dictated 22-year-old / female is written as 49-year-old male; header and other sections untouched`, () => {
+  test(`PATIENT DETAILS (D5, ${section}): the text Gemini returned is written exactly; nothing else changes`, () => {
     const ed = makeEditor(caseDoc());
     const before = lines(ed.state.doc);
-    const edit = { block_id: id(ed, anchor), operation: 'set', new_value: 'A 22-year-old female presented with fever. She was admitted previously.', field_label: section };
-    // the preview (= what Apply does): only the new text follows Patient Details
-    const pv = previewEdits(ed.state.doc, [edit], { allowGender: true, fromFile: false });
-    assert.deepEqual(pv.consistency.map((x) => x.after), ['A 49-year-old male presented with fever. He was admitted previously.']);
-    // Apply (App.jsx: the edit, then the age / gender step limited to the text the command wrote)
-    const oldTexts = new Set(getBlocks(ed.state.doc).map((b) => b.node.textContent));
-    assert.equal(applyVoiceEdit(ed, edit, { allowGender: true }).ok, true);
-    ensurePatientConsistency(ed, null, (node) => !oldTexts.has(node.textContent));
+    const text = 'A 49-year-old male presented with fever. His wife, a 22-year-old female, came with him.';
+    const edit = { block_id: id(ed, anchor), operation: 'set', new_value: text, field_label: section };
+    const pv = previewEdits(ed.state.doc, [edit], { fromFile: false });
+    assert.deepEqual(pv.consistency, []);
+    assert.deepEqual(pv.items.flatMap((i) => i.also), []);
+    assert.equal(applyVoiceEdit(ed, edit).ok, true);
     const now = lines(ed.state.doc);
-    assert.ok(now.includes('P A 49-year-old male presented with fever. He was admitted previously.'), now.join('\n'));
-    // everything else exactly as before (header Age / Sex, the other sections)
+    assert.ok(now.includes(`P ${text}`), now.join('\n')); // the relative's age / gender are kept as Gemini wrote them
     const original = before.find((x) => x.startsWith(`P ${anchor}`));
     assert.deepEqual(now.filter((l) => !l.includes('presented with fever')), before.filter((l) => l !== original));
+    assert.ok(ed.state.doc.eq(pv.doc)); // preview = apply
   });
 }
 
-test('PATIENT DETAILS: other dictated clinical facts unchanged; the header is never changed; missing details are never invented', () => {
+test('PATIENT DETAILS (D5): a header age change is written only where Gemini returned edits (no automatic copies by the app)', () => {
   const ed = makeEditor(caseDoc());
-  const oldTexts = new Set(getBlocks(ed.state.doc).map((b) => b.node.textContent));
-  applyVoiceEdit(ed, { block_id: id(ed, 'Empirical'), operation: 'set', new_value: 'A 22-year-old male, BP 120/80, creatinine 1.4, given 2 units of blood.', field_label: 'C' });
-  ensurePatientConsistency(ed, null, (node) => !oldTexts.has(node.textContent));
-  assert.ok(lines(ed.state.doc).includes('P A 49-year-old male, BP 120/80, creatinine 1.4, given 2 units of blood.'));
-  assert.ok(lines(ed.state.doc).includes('TR Name | DUMMY PATIENT | Age | 49 Years'));
-  assert.ok(lines(ed.state.doc).includes('TR Sex | Male | IP No | IP000999'));
-  // no Patient Details in the document: the dictated age / sex stay as said (nothing invented, nothing removed)
-  const e2 = makeEditor([h('COURSE IN HOSPITAL'), p(t('Old text.')), h('ADVICE'), p(t('x'))]);
-  const old2 = new Set(getBlocks(e2.state.doc).map((b) => b.node.textContent));
-  applyVoiceEdit(e2, { block_id: 'B1', operation: 'set', new_value: 'A 22-year-old female was admitted.', field_label: 'C' });
-  assert.deepEqual(ensurePatientConsistency(e2, null, (node) => !old2.has(node.textContent)), []);
-  assert.ok(lines(e2.state.doc).includes('P A 22-year-old female was admitted.'));
+  const edits = [
+    { block_id: id(ed, '49 Years'), operation: 'set', new_value: '45 Years', field_label: 'Age' },
+    { block_id: id(ed, '49-year-old'), operation: 'replace_text', find_text: '49-year-old', new_value: '45-year-old', field_label: 'Presenting Complaint' },
+  ];
+  const pv = previewEdits(ed.state.doc, edits, { fromFile: false });
+  assert.deepEqual(pv.consistency, []);
+  assert.equal(pv.blocked.length, 0);
+  const now = lines(pv.doc);
+  assert.ok(now.some((l) => l.includes('45 Years')));
+  assert.ok(now.some((l) => l.includes('45-year-old male presented')));
+  assert.ok(!now.some((l) => l.includes('49')), now.join('\n'));
 });
 
-test('PATIENT DETAILS: an explicit change of the header age still updates every place (existing workflow); a department template header too', () => {
+test('PATIENT DETAILS (D5): an uploaded file edit is written as returned too (no rewriting)', () => {
   const ed = makeEditor(caseDoc());
-  const edit = { block_id: id(ed, '49 Years'), operation: 'set', new_value: '45 Years', field_label: 'Age' };
-  const pv = previewEdits(ed.state.doc, [edit], { allowGender: false, fromFile: false });
-  assert.deepEqual(pv.items[0].also.map((x) => x.after), ['45-year-old male presented with loose stools, vomiting and giddiness.']);
-  // a template with "Age : 30 Years" / "Gender : Female" lines
-  const tpl = makeEditor([p(t('Age : 30 Years')), p(t('Gender : Female')), h('NURSING NOTES'), p(t('Stable.')), h('REMARKS'), p(t('None'))]);
-  const old = new Set(getBlocks(tpl.state.doc).map((b) => b.node.textContent));
-  applyVoiceEdit(tpl, { block_id: id(tpl, 'Stable'), operation: 'set', new_value: 'A 60-year-old male patient, stable. He walked.', field_label: 'Notes' });
-  ensurePatientConsistency(tpl, null, (node) => !old.has(node.textContent));
-  assert.ok(lines(tpl.state.doc).includes('P A 30-year-old female patient, stable. She walked.'));
-  assert.ok(lines(tpl.state.doc).includes('P Age : 30 Years') && lines(tpl.state.doc).includes('P Gender : Female'));
-});
-
-test('PATIENT DETAILS: an uploaded file preview follows the same rule (only the new text, header unticked stays)', () => {
-  const ed = makeEditor(caseDoc());
-  const pv = previewEdits(ed.state.doc, [{ block_id: id(ed, 'Empirical'), operation: 'append', new_value: ' A 22-year-old female was seen.', field_label: 'C' }], { allowGender: true, fromFile: true });
-  assert.deepEqual(pv.consistency.map((x) => x.after), ['Empirical antibiotics were initiated. A 49-year-old male was seen.']);
+  const pv = previewEdits(ed.state.doc, [{ block_id: id(ed, 'Empirical'), operation: 'append', new_value: ' Seen by Dr. A.', field_label: 'C' }], { fromFile: true });
+  assert.deepEqual(pv.consistency, []);
+  assert.ok(lines(pv.doc).includes('P Empirical antibiotics were initiated. Seen by Dr. A.'), lines(pv.doc).join('\n'));
 });
 
 // ======================= ISSUE 4: headings locked, content editable =======================
@@ -289,36 +169,4 @@ test('ISSUE 4: heading and content in the SAME paragraph ("Label : text", "HEADI
   ed = makeEditor(course());
   assert.equal(applyVoiceEdit(ed, { block_id: 'B1', operation: 'replace_text', find_text: 'Empirical', new_value: 'Broad-spectrum', field_label: 'C' }).ok, true);
   assert.equal(lines(ed.state.doc)[1], 'P Broad-spectrum antibiotics.');
-});
-
-test('ISSUE 4: what stays protected - heading words, table labels, medicines (confirmation), uploads, unasked gender', () => {
-  // the heading itself is never renamed or removed
-  let ed = makeEditor(course());
-  applyVoiceEdit(ed, { block_id: 'B0', operation: 'set', new_value: 'Patient improved.', field_label: 'Course' });
-  assert.equal(lines(ed.state.doc)[0], 'P COURSE IN HOSPITAL');
-  // a table label stays locked (the value cell next to it changes, as before)
-  ed = makeEditor([header()]);
-  const r = applyVoiceEdit(ed, { block_id: 'B2', operation: 'set', new_value: '50 Years', field_label: 'Age' });
-  assert.equal(r.ok, true);
-  assert.ok(lines(ed.state.doc).includes('TR Name | DUMMY PATIENT | Age | 50 Years'));
-  // Advice with medicines: clearing / rewriting it through the heading is still refused (confirmation window only)
-  for (const kids of [
-    [h('ADVICE'), p(t('Tab. DOLO 650 mg')), p(t('Syp. BENADRYL 5 ml')), h('FOLLOW UP'), p(t('x'))],
-    [p(t('ADVICE', B()), br(), t('Tab. DOLO 650 mg'), br(), t('Syp. BENADRYL 5 ml')), p(t('x'))],
-    [p(t('Advice : ', B()), t('Tab. DOLO 650 mg')), p(t('x'))],
-  ]) {
-    ed = makeEditor(kids);
-    const doc = ed.state.doc;
-    for (const operation of ['clear', 'set']) {
-      const out = applyVoiceEdit(ed, { block_id: 'B0', operation, new_value: 'Rest.', field_label: 'Advice' });
-      assert.equal(out.ok, false, operation);
-      assert.ok(ed.state.doc.eq(doc));
-    }
-  }
-  // an uploaded file still cannot delete content through a heading
-  ed = makeEditor(course());
-  assert.equal(applyVoiceEdit(ed, { block_id: 'B0', operation: 'clear', field_label: 'Course' }, { fromFile: true }).ok, false);
-  // an unasked gender change through a heading is refused
-  ed = makeEditor([h('COURSE IN HOSPITAL'), p(t('He improved.')), h('ADVICE'), p(t('x'))]);
-  assert.equal(applyVoiceEdit(ed, { block_id: 'B0', operation: 'set', new_value: 'She improved.', field_label: 'C' }, { allowGender: false }).ok, false);
 });

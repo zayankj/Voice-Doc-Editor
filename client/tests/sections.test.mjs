@@ -9,7 +9,7 @@ import Table from '@tiptap/extension-table';
 import TableRow from '@tiptap/extension-table-row';
 import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
-import { getSections, findSectionsInCommand, isSectionTitle, nameWords, sectionOf } from '../src/lib/sections.js';
+import { isSectionTitle } from '../src/lib/sections.js';
 import { getBlocks } from '../src/lib/outline.js';
 
 const schema = getSchema([StarterKit, Table.configure({ resizable: false }), TableRow, TableHeader, TableCell]);
@@ -23,7 +23,8 @@ const tr = (...cells) => schema.node('tableRow', null, cells);
 const table = (...rows) => schema.node('table', null, rows);
 const ul = (...items) => schema.node('bulletList', null, items.map((i) => schema.node('listItem', null, [i])));
 const docOf = (...blocks) => schema.node('doc', null, blocks);
-const titlesOf = (doc) => getSections(doc).map((s) => s.title);
+// R6: section titles = the blocks isSectionTitle accepts (getSections / command matching were removed with the code-run commands)
+const titlesOf = (doc) => getBlocks(doc).filter((b) => isSectionTitle(doc, b)).map((b) => b.node.textContent.trim().replace(/:$/, ''));
 const indexOf = (doc, text) => getBlocks(doc).findIndex((b) => b.node.textContent === text);
 
 // Shaped like the real discharge summary in the screenshots
@@ -45,9 +46,6 @@ const summary = docOf(
   bold('ADVICE'), p('Tab. CIPLOX 200 mg — Oral — Twice Daily (1-0-1) — 2 days'), p('MALARIA'),
   mixed('Signed By: ', 'DR.AISWARYA RAMACHANDRAN'),
 );
-const S = getSections(summary);
-const find = (cmd, sections = S) => findSectionsInCommand(sections, cmd);
-
 // ---------- 1. headings vs normal content ----------
 test('finds the real section titles of the summary', () => {
   assert.deepEqual(titlesOf(summary), [
@@ -77,74 +75,4 @@ test('table cells never start a section (label cells, merged cells, lists inside
   for (const text of ['Discharge Date', 'IP No', 'PARAMETER', 'NIL', 'CRP']) {
     assert.equal(isSectionTitle(summary, blocks[indexOf(summary, text)]), false, text);
   }
-});
-
-test('table rows stay in the body of their section', () => {
-  const lab = S.find((s) => s.title === 'LAB INVESTIGATIONS');
-  for (const text of ['PARAMETER', 'CRP', '48.9', 'NIL', 'x']) assert.ok(lab.body.includes(indexOf(summary, text)), text);
-  const top = S.find((s) => s.title === 'DISCHARGE SUMMARY'); // header table belongs to the part under the title
-  for (const text of ['Name', 'MRS.SUJATHA K', 'Discharge Date', '30-10-2026']) assert.ok(top.body.includes(indexOf(summary, text)), text);
-});
-
-test('body of a section stops at the next heading; empty sections are kept', () => {
-  const course = S.find((s) => s.title === 'COURSE IN HOSPITAL');
-  assert.deepEqual(course.body.map((i) => getBlocks(summary)[i].node.textContent), [
-    'Initial labs showed leukocytosis.', 'DENGUE NS1 POSITIVE.', 'Patient is stable.',
-  ]);
-  assert.equal(S.find((s) => s.title === 'SIGMOIDOSCOPY').body.length, 0);
-  assert.equal(sectionOf(S, indexOf(summary, 'Patient is stable.')).title, 'COURSE IN HOSPITAL');
-});
-
-// ---------- 3. loose matching ----------
-test('loose names find the right section', () => {
-  assert.equal(find('inside the course in the hospital make all the content upper case').best.title, 'COURSE IN HOSPITAL');
-  assert.equal(find('add this to the hospital course').best.title, 'COURSE IN HOSPITAL');
-  assert.equal(find('inside the presenting complaints make all the contents in lower case').best.title, 'PRESENTING COMPLAINT');
-  assert.equal(find('Inside course in the hospital add the patient was diagnosed with malaria').best.title, 'COURSE IN HOSPITAL');
-});
-
-test('field names are not sections (the app must change the field, not a section)', () => {
-  assert.equal(find('change the patient mobile number to 9876543210').best, null);
-  assert.equal(find('and discharge date was 10th of October').best, null);
-});
-
-test('content words do not steal the section: "in the course in hospital add ... diagnosed with ..."', () => {
-  // "diagnosed" is not "diagnosis"; and DIAGNOSIS is not after "in/inside/to"
-  assert.equal(find('in the course in hospital add that the patient was diagnosed with dengue').best.title, 'COURSE IN HOSPITAL');
-  const r = find('inside course in hospital add a note about the diagnosis');
-  assert.equal(r.best.title, 'COURSE IN HOSPITAL'); // both named; the one after "inside" wins
-});
-
-test('similar names: the longer, exact one wins', () => {
-  const d = docOf(bold('DIAGNOSIS'), p('a'), bold('FINAL DIAGNOSIS'), p('b'), bold('PROVISIONAL DIAGNOSIS'), p('c'));
-  const s = getSections(d);
-  assert.equal(find('in the final diagnosis add dengue', s).best.title, 'FINAL DIAGNOSIS');
-  assert.equal(find('in the provisional diagnosis add dengue', s).best.title, 'PROVISIONAL DIAGNOSIS');
-  assert.equal(find('in the diagnosis add dengue', s).best.title, 'DIAGNOSIS');
-});
-
-test('only partly named -> no guess, candidates offered for the question', () => {
-  const d = docOf(bold('PHYSICAL EXAMINATION'), p('a'), bold('SYSTEMIC EXAMINATION'), p('b'));
-  const r = find('in the examination add pallor', getSections(d));
-  assert.equal(r.best, null);
-  assert.deepEqual(r.candidates.map((c) => c.title), ['PHYSICAL EXAMINATION', 'SYSTEMIC EXAMINATION']);
-});
-
-test('two named sections, neither after "in/inside/to" -> ambiguous, ask', () => {
-  const r = find('advice and diagnosis make upper case');
-  assert.equal(r.best, null);
-  assert.equal(r.ambiguous, true);
-  assert.deepEqual(r.candidates.map((c) => c.title).sort(), ['ADVICE', 'DIAGNOSIS']);
-});
-
-test('the same section title twice in the document -> ambiguous, ask', () => {
-  const d = docOf(bold('ADVICE'), p('a'), bold('COURSE IN HOSPITAL'), p('b'), bold('ADVICE'), p('c'));
-  const r = find('add rest to the advice', getSections(d));
-  assert.equal(r.best, null);
-  assert.equal(r.ambiguous, true);
-});
-
-test('name words ignore filler words and plurals', () => {
-  assert.deepEqual(nameWords('COURSE IN THE HOSPITAL :'), ['course', 'hospital']);
-  assert.deepEqual(nameWords('Presenting Complaints'), ['presenting', 'complaint']);
 });

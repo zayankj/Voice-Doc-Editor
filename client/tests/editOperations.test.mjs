@@ -16,8 +16,6 @@ import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
 import { EditorState } from '@tiptap/pm/state';
 import { history, undo } from '@tiptap/pm/history';
-import { checkNamedSection, checkTableEdits } from '../src/lib/verify.js';
-import { classifyCommand } from '../src/lib/commandIntent.js';
 import { asOneUndoStep } from '../src/lib/undoStep.js';
 
 // voiceEdit.js imports its neighbours without ".js": a temporary copy with the endings added
@@ -29,7 +27,7 @@ for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tabl
   fs.writeFileSync(path.join(tmp, `${f}.js`), src);
 }
 const { applyVoiceEdit } = await import(pathToFileURL(path.join(tmp, 'voiceEdit.js')).href);
-const { medicinesLostByEdits, previewEdits } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
+const { previewEdits } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
 const { getBlocks, buildOutline } = await import(pathToFileURL(path.join(tmp, 'outline.js')).href);
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -113,7 +111,6 @@ for (const L of ['A', 'B']) {
     const ed = makeEditor(LAYOUT[L]());
     const before = ed.state.doc;
     const edit = { block_id: id(ed, 'Tab. CIPLOX'), operation: 'to_list', list_type: 'ordered', lines: [CIPLOX, DOLO, PAN], field_label: 'Advice' };
-    assert.equal(medicinesLostByEdits(before, [edit]), 0); // the medicine safety check sees no medicine lost
     const r = applyVoiceEdit(ed, edit, { allowGender: false });
     assert.equal(r.ok, true, r.error);
     const adv = section(ed.state.doc, 'ADVICE');
@@ -281,7 +278,6 @@ test('change_case: one word only; a list section stays a list; Advice with line 
   ed = makeEditor(LAYOUT.B());
   const before = ed.state.doc;
   const edit = { block_id: id(ed, 'Tab. CIPLOX'), operation: 'change_case', case: 'lower', field_label: 'Advice' };
-  assert.equal(medicinesLostByEdits(before, [edit]), 0);
   r = applyVoiceEdit(ed, edit);
   assert.equal(r.ok, true, r.error);
   assert.deepEqual(section(ed.state.doc, 'ADVICE'), [`P ${ADVICE.map((x) => x.toLowerCase()).join('↵')}`]);
@@ -295,7 +291,6 @@ test('change_case: the whole document in ONE edit - every text, table and list; 
     const blocks = getBlocks(ed.state.doc);
     const edits = [{ block_id: 'B0', last_block_id: `B${blocks.length - 1}`, operation: 'change_case', case: kase, field_label: 'Document' }];
     // the table check does not stop a case change (it changes no row and no number)
-    assert.deepEqual(checkTableEdits(ed.state.doc, 'make the entire document uppercase', edits).edits, edits);
     const r = applyVoiceEdit(ed, edits[0]);
     assert.equal(r.ok, true, r.error);
     const f = (s) => (kase === 'upper' ? s.toUpperCase() : s.toLowerCase());
@@ -316,25 +311,6 @@ test('change_case on a table value and a label: only the letters change (numbers
 // ================= Issue 2 and the medicine insertion rules =================
 for (const L of ['A', 'B']) {
   // (approved rule) a new medicine goes right after the LAST MEDICINE entry - before "Drink plenty of water."
-  test(`ISSUE 2 (layout ${L}): a new medicine is its OWN line after the last medicine of Advice; the Ringworm line and every medicine unchanged`, () => {
-    const ed = makeEditor(LAYOUT[L]());
-    const before = ed.state.doc;
-    const lastId = L === 'A' ? id(ed, 'Drink plenty') : id(ed, 'Tab. CIPLOX');
-    // the AI may use insert_after or (wrongly) append: both give a separate line
-    for (const operation of ['insert_after', 'append']) {
-      const e2 = makeEditor(LAYOUT[L]());
-      const r = applyVoiceEdit(e2, { block_id: lastId, operation, new_value: 'Tab. ZINCOVIT — At night — Daily', field_label: 'Advice' });
-      assert.equal(r.ok, true, r.error);
-      assert.deepEqual(plainLines(section(e2.state.doc, 'ADVICE')), [CIPLOX, SYP, DOLO, PAN, RING, 'Tab. ZINCOVIT — At night — Daily', WATER], operation);
-      othersSame(before, e2.state.doc, ['ADVICE']);
-    }
-    // a non-medicine instruction appended after the last line: also its own line (never "Drink plenty of water. Avoid alcohol.")
-    const e3 = makeEditor(LAYOUT[L]());
-    assert.equal(applyVoiceEdit(e3, { block_id: lastId, operation: 'append', new_value: '\nAvoid alcohol.', field_label: 'Advice' }).ok, true);
-    assert.deepEqual(plainLines(section(e3.state.doc, 'ADVICE')), [...ADVICE, 'Avoid alcohol.']);
-    void ed;
-  });
-
   test(`medicine at a position (layout ${L}): "after DOLO" and "before PAN" land exactly there`, () => {
     const ed = makeEditor(LAYOUT[L]());
     const edit = L === 'A'
@@ -346,46 +322,12 @@ for (const L of ['A', 'B']) {
     if (L === 'B') assert.equal(section(ed.state.doc, 'ADVICE').length, 1, 'still ONE paragraph with line breaks');
   });
 
-  test(`a medicine already in the section (layout ${L}) -> a question, nothing changes; duplicate_ok -> added as a new line`, () => {
-    const ed = makeEditor(LAYOUT[L]());
-    const before = ed.state.doc;
-    const lastId = L === 'A' ? id(ed, 'Drink plenty') : id(ed, 'Tab. CIPLOX');
-    const edit = { block_id: lastId, operation: 'insert_after', new_value: 'Tab. DOLO (Paracetamol) — At night — Daily', field_label: 'Advice' };
-    const r = applyVoiceEdit(ed, edit);
-    assert.equal(r.ok, false);
-    assert.equal(r.blocked, true);
-    assert.match(r.error, /DOLO is already in this section\. Do you want to change the existing entry, or add another DOLO entry\?/);
-    assert.ok(ed.state.doc.eq(before));
-    assert.equal(applyVoiceEdit(ed, { ...edit, operation: 'append' }).ok, false); // append too
-    assert.equal(applyVoiceEdit(ed, { ...edit, duplicate_ok: true }).ok, true);
-    assert.deepEqual(plainLines(section(ed.state.doc, 'ADVICE')), [CIPLOX, SYP, DOLO, PAN, RING, 'Tab. DOLO (Paracetamol) — At night — Daily', WATER]);
-  });
-
-  test(`an instruction "after the DOLO line" is a NEW line (layout ${L}), never glued onto DOLO; a continuation still appends`, () => {
-    const ed = makeEditor(LAYOUT[L]());
-    const target = L === 'A' ? id(ed, 'Tab. DOLO') : id(ed, 'Tab. CIPLOX');
-    const r = applyVoiceEdit(ed, { block_id: target, operation: 'insert_after', ...(L === 'B' ? { find_text: DOLO } : {}), new_value: 'Take only if the temperature is above 100 F', field_label: 'Advice' });
-    assert.equal(r.ok, true, r.error);
-    assert.deepEqual(plainLines(section(ed.state.doc, 'ADVICE')), [CIPLOX, SYP, DOLO, 'Take only if the temperature is above 100 F', PAN, RING, WATER]);
-    if (L === 'A') {
-      // the AI used append on the DOLO line with a sentence: a new line, not "... (SOS) Take only if ..."
-      const e2 = makeEditor(LAYOUT.A());
-      assert.equal(applyVoiceEdit(e2, { block_id: id(e2, 'Tab. DOLO'), operation: 'append', new_value: 'Take only if the temperature is above 100 F', field_label: 'Advice' }).ok, true);
-      assert.deepEqual(plainLines(section(e2.state.doc, 'ADVICE')).slice(2, 4), [DOLO, 'Take only if the temperature is above 100 F']);
-      // a continuation of the same line ("— 3 days") is still appended to it
-      const e3 = makeEditor(LAYOUT.A());
-      assert.equal(applyVoiceEdit(e3, { block_id: id(e3, 'Tab. DOLO'), operation: 'append', new_value: '— 3 days', field_label: 'Advice' }).ok, true);
-      assert.ok(plainLines(section(e3.state.doc, 'ADVICE')).includes(`${DOLO} — 3 days`));
-    }
-  });
-
   test(`removing one instruction line (layout ${L}): no empty line left, neighbours not joined, medicines kept`, () => {
     const ed = makeEditor(LAYOUT[L]());
     const before = ed.state.doc;
     const edit = L === 'A'
       ? { block_id: id(ed, 'Drink plenty'), operation: 'clear', field_label: 'Advice' }
       : { block_id: id(ed, 'Tab. CIPLOX'), operation: 'replace_text', find_text: WATER, new_value: '', field_label: 'Advice' };
-    assert.equal(medicinesLostByEdits(before, [edit]), 0);
     assert.equal(applyVoiceEdit(ed, edit).ok, true);
     assert.deepEqual(plainLines(section(ed.state.doc, 'ADVICE')), ADVICE.slice(0, 5));
     // a line in the middle (layout B): its break goes with it
@@ -398,35 +340,6 @@ for (const L of ['A', 'B']) {
   });
 }
 
-test('a whole sentence appended to a medicine line after a dash is a NEW line; short medicine parts after a dash still append', () => {
-  const ed = makeEditor(LAYOUT.A());
-  assert.equal(applyVoiceEdit(ed, { block_id: id(ed, 'Tab. DOLO'), operation: 'append', new_value: ' — Take only if the temperature is above 100 F', field_label: 'Advice' }).ok, true);
-  assert.deepEqual(plainLines(section(ed.state.doc, 'ADVICE')).slice(2, 4), [DOLO, 'Take only if the temperature is above 100 F']);
-  for (const part of ['— Once Daily before food', '— As Needed (SOS) — 3 days', '— 5 days']) {
-    const e2 = makeEditor(LAYOUT.A());
-    assert.equal(applyVoiceEdit(e2, { block_id: id(e2, 'Tab. PAN'), operation: 'append', new_value: part, field_label: 'Advice' }).ok, true);
-    assert.ok(plainLines(section(e2.state.doc, 'ADVICE')).includes(`${PAN} ${part}`), part);
-  }
-});
-
-test('a NEW medicine line from a command: every number in it must have been said (no invented strength / duration)', () => {
-  const doc = schema.node('doc', null, LAYOUT.A());
-  const ed = makeEditor(LAYOUT.A());
-  const at = id(ed, 'Drink plenty');
-  const made = { block_id: at, operation: 'insert_after', new_value: 'Tab. DOLO (Paracetamol) 650 mg — Oral — At Night Daily — 5 days', field_label: 'Advice' };
-  let c = checkTableEdits(doc, 'Add a tablet Dolo Paracetamol in the night daily in the advice section.', [made]);
-  assert.equal(c.edits.length, 0);
-  assert.match(c.blocked[0], /contains 650, 5, which was not in your command, so it was not added/);
-  // the numbers WERE said -> allowed (digits or words)
-  c = checkTableEdits(doc, 'add tablet dolo 650 mg at night for 5 days in advice', [made]);
-  assert.equal(c.edits.length, 1);
-  c = checkTableEdits(doc, 'add tablet dolo six fifty mg at night for five days', [{ ...made, new_value: 'Tab. DOLO 650 mg — 5 days' }]);
-  assert.equal(c.edits.length, 0, 'spoken "six fifty" is read as 6 and 50, not 650: refused, never guessed');
-  // a new line without numbers, and a plain instruction, are not affected; nor other sections
-  assert.equal(checkTableEdits(doc, 'add zincovit at night', [{ ...made, new_value: 'Tab. ZINCOVIT — At night' }]).edits.length, 1);
-  assert.equal(checkTableEdits(doc, 'add avoid oily food', [{ ...made, new_value: 'Avoid oily food for 2 weeks' }]).edits.length, 1);
-  assert.equal(checkTableEdits(doc, 'add fever', [{ block_id: id(ed, 'Fever for'), operation: 'append', new_value: 'Tab. X 5 mg', field_label: 'PC' }]).edits.length, 1);
-});
 
 test('a new line inside a list becomes a new list item (numbering continues)', () => {
   const ed = makeEditor(LAYOUT.A());
@@ -444,26 +357,6 @@ test('a medicine added to a department-template section (MEDICATIONS, one paragr
 });
 
 // ================= moving text between sections =================
-test('move "from <section> to <section>": the removal in the source is allowed; other sections still refused', () => {
-  const ed = makeEditor(LAYOUT.A());
-  const doc = ed.state.doc;
-  const pc = id(ed, 'Fever for');
-  const course = id(ed, 'Patient was');
-  const edits = [
-    { block_id: pc, operation: 'replace_text', find_text: ' Headache and body pain.', new_value: '', field_label: 'PC' },
-    { block_id: course, operation: 'append', new_value: 'Headache and body pain.', field_label: 'Course' },
-  ];
-  const cmd = "move 'Headache and body pain.' from the presenting complaints to the course in hospital";
-  const c = checkNamedSection(doc, cmd, edits);
-  assert.ok(!c.reject, c.reject);
-  for (const e of c.edits) assert.equal(applyVoiceEdit(ed, e).ok, true);
-  assert.deepEqual(section(ed.state.doc, 'PRESENTING COMPLAINTS'), ['P Fever for 5 days.']);
-  assert.ok(section(ed.state.doc, 'COURSE IN HOSPITAL')[0].endsWith('IV antibiotics. Headache and body pain.'));
-  othersSame(doc, ed.state.doc, ['PRESENTING COMPLAINTS', 'COURSE IN HOSPITAL']);
-  // without "from <that section>", a change in another section is still refused (existing protection)
-  assert.ok(checkNamedSection(doc, 'add headache and body pain to the course in hospital', edits).reject);
-  assert.ok(checkNamedSection(doc, "move 'x' from the diagnosis to the course in hospital", edits).reject);
-});
 
 // ================= safety, uploads, Undo =================
 test('look-only edits never come from an uploaded file; a file may still add a medicine that exists (compared later)', () => {
@@ -504,11 +397,3 @@ test('the outline the AI reads still lists every line (list items appear as bloc
 });
 
 // ================= quoted phrase in Advice (approved change in commandIntent.js) =================
-test('remove a QUOTED plain instruction from Advice -> normal AI editing; medicine parts keep the confirmation window', () => {
-  const doc = schema.node('doc', null, LAYOUT.A());
-  assert.equal(classifyCommand(doc, "remove 'Drink plenty of water' from the advice").type, 'ai');
-  const oral = classifyCommand(doc, "remove 'Oral' from all medicines in the advice");
-  assert.equal(oral.type, 'remove'); // still the medicine window
-  assert.equal(classifyCommand(doc, "remove 'Bed rest' from the advice").type, 'ask'); // not in Advice: still asks
-  assert.equal(classifyCommand(doc, 'remove all medicines from advice').type, 'remove');
-});

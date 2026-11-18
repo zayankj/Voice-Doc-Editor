@@ -353,10 +353,10 @@ test('the streaming Live session is the SAME session as liveExtract: same settin
 
 test('the stream route uses the same prompt and backup request as the HTTP voice path (index.js)', () => {
   const index = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  // HTTP voice path: buildExtractPrompt(outline, today, typed, hasFile, hasAudio, template) + commandAddon(...)
-  assert.match(index, /const prompt = buildExtractPrompt\(outline, today, typed, hasFile, hasAudio, template\) \+\r?\n\s+\(isCommand \? commandAddon\(\{ cursorBlock: cleanCursorBlock\(cursorBlock\), recent: cleanRecent\(recent\) \}\) : ''\);/);
-  // stream: the same call for a voice clip on its own (typed = '', hasFile = false, hasAudio = true, isCommand)
-  assert.match(index, /return buildExtractPrompt\(outline, today, '', false, true, template\) \+\r?\n\s+commandAddon\(\{ cursorBlock: cleanCursorBlock\(cursorBlock\), recent: cleanRecent\(recent\) \}\);/);
+  // HTTP voice path (Stage 3.3): the command prompt, buildCommandPrompt({ ..., instruction: typed, hasAudio, ... })
+  assert.match(index, /\? buildCommandPrompt\(\{ outline, today, instruction: typed, hasAudio, template, cursorBlock: cleanCursorBlock\(cursorBlock\), recent: cleanRecent\(recent\) \}\)/);
+  // stream: the same call for a voice clip on its own (typed = '', hasAudio = true)
+  assert.match(index, /return buildCommandPrompt\(\{ outline, today, instruction: '', hasAudio: true, template, cursorBlock: cleanCursorBlock\(cursorBlock\), recent: cleanRecent\(recent\) \}\);/);
   // backup: audio first, then the prompt; the same answer settings as the HTTP path for a command
   assert.match(index, /parts: \[\{ inlineData: \{ mimeType: 'audio\/wav', data: wavBase64 \} \}, \{ text: prompt \}\]/);
   const httpCfg = "config: { responseMimeType: 'application/json', responseSchema: isCommand ? commandSchema(editsSchema) : editsSchema, temperature: 0 },";

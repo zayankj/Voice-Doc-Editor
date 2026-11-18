@@ -76,10 +76,42 @@ const swapNoun = (noun, gender) => {
   return swap ? matchCase(swap, noun) : noun;
 };
 
+// ---------- someone OTHER than the patient (a relative, an attender ...) ----------
+// "Mother is a 60 year old female with diabetes", "his father, a 70-year-old man, ...", "Wife: 45 years old lady":
+// that age / sex / pronoun belongs to the relative and is never changed to the patient's. The patient's own words
+// still follow Patient Details ("His mother ..." - "his" is the patient; "a 30 year old male patient whose mother ...").
+const OTHER_PERSON = /\b(?:mother|father|mom|mum|dad|parents?|wife|husband|spouse|sons?|daughters?|child(?:ren)?|kids?|baby|brothers?|sisters?|siblings?|grand(?:mother|father|son|daughter|child|parent)s?|uncles?|aunts?|aunty|nephews?|nieces?|cousins?|in-?laws?|relatives?|relations?|friends?|neighbou?rs?|attender|attendant|caretaker|guardian|bystander)\b/i;
+const SENTENCE_START = /[.!?]\s+(?=\S)|\n+/g;
+// where the sentence containing position i starts, and where the sentence before it starts
+function sentenceBounds(text, i) {
+  let start = 0;
+  let prev = 0;
+  for (const m of text.matchAll(SENTENCE_START)) {
+    const s = m.index + m[0].length;
+    if (s > i) break;
+    prev = start;
+    start = s;
+  }
+  return { start, prev };
+}
+// is the phrase / pronoun at position i about another person? (a relative named BEFORE it in its own sentence; or a
+// he / she that starts a sentence right after a sentence about a relative that does not mention the patient)
+function aboutOtherPerson(text, i, { pronounAtStart = false } = {}) {
+  const { start, prev } = sentenceBounds(text, i);
+  if (OTHER_PERSON.test(text.slice(start, i))) return true;
+  if (pronounAtStart && start > 0 && !text.slice(start, i).trim()) {
+    const before = text.slice(prev, start);
+    return OTHER_PERSON.test(before) && !/\b(?:patient|pt)\b/i.test(before);
+  }
+  return false;
+}
+
 // All the places in one text that must change: [{ i, len, fixed }] (no overlaps)
 function findFixes(text, facts) {
   const hits = [];
   for (const m of text.matchAll(PHRASE)) {
+    // "... a 60 year old female" after "Mother is" belongs to the mother ("... patient" is always the patient)
+    if (!/^(?:patient|pt)$/i.test(m[3]) && aboutOtherPerson(text, m.index)) continue;
     const fixed = `${facts.age ?? m[1]}${m[2]}${swapNoun(m[3], facts.gender)}`;
     if (fixed !== m[0]) hits.push({ i: m.index, len: m[0].length, fixed });
   }
@@ -90,6 +122,8 @@ function findFixes(text, facts) {
     }
     for (const m of text.matchAll(PRONOUN)) {
       const w = m[1].toLowerCase();
+      // a pronoun about a relative ("Mother is diabetic and she takes insulin") stays; "His mother" (the patient's) changes
+      if (aboutOtherPerson(text, m.index, { pronounAtStart: /^(?:he|she)$/.test(w) })) continue;
       let to;
       if (facts.gender === 'female') to = PRONOUN_TO_FEMALE[w];
       else if (w === 'her') to = HER_AS_HIM_NEXT.test(text.slice(m.index + 3).trimStart()) ? 'him' : 'his';
@@ -202,14 +236,4 @@ export function setHeaderGender(editor, gender, onBlockChanged) {
     return applyHits(editor, pos, node, map, [{ i: at, len: old.length, fixed: word(old) }], onBlockChanged);
   }
   return null;
-}
-
-// Which gender do these new texts state? 'male' | 'female' | null (none, or both)
-const FEMALE_WORDS = /\b(female|woman|lady|girl|she|her|herself|mrs|ms|miss)\b/i;
-const MALE_WORDS = /\b(male|man|gentleman|boy|he|him|his|himself|mr)\b/i;
-export function genderStatedIn(texts) {
-  const all = texts.join(' \n ');
-  const f = FEMALE_WORDS.test(all);
-  const m = MALE_WORDS.test(all);
-  return f && !m ? 'female' : m && !f ? 'male' : null;
 }

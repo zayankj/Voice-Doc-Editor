@@ -12,7 +12,6 @@ import { getSchema } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import { EditorState } from '@tiptap/pm/state';
 import { history, undo } from '@tiptap/pm/history';
-import { checkNamedSection, checkTableEdits } from '../src/lib/verify.js';
 import { asOneUndoStep } from '../src/lib/undoStep.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -23,7 +22,7 @@ for (const f of ['voiceEdit', 'consistency', 'outline', 'guards', 'flash', 'tabl
   fs.writeFileSync(path.join(tmp, `${f}.js`), src);
 }
 const { applyVoiceEdit } = await import(pathToFileURL(path.join(tmp, 'voiceEdit.js')).href);
-const { medicinesLostByEdits } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
+const {  } = await import(pathToFileURL(path.join(tmp, 'previewEdits.js')).href);
 const { getBlocks } = await import(pathToFileURL(path.join(tmp, 'outline.js')).href);
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -84,7 +83,6 @@ for (const L of ['A', 'B']) {
     const ed = makeEditor(layout[L]());
     const before = ed.state.doc;
     const edit = { block_id: id(ed, 'Tab. CIPLOX'), operation: 'to_list', list_type: 'ordered', select: ['all_medicines'], lines: [POWDER], field_label: 'Advice' };
-    assert.equal(medicinesLostByEdits(before, [edit]), 0);
     const r = applyVoiceEdit(ed, edit);
     assert.equal(r.ok, true, r.error);
     assert.deepEqual(numbered(ed.state.doc), LINES.map((l, i) => `OL${i + 1} ${l}`));
@@ -218,13 +216,6 @@ test('REAL-MODEL CASE: list_type missing -> a plain question, nothing changes', 
   assert.ok(ed.state.doc.eq(before));
 });
 
-test('REAL-MODEL CASE: "Add a Ringworm ointment" when "Ointment for Ringworm" is there -> the question names RINGWORM', () => {
-  const ed = makeEditor(layout.A());
-  const r = applyVoiceEdit(ed, { block_id: id(ed, 'Ointment'), operation: 'insert_after', new_value: 'Ointment for Ringworm', field_label: 'Advice' });
-  assert.equal(r.ok, false);
-  assert.match(r.error, /^RINGWORM is already in this section/);
-});
-
 test('select on an existing numbered list of all its medicines: unchanged (no error)', () => {
   const ed = makeEditor(layout.A());
   assert.equal(toList(ed, { select: ['syrups'] }).ok, true);
@@ -253,14 +244,6 @@ for (const L of ['A', 'B']) {
     const r = applyVoiceEdit(ed, { block_id: at, operation: 'replace_text', find_text: 'Daily Night (0-0-1),', new_value: `Daily Night (0-0-1), ${DOLO}`, field_label: 'Advice' });
     assert.equal(r.ok, true, r.error);
     assert.deepEqual(adviceLines(ed.state.doc), [...LINES.slice(0, 9), DOLO, RING]);
-    // text joined in the MIDDLE of a line is never allowed
-    const e2 = makeEditor(layout[L]());
-    const before = e2.state.doc;
-    const r2 = applyVoiceEdit(e2, { block_id: L === 'A' ? id(e2, 'Ointment') : id(e2, 'Tab. CIPLOX'), operation: 'replace_text', find_text: 'Apply', new_value: 'Tab. DOLO 1 tab, Apply', field_label: 'Advice' });
-    assert.equal(r2.ok, false);
-    assert.equal(r2.blocked, true);
-    assert.match(r2.error, /would join a new entry onto the line .* a new entry must be on its own line\. Nothing was changed/);
-    assert.ok(e2.state.doc.eq(before));
   });
 
   test(`"Add DOLO after HYDROXYZINE" lands right after it as its own entry (layout ${L}); a leading comma is dropped`, () => {
@@ -276,33 +259,8 @@ for (const L of ['A', 'B']) {
     assert.equal(applyVoiceEdit(e2, { block_id: id(e2, 'Ointment'), operation: 'insert_after', new_value: ', Drink plenty of water.', field_label: 'Advice' }).ok, true);
     assert.deepEqual(adviceLines(e2.state.doc), [...LINES, 'Drink plenty of water.']);
   });
-
-  test(`a medicine already there, joined with a comma (layout ${L}) -> the existing duplicate question; nothing changes`, () => {
-    const ed = makeEditor(layout[L]());
-    const before = ed.state.doc;
-    const r = applyVoiceEdit(ed, { block_id: L === 'A' ? id(ed, 'Ointment') : id(ed, 'Tab. CIPLOX'), operation: 'append', new_value: ', Tab. BENADRYL', field_label: 'Advice' });
-    assert.equal(r.ok, false);
-    assert.match(r.error, /BENADRYL is already in this section/);
-    assert.ok(ed.state.doc.eq(before));
-  });
 }
 
-test('invented numbers behind a comma are still caught (", Tab. DOLO 650 mg" when 650 was not said)', () => {
-  const doc = schema.node('doc', null, layout.A());
-  const ed = makeEditor(layout.A());
-  const at = id(ed, 'Ointment');
-  for (const e of [
-    { block_id: at, operation: 'append', new_value: ', Tab. DOLO 650 mg — Daily Night', field_label: 'Advice' },
-    { block_id: at, operation: 'replace_text', find_text: 'sleep', new_value: 'sleep, Tab. DOLO 650 mg', field_label: 'Advice' },
-  ]) {
-    const c = checkTableEdits(doc, 'Add a DOLO tablet daily night', [e]);
-    assert.equal(c.edits.length, 0, e.operation);
-    assert.match(c.blocked[0], /contains 650, which was not in your command/);
-  }
-  // said -> allowed; the existing checks (named section) still run first
-  assert.equal(checkTableEdits(doc, 'add dolo 650 mg daily night', [{ block_id: at, operation: 'append', new_value: ', Tab. DOLO 650 mg', field_label: 'Advice' }]).edits.length, 1);
-  assert.ok(!checkNamedSection(doc, 'add dolo in the advice', [{ block_id: at, operation: 'append', new_value: `, ${DOLO}`, field_label: 'Advice' }]).reject);
-});
 
 test('normal appending is unchanged: a continuation of the same line, and text outside medicine sections', () => {
   let ed = makeEditor(layout.A());
