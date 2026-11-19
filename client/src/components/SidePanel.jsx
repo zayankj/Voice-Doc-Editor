@@ -24,7 +24,7 @@ const StopIcon = () => (
 );
 
 export default function SidePanel({
-  status, micDetail, onMic, reading, onRead, applying,
+  status, micDetail, onMic, reading, onRead, readSpeeds = [], readSpeed = 1, onReadSpeed, applying,
   transcript, reply, note, error,
   attached, onPickFile, onDropFile, onClearFile,
   instruction, onInstruction, onApply, progress = '',
@@ -74,6 +74,25 @@ export default function SidePanel({
               <span className="round-label">{reading ? 'Stop' : 'Read'}</span>
             </div>
           </div>
+          {/* reading speed: shown only while reading; reading goes on from where it is */}
+          {reading && readSpeeds.length > 0 && (
+            <div className="read-speed">
+              <div className="seg" role="group" aria-label="Reading speed">
+                {readSpeeds.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    className={`seg-btn ${s === readSpeed ? 'on' : ''}`}
+                    aria-pressed={s === readSpeed}
+                    onClick={() => onReadSpeed?.(s)}
+                    title={s === 1 ? 'Normal speed' : `${s} times faster`}
+                  >
+                    {s}x
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <p className="hint">Tap Mic, say what to change, then pause. Tap it again to stop.</p>
 
           <div>

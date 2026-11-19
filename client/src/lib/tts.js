@@ -9,6 +9,9 @@ const INTRO = 'Reading the discharge summary now.';
 const INTRO_FROM_CURSOR = 'Reading from here.'; // said when reading starts at the cursor
 const OUTRO = 'That is the end of the summary.';
 const PITCH = 1.0;
+// The fastest rate the speech engine is given. Chrome's Google voices never start a sentence above 2 (no error: the
+// reading just stopped), so 2x (2 x 1.1) is played at 2.
+export const MAX_RATE = 2;
 // Reading starts where the cursor is. Set to false to always read from the top.
 const START_FROM_CURSOR = true;
 // Reads two-cell table rows as "label: value". Set to false if your tables are normal grids.
@@ -351,11 +354,81 @@ function followScroll(editor, index) {
   if (b) scrollToPos(editor, b.pos, true);
 }
 
+// The reading in progress (null when nothing is being read): what is being read, and WHERE it is, so the speed can
+// be changed without starting again. at = the part being spoken; charAt = where in that part (the last word the
+// voice reported; 0 = the start of the part - some voices do not report words).
+let current = null;
+
 export function stopReading(editor) {
   runId++;
+  current = null;
   if (ttsSupported()) window.speechSynthesis.cancel();
   setHighlight(editor, -1);
 }
+
+// Speaks parts[from..] (the first one from character `offset`) at current.rate. Events of an older run are ignored.
+function speakFrom(from, offset = 0) {
+  const r = current;
+  const synth = window.speechSynthesis;
+  const id = r.id;
+  const { parts, editor } = r;
+  for (let i = from; i < parts.length; i++) {
+    const p = parts[i];
+    const start = i === from ? offset : 0;
+    const u = new SpeechSynthesisUtterance(p.text.slice(start));
+    if (r.voice) {
+      u.voice = r.voice;
+      u.lang = r.voice.lang;
+    }
+    u.rate = Math.min(r.rate, MAX_RATE);
+    u.pitch = PITCH;
+    u.onstart = () => {
+      if (id !== runId) return;
+      r.at = i;
+      r.charAt = start;
+      setHighlight(editor, p.index);
+      followScroll(editor, p.index);
+    };
+    // where the voice is inside this part (only voices that report words; used when the speed changes)
+    u.onboundary = (e) => {
+      if (id !== runId || r.at !== i || e.name !== 'word') return;
+      r.charAt = start + e.charIndex;
+    };
+    u.onend = () => { if (i === parts.length - 1) r.finish(id); };
+    u.onerror = (e) => { if (e.error !== 'canceled' && e.error !== 'interrupted') r.finish(id); };
+    synth.speak(u);
+  }
+}
+
+// Changes the speed of the reading in progress. It goes on from the word it is at (or the start of the sentence
+// part, for voices that do not report words) - never from the beginning. Returns false when nothing is being read.
+export function setReadingRate(rate) {
+  if (!current || !ttsSupported() || !(rate > 0)) return false;
+  const r = current;
+  if (r.rate === rate) return true;
+  r.rate = rate;
+  let { at, charAt } = r;
+  // nothing left of this part (the voice was at its very end): go on with the next one
+  if (!r.parts[at].text.slice(charAt).trim()) {
+    at++;
+    charAt = 0;
+  }
+  const id = ++runId; // the events of the utterances cancelled below are ignored
+  r.id = id;
+  window.speechSynthesis.cancel();
+  if (at >= r.parts.length) {
+    r.finish(id);
+    return true;
+  }
+  // Chrome drops sentences queued in the same moment as cancel() (seen with its Google voices: the reading then
+  // stopped), so the rest is queued a moment later. Stop or another speed change in between: this one does nothing.
+  setTimeout(() => {
+    if (id === runId && current === r) speakFrom(at, charAt);
+  }, RATE_CHANGE_GAP_MS);
+  return true;
+}
+// the short pause between cancel() and queueing the rest of the reading at the new speed
+export const RATE_CHANGE_GAP_MS = 150;
 
 // intro = false: no opening line (used when reading restarts after a click)
 // introText: the opening line (default: the discharge summary line), e.g. "Reading the Nursing Assessment now."
@@ -382,32 +455,18 @@ export function readDocument(editor, { voiceName, rate = 0.95, intro = true, int
     for (const text of chunk(closed)) parts.push({ text, index: item.index });
   }
 
-  const finish = () => {
-    if (id !== runId) return;
+  // the end of THIS reading (also after a speed change, which gives it a new id)
+  const finish = (fromId) => {
+    if (fromId !== runId) return;
+    current = null;
     setHighlight(editor, -1);
     onEnd?.();
   };
 
+  current = { id, editor, parts, voice, rate, at: 0, charAt: 0, finish };
   if (!parts.length) {
-    finish();
+    finish(id);
     return;
   }
-
-  parts.forEach((p, i) => {
-    const u = new SpeechSynthesisUtterance(p.text);
-    if (voice) {
-      u.voice = voice;
-      u.lang = voice.lang;
-    }
-    u.rate = rate;
-    u.pitch = PITCH;
-    u.onstart = () => {
-      if (id !== runId) return;
-      setHighlight(editor, p.index);
-      followScroll(editor, p.index);
-    };
-    u.onend = () => { if (i === parts.length - 1) finish(); };
-    u.onerror = (e) => { if (e.error !== 'canceled' && e.error !== 'interrupted') finish(); };
-    synth.speak(u);
-  });
+  speakFrom(0);
 }

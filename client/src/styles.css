@@ -179,6 +179,8 @@ textarea.instr:focus { outline: none; border-color: var(--accent); box-shadow: 0
 .round-btn.mic.listening { animation: pulse 1.2s infinite; }
 .round-btn.read.on { background: var(--info-soft); border-color: #7aa2f7; color: #1d4ed8; }
 .round-label { font-size: 13px; color: var(--soft-ink); min-height: 18px; }
+.read-speed { display: flex; justify-content: center; }
+.read-speed .seg-btn { padding: 5px 14px; font-size: 13px; }
 .hint { margin: 0; text-align: center; font-size: 12px; color: var(--faint-ink); }
 
 /* History tab: one card per instruction */

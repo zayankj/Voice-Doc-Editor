@@ -37,7 +37,8 @@ import { extractEdits, checkFile, FILE_ACCEPT } from './lib/fileExtract';
 import { createRequestTracker, startProgress, isCancelled, isTimeout, NOT_CHANGED } from './lib/requestGuard';
 import { previewEdits } from './lib/previewEdits';
 import { hasDeletion } from './lib/deletions';
-import { readDocument, stopReading, ttsSupported, watchVoices } from './lib/tts';
+import { readDocument, stopReading, setReadingRate, ttsSupported, watchVoices } from './lib/tts';
+import { createMicIdle } from './lib/micIdle'; // the time limit: MIC_IDLE_TIMEOUT_MS in that file
 import TopBar from './components/TopBar';
 import FormatBar from './components/FormatBar';
 import Ruler from './components/Ruler';
@@ -64,9 +65,10 @@ const USER_INITIAL = ''; // the user is now shown in the top header (AppHeader)
 // audio = the mic listens all the time, each command is sent after a pause (works with the Mumbai models).
 // live  = real-time Live model (needs GEMINI_API_KEY and a Live model; not available in the India region setup).
 const VOICE_MODE = import.meta.env.VITE_VOICE_MODE === 'live' ? 'live' : 'audio';
-const IDLE_STOP_MS = 5 * 60 * 1000; // the mic turns itself off after this long without speech
+// (the mic turns itself off after MIC_IDLE_TIMEOUT_MS without speech: lib/micIdle.js)
 const MAX_QUEUE = 5; // commands that may wait while a previous one is being applied
-const READ_RATE = 1.1; // reading speed for Read aloud (0.95 = normal, 1.1 = fast)
+const READ_RATE = 1.1; // reading speed for Read aloud at "1x" (0.95 = normal, 1.1 = fast)
+const READ_SPEEDS = [1, 1.25, 1.5, 2]; // the speed buttons shown while reading (times READ_RATE); every reading starts at 1x
 const RESTART_ON_CLICK = true; // while reading, clicking in the document restarts reading from the clicked sentence
 
 // Summaries are saved in this browser by lib/summaries.js (one entry per summary).
@@ -122,7 +124,9 @@ export default function App() {
   const submitting = useRef(false); // Apply Edit is running (blocks a double click before the button re-renders)
   const requests = useRef(null); // the AI requests still waiting for an answer (lib/requestGuard.js)
   if (!requests.current) requests.current = createRequestTracker();
-  const lastActivity = useRef(0);
+  const micIdle = useRef(null); // turns the mic off after MIC_IDLE_TIMEOUT_MS without speech (lib/micIdle.js)
+  const [readSpeed, setReadSpeed] = useState(1); // Read aloud speed button: 1, 1.5 or 2 (times READ_RATE)
+  const readSpeedRef = useRef(1); // the same, for the click-to-restart handler
   const fileInput = useRef(null);
   const attachInput = useRef(null);
   const imageInput = useRef(null);
@@ -314,6 +318,8 @@ export default function App() {
     }
     setError('');
     setReading(true);
+    setReadSpeed(1); // every reading starts at normal speed
+    readSpeedRef.current = 1;
     const tpl = findTemplateById(openTemplateId())?.tpl;
     readDocument(editor, {
       voiceName: activeVoice?.name,
@@ -321,6 +327,14 @@ export default function App() {
       ...(tpl ? { introText: `Reading the ${tpl.name} now.` } : {}), // summaries keep their usual opening line
       onEnd: () => setReading(false),
     });
+  }
+
+  // A speed button while reading: reading goes on from the sentence (or word) it is at, now at the new speed
+  function changeReadSpeed(speed) {
+    if (!reading || !READ_SPEEDS.includes(speed)) return;
+    setReadSpeed(speed);
+    readSpeedRef.current = speed;
+    setReadingRate(READ_RATE * speed);
   }
 
   // While reading, a click inside the document restarts the reading from the clicked sentence
@@ -335,7 +349,7 @@ export default function App() {
       timer = setTimeout(() => {
         readDocument(editor, {
           voiceName: activeVoice?.name,
-          rate: READ_RATE,
+          rate: READ_RATE * readSpeedRef.current, // the speed chosen for this reading
           intro: false, // no opening line, just continue from where you clicked
           onEnd: () => setReading(false),
         });
@@ -720,6 +734,7 @@ export default function App() {
     stopMic.current = null;
     segmenter.current?.flush(); // a command you are still saying is sent, not lost
     segmenter.current = null;
+    micIdle.current = null;
     setHearing(false);
     setStatus('idle');
   }
@@ -730,28 +745,39 @@ export default function App() {
       setError(''); setTranscript(''); setReply(''); setNote('');
       for (const q of queue.current) q.stream?.cancel(); // voice streaming: dropped clips close their streams too
       queue.current = [];
-      lastActivity.current = Date.now();
+      // the idle clock only counts SPEECH as vad.js decides it (the same callbacks below); it starts with the first
+      // microphone chunk, so the permission prompt is not counted
+      const idle = createMicIdle();
+      micIdle.current = idle;
       segmenter.current = createSegmenter({
         onSpeechStart: () => {
-          lastActivity.current = Date.now();
           setHearing(true);
         },
         onSegment: (clip) => {
-          lastActivity.current = Date.now();
           setHearing(false);
           enqueueClip(clip);
         },
         // voice streaming only (each does nothing when it is off): a stream is opened only once the command has the
         // minimum voiced audio (500 ms) - a cough or a click never opens one; then what vad.js reports is passed to it
-        onSpeechConfirmed: (chunksSoFar) => startStream(chunksSoFar),
-        onSegmentChunk: (chunk, loud) => speakingStream.current?.push(chunk, loud),
-        onSegmentEnd: endStream,
+        onSpeechConfirmed: (chunksSoFar) => {
+          idle.speechConfirmed();
+          startStream(chunksSoFar);
+        },
+        onSegmentChunk: (chunk, loud) => {
+          idle.chunk(loud);
+          speakingStream.current?.push(chunk, loud);
+        },
+        onSegmentEnd: (info) => {
+          idle.segmentEnd(info.sent);
+          endStream(info);
+        },
       });
       stopMic.current = await startCapture((chunk, rms) => {
         segmenter.current?.push(chunk, rms);
-        if (Date.now() - lastActivity.current > IDLE_STOP_MS) {
+        // a command waiting or being processed holds the clock: it is never cut off by the time limit
+        if (micIdle.current === idle && idle.tick(working.current || queue.current.length > 0)) {
           stopListening();
-          showToast('Microphone turned off after 5 minutes without speech.');
+          showToast('Microphone turned off automatically due to inactivity.');
         }
       });
       setStatus('listening');
@@ -980,6 +1006,9 @@ export default function App() {
           onMic={toggleMic}
           reading={reading}
           onRead={toggleRead}
+          readSpeeds={READ_SPEEDS}
+          readSpeed={readSpeed}
+          onReadSpeed={changeReadSpeed}
           applying={applying}
           transcript={transcript}
           reply={reply}

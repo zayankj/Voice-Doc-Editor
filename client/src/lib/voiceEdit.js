@@ -786,6 +786,12 @@ export function incompleteEdit(e) {
 const OUTLINE_MARKUP = /\[B\d+\]\s*\((?:P|H\d)\)|^\s*TABLE ROW:/m;
 
 export function applyVoiceEdit(editor, args, opts = {}) {
+  // Gemini sometimes escapes a line break twice, so new_value holds the two characters "\" + "n" (e.g.
+  // "Enteric fever\nheadache") instead of a real line break. Turn them back into real line breaks, so the line-break
+  // handling below makes separate lines (and no visible "\n" text ends up in the document).
+  if (typeof args?.new_value === 'string' && /\\n/.test(args.new_value)) {
+    args = { ...args, new_value: args.new_value.replace(/(?:\\r)?\\n/g, '\n') };
+  }
   // (Stage R1) an incomplete edit never changes the document
   const incomplete = incompleteEdit(args);
   if (incomplete) return { ok: false, blocked: true, error: incomplete };

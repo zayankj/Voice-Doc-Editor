@@ -406,7 +406,8 @@ test('A SHORT NOISE, THEN REAL SPEECH: no stream for the noise; exactly one for 
 test('App.jsx: the stream is opened on onSpeechConfirmed (never on the first loud chunk)', () => {
   const app = fs.readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
   const seg = app.slice(app.indexOf('segmenter.current = createSegmenter({'), app.indexOf('stopMic.current = await startCapture('));
-  assert.match(seg, /onSpeechConfirmed: \(chunksSoFar\) => startStream\(chunksSoFar\),/);
+  // (the mic idle stop also listens to onSpeechConfirmed: lib/micIdle.js; the stream is opened in the same callback)
+  assert.match(seg, /onSpeechConfirmed: \(chunksSoFar\) => \{[^}]*startStream\(chunksSoFar\);[^}]*\},/);
   const onStart = seg.slice(seg.indexOf('onSpeechStart:'), seg.indexOf('onSegment:'));
   assert.doesNotMatch(onStart, /startStream/, 'not opened when speech merely starts');
   assert.equal((app.match(/startStream\(/g) || []).length, 2, 'the definition + this one call');
