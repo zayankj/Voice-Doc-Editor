@@ -250,9 +250,9 @@ test('each of the four speeds: the rest of the WHOLE document is queued at that 
 });
 
 // ---------- MICROPHONE IDLE STOP ----------
-test('the time limit is one constant: 25 s', () => {
-  assert.equal(MIC_IDLE_TIMEOUT_MS, 25000);
-  assert.ok(!/IDLE_STOP_MS|25000|30000/.test(APP), 'App.jsx has no second copy of the time');
+test('the time limit is one constant: 10 s (changed from 25 s on 23 Nov)', () => {
+  assert.equal(MIC_IDLE_TIMEOUT_MS, 10000);
+  assert.ok(!/IDLE_STOP_MS|10000|25000|30000/.test(APP), 'App.jsx has no second copy of the time');
 });
 
 // drives the REAL vad.js and micIdle.js together, 128 ms per chunk (as the microphone). rmsAt(t) = loudness at time t.
@@ -261,6 +261,7 @@ function runMic(rmsAt, { ms = 120000, busyAt = () => false } = {}) {
   let clock = 0;
   const idle = createMicIdle({ now: () => clock });
   const seg = createSegmenter({
+    onSpeechStart: () => idle.soundStart(), // as App.jsx
     onSpeechConfirmed: () => idle.speechConfirmed(),
     onSegmentChunk: (_c, loud) => idle.chunk(loud),
     onSegmentEnd: (info) => idle.segmentEnd(info.sent),
@@ -273,10 +274,10 @@ function runMic(rmsAt, { ms = 120000, busyAt = () => false } = {}) {
 }
 const SILENT = 0.002;
 const SPEECH = 0.08;
-const T = 25000; // MIC_IDLE_TIMEOUT_MS
+const T = MIC_IDLE_TIMEOUT_MS; // 10 s
 const near = (t, expected) => assert.ok(t !== null && Math.abs(t - expected) <= 300, `turned off at ${t}, expected about ${expected}`);
 
-test('mic on, nobody speaks: off after 25 s', () => near(runMic(() => SILENT), T));
+test('mic on, nobody speaks: off after 10 s', () => near(runMic(() => SILENT), T));
 
 test('mic on, speaking without stopping for 100 s (vad cuts it into 30 s commands): never turned off', () => {
   assert.equal(runMic(() => SPEECH, { ms: 100000 }), null);
@@ -284,14 +285,54 @@ test('mic on, speaking without stopping for 100 s (vad cuts it into 30 s command
 
 // the clock restarts when a command ENDS: the last word + the 1.5 s pause vad.js waits for
 const END = 1536;
-test('speech with short pauses (1 s every 4 s): never off while speaking; off 25 s after the last command ended', () => {
+test('speech with short pauses (1 s every 4 s): never off while speaking; off 10 s after the last command ended', () => {
   const rms = (t) => (t < 60000 && t % 4000 < 3000 ? SPEECH : SILENT);
   near(runMic(rms), 59000 + END + T - 300);
 });
 
-test('speak, then 20 s quiet, then speak again: the clock starts again from the second command', () => {
-  const rms = (t) => ((t < 2000 || (t >= 22000 && t < 24000)) ? SPEECH : SILENT);
-  near(runMic(rms), 24000 + END + T);
+test('speak, then a quiet gap shorter than the limit, then speak again: the clock starts again from the second command', () => {
+  const rms = (t) => ((t < 2000 || (t >= 9000 && t < 11000)) ? SPEECH : SILENT); // ended at ~3.5 s, again at 9 s
+  near(runMic(rms), 11000 + END + T);
+});
+
+test('someone starting to speak exactly when the limit runs out is NOT cut off (the sound is waited for)', () => {
+  // quiet until just before the limit; then speech for 3 s: the command is heard, the mic stops 10 s after it ended
+  for (const startAt of [T - 128, T - 64, T]) {
+    const rms = (t) => (t >= startAt && t < startAt + 3000 ? SPEECH : SILENT);
+    let clock = 0;
+    let confirmed = false;
+    const idle = createMicIdle({ now: () => clock });
+    const seg = createSegmenter({
+      onSpeechStart: () => idle.soundStart(),
+      onSpeechConfirmed: () => { confirmed = true; idle.speechConfirmed(); },
+      onSegmentChunk: (_c, loud) => idle.chunk(loud),
+      onSegmentEnd: (info) => idle.segmentEnd(info.sent),
+    });
+    let off = null;
+    for (clock = 0; clock <= 40000 && off === null; clock += 128) { seg.push('x', rms(clock)); if (idle.tick()) off = clock; }
+    assert.ok(confirmed, `speech starting at ${startAt} ms was heard as a command (not cut off)`);
+    assert.ok(off > startAt + 3000 + T - 300, `off at ${off}: only after the command and another 10 s`);
+  }
+});
+
+test('vad.js speech floor (23 Nov: 0.012 -> 0.02): a distant voice no longer starts a command; normal speech still does', () => {
+  const commands = (level, opts = {}) => {
+    let n = 0;
+    const seg = createSegmenter({ ...opts, onSegment: () => { n++; } });
+    for (let t = 0; t < 6000; t += 128) seg.push('x', t >= 512 && t < 3000 ? level : SILENT); // 2.5 s of sound
+    return n;
+  };
+  assert.equal(commands(0.015), 0, 'a distant voice (0.015) is not a command any more');
+  assert.equal(commands(0.015, { minLevel: 0.012 }), 1, 'before (floor 0.012) it was');
+  for (const level of [0.025, 0.05, SPEECH, 0.2]) assert.equal(commands(level), 1, `normal speech ${level} is still a command`);
+  // the room's own level still raises the bar further when the room is noisy (unchanged)
+  const src = fs.readFileSync(path.join(here, '../src/lib/vad.js'), 'utf8');
+  assert.match(src, /minLevel = 0\.02,/);
+  assert.match(src, /const isLoud = \(rms\) => rms > Math\.max\(minLevel, noise \* 3\);/);
+});
+
+test('a short sound at the limit delays the stop by at most that sound (it does not restart the clock)', () => {
+  near(runMic((t) => (t >= T - 64 && t < T + 128 ? 0.2 : SILENT)), T + 256);
 });
 
 test('background noise (a click or cough every 2 s, a steady quiet hum) does NOT keep the mic on', () => {
@@ -300,7 +341,7 @@ test('background noise (a click or cough every 2 s, a steady quiet hum) does NOT
 });
 
 test('a command being processed holds the clock: never cut off while waiting for the AI', () => {
-  // spoken at 0-2 s, the AI takes until 50 s; the mic stops 25 s after that, not at 27 s
+  // spoken at 0-2 s, the AI takes until 50 s; the mic stops 10 s after that, not at 12 s
   const rms = (t) => (t < 2000 ? SPEECH : SILENT);
   near(runMic(rms, { busyAt: (t) => t >= 2000 && t < 50000 }), 50000 + T);
 });
@@ -322,5 +363,9 @@ test('App: the idle stop uses vad.js callbacks only, holds while busy, and stops
   assert.match(mic, /idle\.segmentEnd\(info\.sent\)/);
   assert.match(mic, /idle\.tick\(working\.current \|\| queue\.current\.length > 0\)/);
   assert.match(mic, /stopListening\(\);\s*showToast\('Microphone turned off automatically due to inactivity\.'\)/);
-  assert.ok(!/onSpeechStart: \(\) => \{[^}]*idle/.test(mic), 'a short sound (speech start only) is not counted');
+  // a short sound (speech start only) is not counted as speech: onSpeechStart only tells the clock a sound is going on
+  // (it never restarts the clock - see the click / cough tests above)
+  const onStart = mic.slice(mic.indexOf('onSpeechStart:'), mic.indexOf('onSegment:'));
+  assert.match(onStart, /idle\.soundStart\(\)/);
+  assert.doesNotMatch(onStart, /idle\.(speechConfirmed|chunk|segmentEnd)\(/, 'a short sound never restarts the clock');
 });

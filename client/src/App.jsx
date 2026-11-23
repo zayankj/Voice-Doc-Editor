@@ -36,7 +36,8 @@ import { todayString } from './lib/tools';
 import { extractEdits, checkFile, FILE_ACCEPT } from './lib/fileExtract';
 import { createRequestTracker, startProgress, isCancelled, isTimeout, NOT_CHANGED } from './lib/requestGuard';
 import { previewEdits } from './lib/previewEdits';
-import { hasDeletion } from './lib/deletions';
+import { needsConfirmation } from './lib/deletions';
+import { bottomUp, withRealLineBreaks } from './lib/aiEdits';
 import { readDocument, stopReading, setReadingRate, ttsSupported, watchVoices } from './lib/tts';
 import { createMicIdle } from './lib/micIdle'; // the time limit: MIC_IDLE_TIMEOUT_MS in that file
 import TopBar from './components/TopBar';
@@ -73,18 +74,13 @@ const RESTART_ON_CLICK = true; // while reading, clicking in the document restar
 
 // Summaries are saved in this browser by lib/summaries.js (one entry per summary).
 
-// The AI's edits from the bottom of the document upwards, so a newly inserted line never shifts the blocks that
-// are still waiting to be edited
-function bottomUp(edits) {
-  const blockNo = (ed) => {
-    const n = parseInt(String(ed.block_id).replace(/\D/g, ''), 10);
-    return Number.isNaN(n) ? -1 : n;
-  };
-  return edits
-    .map((ed, i) => ({ ed, i }))
-    .sort((a, b) => blockNo(b.ed) - blockNo(a.ed) || b.i - a.i)
-    .map((x) => x.ed);
-}
+// The AI's edits from the bottom of the document upwards (several edits of ONE block in Gemini's order):
+// bottomUp in lib/aiEdits.js
+
+// (Stage 1) shown when the document changed while the AI was working on a request (nothing of the answer is applied)
+const DOC_CHANGED = 'The document was changed while the AI was working, so nothing was changed. Please give the command again.';
+// (Stage 1) a voice command spoken for a document that is no longer open is discarded (never applied elsewhere)
+const DISCARDED = 'A voice command for the previous document was discarded. Nothing was changed.';
 
 export default function App() {
   const [history, setHistory] = useState([]);
@@ -116,7 +112,8 @@ export default function App() {
   const live = useRef(null);
   const stopMic = useRef(null);
   const segmenter = useRef(null); // cuts the microphone stream into commands (audio mode)
-  const queue = useRef([]); // finished commands waiting to be sent: { clip, endedAt, stream }
+  const queue = useRef([]); // finished commands waiting to be sent: { clip, endedAt, stream, docKey }
+  const speechDoc = useRef(null); // (Stage 1) the document open when the command being spoken now was started
   const speakingStream = useRef(null); // voice streaming: the stream of the command being spoken now (or null)
   const endedStream = useRef(null); // voice streaming: the stream of the command that just ended (handed to its clip)
   const voiceTiming = useRef(null); // times of the voice command being processed (console line only)
@@ -558,7 +555,15 @@ export default function App() {
       // the document this answer was made for is no longer open (or the request was cancelled): never applied
       if (ticket.isStale(currentId.current)) return 'stale';
       if (timing) timing.answerAt = performance.now();
-      const { edits: aiEdits, summary: aiSummary } = answer;
+      // (Stage 1) the answer was made for the document AS IT WAS when the request started (its block numbers). If it
+      // changed while the AI was working (typing, undo, another command), nothing of it is applied.
+      if (!editor.state.doc.eq(docAtStart)) {
+        setError(DOC_CHANGED);
+        return false;
+      }
+      const { edits: rawEdits, summary: aiSummary } = answer;
+      // (Stage 1) cleaned ONCE here, so the deletion check, the dry run, the window and the editor see the same edits
+      const aiEdits = rawEdits.map(withRealLineBreaks);
       // heard is the transcript of a VOICE command; for typed text the AI may echo the text, which is not used
       const heard = audio ? answer.heard || '' : '';
       if (heard) setTranscript(heard);
@@ -582,10 +587,11 @@ export default function App() {
           return true;
         }
       }
-      // R4 (D3): an edit that DELETES existing text (clear, set "", replace_text with "") - decided by the operation
-      // only: the whole command is shown in the confirmation window first (removed text struck through); nothing
-      // changes until Apply. Everything else is applied directly (highlighted, one Undo step, History).
-      if (hasDeletion(doc, ordered)) {
+      // (23 Nov) an edit that REMOVES or REPLACES an existing MEDICINE (Gemini's removes_medicine, never skipped when
+      // that answer is missing or contradicts itself - lib/deletions.js needsConfirmation): the whole command is shown
+      // in the confirmation window first (removed text struck through); nothing changes until Apply. Everything else -
+      // also removing other text - is applied directly (highlighted, one Undo step, History).
+      if (needsConfirmation(doc, ordered)) {
         const dry = previewEdits(doc, ordered, { fromFile });
         if (dry.blocked.length) {
           setNote(`🔒 Nothing was changed: ${dry.blocked.map((b) => `${b.field}: ${b.reason}`).join('; ')}.`);
@@ -594,9 +600,9 @@ export default function App() {
         openPending({
           kind: 'command', doc, ordered, preview: dry, label, text, heard, voice, summary, fromFile, fileName: file?.name || '',
           recompute: (selected) => previewEdits(doc, ordered, { fromFile, selected }),
-          notice: 'This removes existing text (struck through below). Check it, then press Apply - nothing is changed until then.',
+          notice: 'This removes existing text, including a medicine (struck through below). Check it, then press Apply - nothing is changed until then.',
         });
-        setNote('Please check the window: this removes existing text. Nothing has been changed yet.');
+        setNote('Please check the window: this removes a medicine. Nothing has been changed yet.');
         return true;
       }
       const applyFrom = performance.now();
@@ -638,6 +644,9 @@ export default function App() {
   async function handleApply() {
     if (!attached && !instruction.trim()) return;
     if (submitting.current) return; // already running: a second click never sends the instruction twice
+    // (Stage 1) a voice command is still being processed: no second request at the same time (the button is
+    // disabled then too; the microphone itself keeps listening and queuing commands as before)
+    if (working.current) return;
     submitting.current = true;
     try {
       const outcome = await runAndReport({
@@ -660,7 +669,10 @@ export default function App() {
     setProcessing(true);
     try {
       while (queue.current.length) {
-        const { clip, endedAt, stream: spoken = null } = queue.current.shift();
+        const { clip, endedAt, stream: spoken = null, docKey } = queue.current.shift();
+        // (Stage 1) a command belongs to the document that was open when the person STARTED saying it: never
+        // processed for another document (another patient)
+        if (docKey !== currentId.current) { spoken?.cancel(); continue; }
         const startedAt = performance.now();
         const { base64, seconds } = pcmChunksToWav(clip);
         if (seconds < 0.5) { spoken?.cancel(); continue; }
@@ -690,15 +702,37 @@ export default function App() {
     }
   }
 
+  // (Stage 1) another document is opened (or the editor is left): the voice commands of the previous document that
+  // are waiting are dropped (their streams closed), and the stream of a command still being spoken is closed. That
+  // command itself is dropped when it ends (enqueueClip: it belongs to the previous document). The request being
+  // processed now is cancelled by requests.current.cancelAll().
+  function discardVoiceCommands() {
+    const dropped = queue.current.length;
+    for (const q of queue.current) q.stream?.cancel();
+    queue.current = [];
+    speakingStream.current?.cancel();
+    speakingStream.current = null;
+    if (dropped) showToast(DISCARDED);
+  }
+
   function enqueueClip(clip) {
     const stream = endedStream.current; // voice streaming: the stream of THIS clip (set just before, by vad.js)
     endedStream.current = null;
+    // (Stage 1) the document that was open when this command was STARTED; another document is open now (or none):
+    // the recording is discarded, never sent or applied
+    const docKey = speechDoc.current;
+    speechDoc.current = null;
+    if (!docKey || docKey !== currentId.current) {
+      stream?.cancel();
+      showToast(DISCARDED);
+      return;
+    }
     if (queue.current.length >= MAX_QUEUE) {
       stream?.cancel();
       showToast('Too many commands waiting. Please wait a moment.');
       return;
     }
-    queue.current.push({ clip, endedAt: performance.now(), stream }); // endedAt: when the pause ended the command (for the timing line)
+    queue.current.push({ clip, endedAt: performance.now(), stream, docKey }); // endedAt: when the pause ended the command (for the timing line)
     processQueue();
   }
 
@@ -751,6 +785,8 @@ export default function App() {
       micIdle.current = idle;
       segmenter.current = createSegmenter({
         onSpeechStart: () => {
+          idle.soundStart(); // the mic is not turned off in the middle of this sound (it does not count as speech yet)
+          speechDoc.current = currentId.current; // (Stage 1) this command belongs to the document open NOW
           setHearing(true);
         },
         onSegment: (clip) => {
@@ -860,6 +896,7 @@ export default function App() {
     if (!editor) return;
     if (currentId.current === openKey) return;
     requests.current.cancelAll(); // an answer for the previous document must never land in this one
+    discardVoiceCommands(); // (Stage 1) and no queued voice command of the previous document is sent or applied
     flushSave();
     currentId.current = openKey;
     if (openSummary) {
@@ -1010,6 +1047,7 @@ export default function App() {
           readSpeed={readSpeed}
           onReadSpeed={changeReadSpeed}
           applying={applying}
+          processing={processing}
           transcript={transcript}
           reply={reply}
           note={note}

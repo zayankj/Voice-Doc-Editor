@@ -10,7 +10,10 @@ export function createSegmenter({
   maxSegmentMs = 30000, // very long speech is cut after this long
   preRollMs = 400, // audio kept from just before you started speaking, so the first word is not lost
   tailMs = 400, // silence kept at the end of the clip
-  minLevel = 0.012, // sounds quieter than this are never speech. Raise it if room noise triggers it, lower it if quiet speech is missed
+  // sounds quieter than this are never speech. Raise it if room noise triggers it, lower it if quiet speech is missed.
+  // 23 Nov: 0.012 -> 0.02 (about 4.4 dB higher) so distant voices and background conversations in the room start a
+  // command less often; normal speech into the microphone is far louder (often 0.05 - 0.2)
+  minLevel = 0.02,
   onSpeechStart,
   onSegment, // called with the list of audio chunks of one finished command
   // Optional, for voice streaming (lib/voiceStream.js). They only REPORT what happens here; nothing above or below

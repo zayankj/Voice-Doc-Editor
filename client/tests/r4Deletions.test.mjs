@@ -159,7 +159,9 @@ const tail = app.slice(app.indexOf('const ordered = bottomUp(aiEdits);'), app.in
 
 test('R4. App: a deletion opens the window (nothing applied yet); everything else goes straight to applyAiEdits', () => {
   assert.ok(tail.length > 100, 'the runEdits tail was found');
-  const i = tail.indexOf('if (hasDeletion(doc, ordered)) {');
+  // (23 Nov) the window is decided by needsConfirmation (only MEDICINE removals; lib/deletions.js) - same place, same
+  // window, same "nothing applied before Apply"
+  const i = tail.indexOf('if (needsConfirmation(doc, ordered)) {');
   assert.ok(i > 0);
   const block = tail.slice(i);
   assert.match(block, /openPending\(\{\s*kind: 'command'/);

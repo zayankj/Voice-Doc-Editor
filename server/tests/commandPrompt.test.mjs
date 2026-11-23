@@ -119,8 +119,10 @@ test('commands (not uploads) may use format / change_case / to_list / unlist and
   const base = baseSchema();
   const copy = JSON.stringify(base);
   const item = commandSchema(base).properties.edits.items;
-  assert.deepEqual(item.properties.operation.enum, [...UPLOAD_OPS, 'format', 'change_case', 'to_list', 'unlist']);
+  // (Advice placement, approved 23 Nov) + insert_before (commands only)
+  assert.deepEqual(item.properties.operation.enum, [...UPLOAD_OPS, 'insert_before', 'format', 'change_case', 'to_list', 'unlist']);
   for (const k of ['style', 'case', 'list_type', 'lines', 'select', 'last_block_id', 'duplicate_ok']) assert.ok(item.properties[k], k);
+  assert.equal(item.properties.separate_paragraph?.type, Type.BOOLEAN, 'separate_paragraph: true / false only');
   // to_list select: only the kinds the browser can pick from the document
   assert.deepEqual(item.properties.select.items.enum, ['all_medicines', 'tablets', 'capsules', 'syrups', 'suspensions', 'injections', 'drops', 'ointments', 'sachets', 'powders', 'inhalers']);
   const a = commandPrompt();
@@ -157,7 +159,13 @@ test('medicines: Gemini adds, changes, removes and replaces them itself - with o
   for (const a of both()) {
     assert.match(a, /Adding: one new line for each medicine, in the style of the existing medicine lines, with the details the person\s+gave and in their meaning/);
     assert.match(a, /Add no detail they did not give; a missing detail is not a reason to\s+ask\./);
-    assert.match(a, /"at the top" = insert_after the section heading;\s+"after DOLO" = insert_after the DOLO line\./);
+    // (Advice placement, approved 23 Nov) "at the top" of the medicines = before the FIRST medicine line (it becomes
+    // the first entry of the list); before: insert_after the section heading (a paragraph above the list)
+    assert.match(a, /"at the top" \/ "first" = insert_before the FIRST\s+medicine line; "after DOLO" = insert_after the DOLO line; "before DOLO" = insert_before the DOLO line\./);
+    assert.doesNotMatch(a, /"at the top" = insert_after the section heading;\s+"after DOLO"/);
+    // follow-up / general advice: never a medicine line; its own paragraph (separate_paragraph next to a medicine line)
+    assert.match(a, /are not medicines: never write them as a medicine line or list entry\. Each is its own paragraph/);
+    assert.match(a, /insert_after the last block of the section, with separate_paragraph = true\s+when that block is a medicine line/);
     assert.match(a, /Changing: change only the detail asked \(dose, strength, timing, duration \.\.\.\); the rest of the line stays as it is\./);
     assert.match(a, /Removing a whole medicine: clear its block, or - when it shares a block with other lines - replace_text its exact\s+line with ""\./);
     assert.match(a, /"All medicines except PAN" means every other medicine\./);

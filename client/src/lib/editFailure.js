@@ -21,7 +21,7 @@ export function reasonCode(result) {
   const e = String(result?.error || '');
   if (/^Block \S* does not exist$/.test(e)) return 'no_such_block';
   if (/^".*" not found in B\d+/s.test(e)) return 'text_not_found';
-  if (/^(insert_after|append) needs new_value$/.test(e)) return 'missing_value';
+  if (/^(insert_after|insert_before|append) needs new_value$/.test(e)) return 'missing_value';
   if (/^Unknown operation: /.test(e)) return 'unknown_operation';
   return 'not_applied';
 }

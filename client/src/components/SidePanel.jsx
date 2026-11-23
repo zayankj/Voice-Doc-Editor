@@ -24,7 +24,7 @@ const StopIcon = () => (
 );
 
 export default function SidePanel({
-  status, micDetail, onMic, reading, onRead, readSpeeds = [], readSpeed = 1, onReadSpeed, applying,
+  status, micDetail, onMic, reading, onRead, readSpeeds = [], readSpeed = 1, onReadSpeed, applying, processing = false,
   transcript, reply, note, error,
   attached, onPickFile, onDropFile, onClearFile,
   instruction, onInstruction, onApply, progress = '',
@@ -34,7 +34,9 @@ export default function SidePanel({
   const busyMic = status !== 'idle';
   const micLabel =
     micDetail || (status === 'connecting' ? 'Connecting...' : status === 'listening' ? 'Listening... tap to stop' : 'Mic');
-  const canApply = Boolean(attached || instruction.trim()) && !applying && !busyMic;
+  // (Stage 1) also not while a voice command is still being processed (processing): never two requests at once.
+  // Only this button: the microphone and the read button are not affected by it.
+  const canApply = Boolean(attached || instruction.trim()) && !applying && !busyMic && !processing;
 
   return (
     <aside className="side">

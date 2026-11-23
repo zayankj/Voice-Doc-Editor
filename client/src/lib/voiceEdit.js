@@ -6,6 +6,17 @@ import { cellAt, isDataTable, hasTitleRow, rowNames, valueCellAfter, keepValueFo
 import { isMedicineEntry } from './medicineText.js';
 import { isSectionTitle as isSectionStart } from './sections.js';
 
+// Gemini sometimes escapes a line break twice, so new_value holds the two characters "\" + "n" (e.g.
+// "Enteric fever\nheadache") instead of a real line break: it becomes a real line break (also "\r\n"). Other fields
+// and edits without it are returned unchanged (the same object). The same as withRealLineBreaks in lib/aiEdits.js
+// (which App.jsx uses when the answer arrives); a copy, so this file needs no extra import.
+function withRealLineBreaks(edit) {
+  if (typeof edit?.new_value === 'string' && /\\n/.test(edit.new_value)) {
+    return { ...edit, new_value: edit.new_value.replace(/(?:\\r)?\\n/g, '\n') };
+  }
+  return edit;
+}
+
 export { getPatientFacts };
 
 const HIGHLIGHT_MS = 5000; // how long changed text stays highlighted (5 seconds)
@@ -212,6 +223,56 @@ function addNewLines(editor, target, newLines, afterLine = null) {
   scheduleClear(editor);
   // before = '' : nothing existing changes, lines are only ADDED
   return { ok: true, before: '', after: newLines.join('\n'), pos };
+}
+
+// insert_before: lines as NEW lines in front of target, in the layout of the place (the mirror of addNewLines):
+//   - a paragraph with line breaks: line + line break, before line `beforeLine` (default: the first line)
+//   - a list item: new list items before it (the numbering follows by itself)
+//   - otherwise: new paragraphs before the block
+function addNewLinesBefore(editor, target, newLines, beforeLine = null) {
+  const { pos, node } = target;
+  const schema = editor.schema;
+  const doc = editor.state.doc;
+  const ends = lineEnds(node, pos); // ends[k] = the line break after line k (the last one: the paragraph's end)
+  let tr = editor.state.tr;
+  let at;
+  if (ends.length > 1) {
+    const k = beforeLine ?? 0;
+    at = k === 0 ? pos + 1 : ends[k - 1] + 1; // the start of line k (just after the line break before it)
+    tr = tr.insert(at, newLines.flatMap((l) => [schema.text(l), schema.nodes.hardBreak.create()]));
+    tr.setMeta(flashKey, { add: { from: pos, to: pos + tr.doc.nodeAt(pos).nodeSize } });
+  } else if (inListItem(doc, target)) {
+    const $p = doc.resolve(pos);
+    at = $p.before($p.depth); // before the list item
+    const items = newLines.map((l) => schema.nodes.listItem.create(null, schema.nodes.paragraph.create(null, schema.text(l))));
+    tr = tr.insert(at, items);
+    tr.setMeta(flashKey, { add: { from: at, to: at + items.reduce((n, x) => n + x.nodeSize, 0) } });
+  } else {
+    at = pos;
+    const paragraphs = newLines.map((l) => schema.nodes.paragraph.create(null, schema.text(l)));
+    tr = tr.insert(at, paragraphs);
+    tr.setMeta(flashKey, { add: { from: at, to: at + paragraphs.reduce((n, x) => n + x.nodeSize, 0) } });
+  }
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  return { ok: true, before: '', after: newLines.join('\n'), pos: at };
+}
+
+// insert_after with separate_paragraph: new PARAGRAPHS right after the whole list target is in (the outermost one,
+// so never inside a list), or else right after target itself (a paragraph with line breaks is left as it is)
+function addParagraphsAfter(editor, target, newLines) {
+  const schema = editor.schema;
+  const $p = editor.state.doc.resolve(target.pos);
+  let at = target.pos + target.node.nodeSize;
+  for (let d = 1; d <= $p.depth; d++) {
+    if (/^(ordered|bullet)List$/.test($p.node(d).type.name)) { at = $p.after(d); break; }
+  }
+  const paragraphs = newLines.map((l) => schema.nodes.paragraph.create(null, schema.text(l)));
+  const tr = editor.state.tr.insert(at, paragraphs);
+  tr.setMeta(flashKey, { add: { from: at, to: at + paragraphs.reduce((n, x) => n + x.nodeSize, 0) } });
+  editor.view.dispatch(tr);
+  scheduleClear(editor);
+  return { ok: true, before: '', after: newLines.join('\n'), pos: at };
 }
 
 // ---------- look-only edits and lists (commands): the WORDS never change ----------
@@ -647,7 +708,7 @@ function toValueCell(editor, blocks, target, args, labelText) {
 
 // A new row for a table ("CRP | 48.9 MG/L"): never a paragraph pushed inside a cell.
 // Same cell types and formatting as the rows around it; one value per column.
-function addTableRow(editor, info, value) {
+function addTableRow(editor, info, value, before = false) {
   const { table } = info;
   const parts = String(value).split('|').map((s) => s.trim());
   // copy the look of a data row (not of the column-title row)
@@ -672,7 +733,7 @@ function addTableRow(editor, info, value) {
     return c.type.create(c.attrs, schema.nodes.paragraph.create(para?.attrs || null, schema.text(parts[i], marks)));
   });
   const newRow = model.type.create(model.attrs, newCells);
-  const at = info.rowPos + info.row.nodeSize; // right after the row the AI pointed at
+  const at = before ? info.rowPos : info.rowPos + info.row.nodeSize; // right after (insert_before: before) the row the AI pointed at
   const tr = editor.state.tr.insert(at, newRow);
   tr.setMeta(flashKey, { add: { from: at, to: at + newRow.nodeSize } });
   editor.view.dispatch(tr);
@@ -769,7 +830,7 @@ function replaceAfterLabel(editor, target, args, opts) {
 export function incompleteEdit(e) {
   const op = e?.operation;
   if (op === 'set' && typeof e.new_value !== 'string') return "the AI's answer had no new text for this change (set), so it was not applied";
-  if ((op === 'append' || op === 'insert_after') && (typeof e.new_value !== 'string' || !e.new_value.trim())) {
+  if ((op === 'append' || op === 'insert_after' || op === 'insert_before') && (typeof e.new_value !== 'string' || !e.new_value.trim())) {
     return `the AI's answer had no new text for this change (${op}), so it was not applied`;
   }
   if (op === 'replace_text') {
@@ -786,12 +847,10 @@ export function incompleteEdit(e) {
 const OUTLINE_MARKUP = /\[B\d+\]\s*\((?:P|H\d)\)|^\s*TABLE ROW:/m;
 
 export function applyVoiceEdit(editor, args, opts = {}) {
-  // Gemini sometimes escapes a line break twice, so new_value holds the two characters "\" + "n" (e.g.
-  // "Enteric fever\nheadache") instead of a real line break. Turn them back into real line breaks, so the line-break
-  // handling below makes separate lines (and no visible "\n" text ends up in the document).
-  if (typeof args?.new_value === 'string' && /\\n/.test(args.new_value)) {
-    args = { ...args, new_value: args.new_value.replace(/(?:\\r)?\\n/g, '\n') };
-  }
+  // A "\n" written as two characters becomes a real line break, so the line-break handling below makes separate
+  // lines (and no visible "\n" text ends up in the document). App.jsx already did it when the answer arrived; then
+  // this changes nothing.
+  args = withRealLineBreaks(args);
   // (Stage R1) an incomplete edit never changes the document
   const incomplete = incompleteEdit(args);
   if (incomplete) return { ok: false, blocked: true, error: incomplete };
@@ -864,6 +923,9 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     }
     // a new line never starts or ends with stray spaces (or a stray comma); several lines -> several new lines
     const newLines = String(new_value).split(/\r?\n/).map((l) => l.replace(/^[\s,;]+/, '').trim()).filter(Boolean);
+    // separate_paragraph (Gemini decided the text is its own paragraph, e.g. a follow-up after the medicines): a
+    // normal paragraph after the whole list / block - never a new entry or line of it
+    if (args.separate_paragraph === true) return addParagraphsAfter(editor, target, newLines);
     if (afterLine != null) return addNewLines(editor, target, newLines, afterLine);
     if (inListItem(editor.state.doc, target)) return addNewLines(editor, target, newLines);
     const insertPos = pos + node.nodeSize;
@@ -873,6 +935,24 @@ export function applyVoiceEdit(editor, args, opts = {}) {
     editor.view.dispatch(tr);
     scheduleClear(editor);
     return { ok: true, before: '', after: new_value, pos: insertPos };
+  }
+
+  // Add NEW line(s) BEFORE this block - the mirror of insert_after: a list item -> new list item(s) before it; a
+  // paragraph with line breaks -> new line(s) before the line find_text points at (no find_text: before its first
+  // line); a table row -> a new row before it; otherwise new paragraph(s) before the block
+  if (operation === 'insert_before') {
+    if (!new_value.trim()) return { ok: false, error: 'insert_before needs new_value' };
+    const cellInfo = cellAt(editor.state.doc, pos);
+    if (cellInfo && (isDataTable(cellInfo.table) || new_value.includes('|'))) return addTableRow(editor, cellInfo, new_value, true);
+    const lines = linesOf(node, start);
+    let beforeLine = null;
+    if (find_text.trim() && lines.length > 1) {
+      beforeLine = lineIndexOf(lines, find_text);
+      if (beforeLine === -1) return { ok: false, error: `"${find_text}" not found in ${block_id}` };
+      if (beforeLine === -2) return { ok: false, blocked: true, error: `more than one line contains "${find_text}"; say which line` };
+    }
+    const newLines = String(new_value).split(/\r?\n/).map((l) => l.replace(/^[\s,;]+/, '').trim()).filter(Boolean);
+    return addNewLinesBefore(editor, target, newLines, beforeLine);
   }
 
   // "append" whose text starts with a new line: the AI means a NEW line, never glued onto the last one

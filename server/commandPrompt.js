@@ -33,7 +33,7 @@ export function cleanRecent(v) {
 
 // Look-only edits and lists, for COMMANDS ONLY (uploads keep the five text operations). The browser applies them
 // (client/src/lib/voiceEdit.js) without changing any words.
-export const COMMAND_OPERATIONS = ['set', 'replace_text', 'append', 'clear', 'insert_after', 'format', 'change_case', 'to_list', 'unlist'];
+export const COMMAND_OPERATIONS = ['set', 'replace_text', 'append', 'clear', 'insert_after', 'insert_before', 'format', 'change_case', 'to_list', 'unlist'];
 export const STYLES = ['bold', 'italic', 'underline', 'not_bold', 'not_italic', 'not_underline'];
 export const CASES = ['upper', 'lower', 'title', 'sentence'];
 export const LIST_TYPES = ['ordered', 'bullet'];
@@ -48,6 +48,8 @@ export const extraEditFields = (T) => ({
   select: { type: T.ARRAY, items: { type: T.STRING, enum: SELECT_KINDS } },
   last_block_id: { type: T.STRING },
   duplicate_ok: { type: T.BOOLEAN },
+  separate_paragraph: { type: T.BOOLEAN },
+  removes_medicine: { type: T.BOOLEAN },
 });
 
 // The answer format for commands: the upload format plus understood, and the edits may also
@@ -147,8 +149,13 @@ MEDICINES
   gave and in their meaning: name, strength, form, route, frequency, time of day, food timing, duration, a condition
   ("if fever") and words such as "to continue". Add no detail they did not give; a missing detail is not a reason to
   ask. Put it after the last medicine of the section where the medicines are listed (Advice, Discharge Medications
-  ...), unless the person names another section or a position: "at the top" = insert_after the section heading;
-  "after DOLO" = insert_after the DOLO line.
+  ...), unless the person names another section or a position: "at the top" / "first" = insert_before the FIRST
+  medicine line; "after DOLO" = insert_after the DOLO line; "before DOLO" = insert_before the DOLO line.
+- Follow-up, review and general advice ("review after 2 weeks", "avoid heavy work", "come back if the fever returns")
+  are not medicines: never write them as a medicine line or list entry. Each is its own paragraph - by default at the
+  end of the section, after the medicines: insert_after the last block of the section, with separate_paragraph = true
+  when that block is a medicine line. A position the person names is kept ("at the top" = insert_after the section
+  heading), always as its own paragraph (separate_paragraph = true next to a medicine line).
 - Changing: change only the detail asked (dose, strength, timing, duration ...); the rest of the line stays as it is.
 - Removing a whole medicine: clear its block, or - when it shares a block with other lines - replace_text its exact
   line with "". Removing one detail ("remove 5 days from PAN", "remove the generic name from CROCIN"): replace_text
@@ -195,11 +202,17 @@ THE ANSWER
   block_id: exactly one id like B12.
   operation: set = the block's whole new text | replace_text = find_text (the exact existing words) replaced by
   new_value ("" removes them) | append = continues the same line | insert_after = a new line after block_id (when that
-  block has line breaks, find_text = the line it goes after) | clear = empties the block | format | change_case |
+  block has line breaks, find_text = the line it goes after) | insert_before = a new line before block_id (when that
+  block has line breaks, find_text = the line it goes before) | clear = empties the block | format | change_case |
   to_list | unlist.
   set, append, insert_after and replace_text always carry their text in new_value (and replace_text its find_text):
   an edit without its text is not applied. To REMOVE text with replace_text, write new_value as an empty string ""
-  (never leave new_value out).
+  (never leave new_value out). insert_before also carries its text in new_value.
+  separate_paragraph: only with insert_after; true = the new text is its own paragraph after the whole list or
+  block that block_id is in (never a new entry or line of it).
+  removes_medicine: on every clear, set and replace_text: true when the edit removes an existing medicine from the
+  document or replaces it with a different medicine; false when it removes or changes only other text, or changes
+  only details of a medicine that stays (dose, strength, timing, duration ...).
   field_label: a short name of what changed ("Date of Discharge", "Advice").
 - summary: one to three short sentences in simple English: what you changed - or the question.
 - understood: one plain-English sentence: what you did, or what is unclear.
@@ -214,6 +227,9 @@ EXAMPLES (names refer to whatever is in the document)
 - "change PAN to 20 mg" -> replace_text "40 mg" -> "20 mg" in the PAN line.
 - "add Dolo 650 in the morning and Zinc at night" -> two new lines after the last medicine, "DOLO 650 — In the
   Morning" and "ZINC — At Night".
+- "add Dolo 650 at the top of the medicines" -> insert_before the first medicine line, "DOLO 650".
+- "add review after 2 weeks" when the medicines are the last lines of Advice -> insert_after the last medicine line,
+  separate_paragraph = true, "Review after 2 weeks."
 - "give pan at night instead of once daily" -> replace_text "Once Daily" -> "At Night" in the PAN line.
 - "remove 5 days from PAN" -> replace_text " — 5 days" -> "" in the PAN line.
 - "remove all medicines except PAN" -> each other medicine line removed.

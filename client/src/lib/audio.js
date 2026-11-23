@@ -4,15 +4,29 @@ export async function startCapture(onChunk) {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
   });
-  const ctx = new AudioContext({ sampleRate: 16000 });
-  await ctx.audioWorklet.addModule('/pcm-worklet.js');
+  // (Stage 1) the microphone is already on here: if anything below fails, everything is released again (the browser
+  // must not keep recording), then the error goes to the caller as before
+  let ctx = null;
+  let src = null;
+  let node = null;
+  let mute = null;
+  try {
+    ctx = new AudioContext({ sampleRate: 16000 });
+    await ctx.audioWorklet.addModule('/pcm-worklet.js');
 
-  const src = ctx.createMediaStreamSource(stream);
-  const node = new AudioWorkletNode(ctx, 'pcm-processor');
-  const mute = ctx.createGain();
-  mute.gain.value = 0; // keeps the graph running without echoing the mic
-  node.port.onmessage = (e) => onChunk(floatToBase64Pcm(e.data), rmsOf(e.data));
-  src.connect(node).connect(mute).connect(ctx.destination);
+    src = ctx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(ctx, 'pcm-processor');
+    mute = ctx.createGain();
+    mute.gain.value = 0; // keeps the graph running without echoing the mic
+    node.port.onmessage = (e) => onChunk(floatToBase64Pcm(e.data), rmsOf(e.data));
+    src.connect(node).connect(mute).connect(ctx.destination);
+  } catch (err) {
+    try { if (node) node.port.onmessage = null; } catch { /* releasing anyway */ }
+    for (const n of [node, src, mute]) { try { n?.disconnect(); } catch { /* releasing anyway */ } }
+    stream.getTracks().forEach((t) => { try { t.stop(); } catch { /* releasing anyway */ } });
+    try { if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {}); } catch { /* releasing anyway */ }
+    throw err;
+  }
 
   let stopped = false;
   return () => {

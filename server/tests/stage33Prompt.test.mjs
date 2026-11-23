@@ -30,13 +30,14 @@ test('R2: every operation and edit field named in the prompt exists in the answe
   const item = commandSchema({ type: Type.OBJECT, properties: { edits: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { block_id: {}, operation: { type: Type.STRING, enum: [] }, new_value: {}, find_text: {}, field_label: {} }, required: [] } } }, required: [] }).properties.edits.items;
   const live = liveFunctionDeclaration().parameters.properties.edits.items;
   for (const op of COMMAND_OPERATIONS) assert.ok(p.includes(op), `prompt names ${op}`);
-  for (const f of ['block_id', 'new_value', 'find_text', 'field_label', 'style', 'case', 'list_type', 'select', 'lines', 'last_block_id', 'duplicate_ok']) {
+  for (const f of ['block_id', 'new_value', 'find_text', 'field_label', 'style', 'case', 'list_type', 'select', 'lines', 'last_block_id', 'duplicate_ok', 'separate_paragraph']) {
     assert.ok(item.properties[f], `schema has ${f}`);
     assert.ok(live.properties[f], `Live has ${f}`);
   }
   for (const v of [...STYLES, ...CASE_VALUES, ...SELECT_KINDS]) assert.ok(p.includes(v), `prompt lists ${v}`);
   // no operation that does not exist
-  for (const bad of ['delete_block', 'insert_before', 'move_block', 'rename_heading']) assert.ok(!p.includes(bad), bad);
+  // (insert_before exists since the Advice placement change of 23 Nov - it is in COMMAND_OPERATIONS, checked above)
+  for (const bad of ['delete_block', 'move_block', 'rename_heading']) assert.ok(!p.includes(bad), bad);
 });
 
 test('R2: never add information; corrections and rewrites keep the facts', () => {

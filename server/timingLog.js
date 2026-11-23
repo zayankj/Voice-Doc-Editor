@@ -14,7 +14,7 @@ export const LIVE_REASONS = [
   'invalid edit (not an object)', 'invalid edit (block_id not like B12)', 'invalid edit (unknown operation)',
   'invalid edit (field_label missing)', 'invalid edit (new_value or find_text not text)', 'invalid edit (new_value missing)',
   'invalid edit (replace_text needs find_text and new_value)', 'invalid edit (unknown style)', 'invalid edit (unknown case)',
-  'invalid edit (unknown list_type)', 'invalid edit (last_block_id not like B12)', 'invalid edit (duplicate_ok not true/false)',
+  'invalid edit (unknown list_type)', 'invalid edit (last_block_id not like B12)', 'invalid edit (duplicate_ok not true/false)', 'invalid edit (separate_paragraph not true/false)',
   'invalid edit (lines not a valid list)', 'invalid edit (format needs style)', 'invalid edit (change_case needs case)',
   'invalid edit (select not a valid list)', 'invalid edit (to_list needs list_type and lines or select)',
 ];

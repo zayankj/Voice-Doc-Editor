@@ -109,7 +109,7 @@ export function checkLiveResult(args, transcript) {
     if (!text(e.field_label) || !e.field_label.trim()) fail('invalid edit (field_label missing)');
     for (const k of ['new_value', 'find_text']) if (e[k] !== undefined && !text(e[k])) fail('invalid edit (new_value or find_text not text)');
     // what each operation needs
-    if (['set', 'append', 'insert_after'].includes(e.operation) && typeof e.new_value !== 'string') fail('invalid edit (new_value missing)');
+    if (['set', 'append', 'insert_after', 'insert_before'].includes(e.operation) && typeof e.new_value !== 'string') fail('invalid edit (new_value missing)');
     if (e.operation === 'replace_text' && (typeof e.find_text !== 'string' || !e.find_text || typeof e.new_value !== 'string')) fail('invalid edit (replace_text needs find_text and new_value)');
     // the look-only / list fields: only known values
     if (e.style !== undefined && !STYLES.includes(e.style)) fail('invalid edit (unknown style)');
@@ -117,15 +117,19 @@ export function checkLiveResult(args, transcript) {
     if (e.list_type !== undefined && !LIST_TYPES.includes(e.list_type)) fail('invalid edit (unknown list_type)');
     if (e.last_block_id !== undefined && (typeof e.last_block_id !== 'string' || !/^B\d{1,6}$/.test(e.last_block_id))) fail('invalid edit (last_block_id not like B12)');
     if (e.duplicate_ok !== undefined && typeof e.duplicate_ok !== 'boolean') fail('invalid edit (duplicate_ok not true/false)');
+    if (e.separate_paragraph !== undefined && typeof e.separate_paragraph !== 'boolean') fail('invalid edit (separate_paragraph not true/false)');
     if (e.lines !== undefined && (!Array.isArray(e.lines) || e.lines.length > MAX_LINES || !e.lines.every(text))) fail('invalid edit (lines not a valid list)');
     if (e.operation === 'format' && e.style === undefined) fail('invalid edit (format needs style)');
     if (e.operation === 'change_case' && e.case === undefined) fail('invalid edit (change_case needs case)');
     if (e.select !== undefined && (!Array.isArray(e.select) || e.select.length > SELECT_KINDS.length || !e.select.every((k) => SELECT_KINDS.includes(k)))) fail('invalid edit (select not a valid list)');
     if (e.operation === 'to_list' && (e.list_type === undefined || (!e.lines?.length && !e.select?.length))) fail('invalid edit (to_list needs list_type and lines or select)');
     const out = { block_id: e.block_id, operation: e.operation, field_label: e.field_label };
-    for (const k of ['new_value', 'find_text', 'style', 'case', 'list_type', 'lines', 'select', 'last_block_id', 'duplicate_ok']) {
+    for (const k of ['new_value', 'find_text', 'style', 'case', 'list_type', 'lines', 'select', 'last_block_id', 'duplicate_ok', 'separate_paragraph']) {
       if (e[k] !== undefined) out[k] = e[k];
     }
+    // removes_medicine (medicine-removal confirmation): passed on only as true / false. Anything else is left out, so
+    // the browser treats it as unknown - and an unknown removal is always confirmed (client/src/lib/deletions.js)
+    if (typeof e.removes_medicine === 'boolean') out.removes_medicine = e.removes_medicine;
     // only the known fields are passed on (anything else the model sends, e.g. old statement keys, is dropped)
     return out;
   });
@@ -151,6 +155,8 @@ const FIELD_HELP = {
   select: `${LIST_ONLY} The kinds of medicine lines to turn into a list.`,
   last_block_id: 'Only for format / change_case over several blocks: the LAST block, one id like "B20".',
   duplicate_ok: 'true only when adding a new line of a medicine that is already in that section.',
+  separate_paragraph: 'ONLY with insert_after: true = the new text is its own paragraph after the whole list or block (follow-up, advice), never a new entry of it.',
+  removes_medicine: 'On every clear, set and replace_text: true when an existing medicine is removed or replaced by a different medicine; false otherwise (other text, or only a dose / timing / duration change).',
 };
 const describedExtraFields = Object.fromEntries(Object.entries(extraEditFields(Type))
   .map(([k, v]) => [k, FIELD_HELP[k] ? { ...v, description: FIELD_HELP[k] } : v]));
@@ -173,8 +179,8 @@ const proposeEdits = {
           properties: {
             block_id: { type: Type.STRING, description: 'Exactly ONE block id from the document, written like "B12": the letter B and digits only (no brackets, spaces, ranges or lists).' },
             operation: { type: Type.STRING, enum: OPERATIONS },
-            new_value: { type: Type.STRING, description: 'The text to write. REQUIRED for set, append, insert_after and replace_text (the replacement text). A new line or medicine always goes here, never in lines.' },
-            find_text: { type: Type.STRING, description: 'replace_text: the exact existing text to replace (required). insert_after in a block with several lines: the line it goes after. format / change_case: the part to change.' },
+            new_value: { type: Type.STRING, description: 'The text to write. REQUIRED for set, append, insert_after and replace_text (the replacement text), and for insert_before. A new line or medicine always goes here, never in lines.' },
+            find_text: { type: Type.STRING, description: 'replace_text: the exact existing text to replace (required). insert_after / insert_before in a block with several lines: the line it goes after / before. format / change_case: the part to change.' },
             field_label: { type: Type.STRING, description: 'Short name of what is changed, e.g. "Advice" or "Date of Discharge". Never empty.' },
             ...describedExtraFields,
           },
@@ -196,6 +202,7 @@ call the function propose_edits exactly once, with heard, understood, summary an
 FORMAT OF THE FUNCTION CALL (an answer in any other form cannot be used, and the command has to be processed again):
 - block_id: ONE id exactly like B12 (no brackets, spaces, ranges or lists).
 - set, append and insert_after: the text to write is ALWAYS in new_value (never in lines). replace_text: find_text AND new_value.
+- insert_before: the text is in new_value too. separate_paragraph only with insert_after.
 - lines, select and list_type are ONLY for to_list; style ONLY for format; case ONLY for change_case.
 - field_label is never empty.
 - A question goes in summary with an empty edits list, inside the function call. Never speak a question or an answer.`;

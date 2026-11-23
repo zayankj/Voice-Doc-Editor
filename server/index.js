@@ -96,6 +96,7 @@ const editsSchema = {
           new_value: { type: Type.STRING },
           find_text: { type: Type.STRING },
           field_label: { type: Type.STRING },
+          removes_medicine: { type: Type.BOOLEAN }, // medicine-removal confirmation in the browser (lib/deletions.js)
         },
         required: ['block_id', 'operation', 'field_label'],
       },
@@ -219,6 +220,9 @@ Rules:
 - If handwriting or any value is unclear, do NOT guess. Skip it and mention it in the summary.
 - If the patient name in the file differs from the document, mention that first in the summary.
 - field_label is a short human name of what changed (e.g. "Date of Discharge").
+- removes_medicine: on every clear, set and replace_text: true when the edit removes an existing medicine from the
+  document or replaces it with a different medicine; false when it removes or changes only other text, or changes
+  only details of a medicine that stays (dose, strength, timing, duration ...).
 - heard: when there is a spoken command, write the person's EXACT words (a short transcript). Write English words,
   medicine names, abbreviations (OD, BD, IV) and numbers in English letters and digits, exactly as said; write
   Malayalam words in Malayalam script; write Hindi or Urdu words in English letters. Never translate, correct or

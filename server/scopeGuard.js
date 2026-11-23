@@ -12,7 +12,7 @@
 export function incompleteEdit(e) {
   const op = e?.operation;
   if (op === 'set' && typeof e.new_value !== 'string') return true;
-  if ((op === 'append' || op === 'insert_after') && (typeof e.new_value !== 'string' || !e.new_value.trim())) return true;
+  if ((op === 'append' || op === 'insert_after' || op === 'insert_before') && (typeof e.new_value !== 'string' || !e.new_value.trim())) return true;
   if (op === 'replace_text' && (typeof e.find_text !== 'string' || !e.find_text || typeof e.new_value !== 'string')) return true;
   return false;
 }
